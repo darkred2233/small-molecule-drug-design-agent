@@ -45,6 +45,10 @@ class BuiltinDrugRead(BaseModel):
     mechanism: str | None = None
     indication: str | None = None
     smiles: str | None = None
+    canonical_smiles: str | None = None
+    isomeric_smiles: str | None = None
+    inchi_key: str | None = None
+    pubchem_cid: int | None = None
     evidence_source: str | None = None
 
 
@@ -106,3 +110,11 @@ class ToolRunResult(BaseModel):
     stderr: str = ""
     exit_code: int
     runtime_seconds: float
+
+
+class DatabaseSummary(BaseModel):
+    target_count: int
+    drug_count: int
+    project_count: int
+    molecule_count: int
+    target_ids: list[str]

@@ -1,11 +1,12 @@
 from sqlalchemy.orm import Session
 
-from medagent.data.builtin_targets import BUILTIN_TARGETS
+from medagent.data.builtin_targets import load_builtin_targets
 from medagent.db.models import Target, TargetDrugLibrary
 
 
 def seed_builtin_targets(db: Session) -> None:
-    for target_payload in BUILTIN_TARGETS:
+    builtin_targets = load_builtin_targets()
+    for target_payload in builtin_targets:
         target = db.query(Target).filter_by(target_id=target_payload["target_id"]).one_or_none()
         if target is None:
             target = Target(
@@ -30,4 +31,7 @@ def seed_builtin_targets(db: Session) -> None:
             )
             if exists is None:
                 db.add(TargetDrugLibrary(target_id=target_payload["target_id"], **drug_payload))
+            else:
+                for key, value in drug_payload.items():
+                    setattr(exists, key, value)
     db.commit()

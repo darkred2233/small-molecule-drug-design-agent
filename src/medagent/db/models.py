@@ -70,7 +70,12 @@ class TargetDrugLibrary(TimestampMixin, Base):
     mechanism: Mapped[str | None] = mapped_column(String(240))
     indication: Mapped[str | None] = mapped_column(String(240))
     smiles: Mapped[str | None] = mapped_column(Text)
+    canonical_smiles: Mapped[str | None] = mapped_column(Text)
+    isomeric_smiles: Mapped[str | None] = mapped_column(Text)
+    inchi_key: Mapped[str | None] = mapped_column(String(120), index=True)
+    pubchem_cid: Mapped[int | None] = mapped_column(Integer)
     evidence_source: Mapped[str | None] = mapped_column(String(240))
+    external_refs: Mapped[dict] = mapped_column(JSON, default=dict)
 
     target: Mapped["Target"] = relationship(back_populates="drugs")
 

@@ -67,6 +67,8 @@ small-molecule-drug-design-agent/
 | `src/medagent/agents/conversation.py` | 自然语言约束解析的第一版规则实现 |
 | `src/medagent/agents/orchestrator.py` | 端到端 Agent 流程 dry-run 编排 |
 | `src/medagent/data/builtin_targets.py` | 内置靶点-药物种子数据 |
+| `src/medagent/data/target_drug_library.json` | 已下载增强的内置靶点-药物关系库 |
+| `database/medagent_seed.sqlite` | 可迁移 SQLite 种子库快照 |
 | `tests/test_api.py` | API 行为测试 |
 
 ## 3. 环境要求
@@ -169,6 +171,7 @@ python -m pip install "psycopg[binary]"
 | 方法 | 路径 | 状态 | 说明 |
 |---|---|---|---|
 | `GET` | `/health` | 已实现 | 健康检查 |
+| `GET` | `/database/summary` | 已实现 | 查询关系数据库摘要 |
 | `GET` | `/builtin-targets` | 已实现 | 获取内置靶点列表 |
 | `GET` | `/builtin-targets/{target_id}` | 已实现 | 获取靶点详情和代表药物 |
 | `POST` | `/projects` | 已实现 | 创建项目 |

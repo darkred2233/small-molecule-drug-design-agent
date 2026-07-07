@@ -7,6 +7,8 @@
 - FastAPI 后端骨架
 - PostgreSQL/pgvector/MinIO 的 Docker Compose 配置
 - 文档要求的核心关系表 SQLAlchemy 模型
+- 内置靶点-药物关系库：10 个 MVP 靶点、32 个代表药物
+- 数据库摘要接口：`GET /database/summary`
 - 内置靶点接口：`GET /builtin-targets`
 - 项目创建接口：`POST /projects`
 - 对话约束接口：`POST /projects/{id}/chat`
@@ -44,6 +46,27 @@ Compose 会启动 PostgreSQL + pgvector 和 MinIO。RDKit cartridge 在不同发
 
 ```powershell
 python -m pytest
+```
+
+## 关系数据库快照
+
+已生成可迁移 SQLite 种子库：
+
+```text
+database/medagent_seed.sqlite
+```
+
+重新生成：
+
+```powershell
+$env:PYTHONPATH='src'
+python -m medagent.cli db snapshot --output database/medagent_seed.sqlite
+```
+
+详细说明见：
+
+```text
+docs/RELATIONAL_DATABASE_BUILD.md
 ```
 
 ## 下一步建议

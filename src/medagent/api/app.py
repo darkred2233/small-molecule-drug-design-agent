@@ -32,6 +32,7 @@ from medagent.domain.schemas import (
     UploadedFileRead,
 )
 from medagent.services.bootstrap import seed_builtin_targets
+from medagent.services.database import database_summary, ensure_relational_schema
 from medagent.services.ids import new_id
 
 SessionLocal: sessionmaker[Session]
@@ -46,6 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         engine = session_factory.kw["bind"]
         Base.metadata.create_all(bind=engine)
+        ensure_relational_schema(engine)
         with session_factory() as db:
             seed_builtin_targets(db)
         yield
@@ -62,6 +64,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "app": app_settings.app_name}
+
+    @app.get("/database/summary")
+    def get_database_summary(db: Session = Depends(get_db)):
+        return database_summary(db)
 
     @app.get("/builtin-targets", response_model=list[BuiltinTargetRead])
     def list_builtin_targets(db: Session = Depends(get_db)):
@@ -350,6 +356,10 @@ def _target_to_read(target: Target) -> BuiltinTargetRead:
                 mechanism=drug.mechanism,
                 indication=drug.indication,
                 smiles=drug.smiles,
+                canonical_smiles=drug.canonical_smiles,
+                isomeric_smiles=drug.isomeric_smiles,
+                inchi_key=drug.inchi_key,
+                pubchem_cid=drug.pubchem_cid,
                 evidence_source=drug.evidence_source,
             )
             for drug in target.drugs
