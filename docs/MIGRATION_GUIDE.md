@@ -71,7 +71,193 @@ small-molecule-drug-design-agent/
 | `database/medagent_seed.sqlite` | 可迁移 SQLite 种子库快照 |
 | `tests/test_api.py` | API 行为测试 |
 
-## 3. 环境要求
+## 3. 最终目标结构
+
+当前项目仍处于 MVP 早期，代码暂时集中在 `src/medagent` 下，方便快速验证。进入 RAG、Docking、ADMET、前端和后台任务之后，建议演进为下面的最终结构：
+
+```text
+small-molecule-drug-design-agent/
+├─ apps/                                  # 所有可运行应用
+│  ├─ api/                                # 后端 API 服务
+│  │  ├─ main.py                          # FastAPI 启动入口
+│  │  ├─ routes/                          # HTTP 路由分组
+│  │  │  ├─ projects.py                    # 项目创建、状态、轮次
+│  │  │  ├─ chat.py                        # 自然语言对话与约束
+│  │  │  ├─ files.py                       # 文件上传、解析、导入
+│  │  │  ├─ targets.py                     # 内置靶点库
+│  │  │  ├─ molecules.py                   # 候选分子查询
+│  │  │  ├─ pipeline.py                    # 启动完整 Agent 流程
+│  │  │  └─ reports.py                     # 报告查看与导出
+│  │  └─ dependencies.py                   # 数据库、权限、配置依赖注入
+│  │
+│  ├─ web/                                # 前端页面
+│  │  ├─ pages/                            # 页面：项目、上传、结果、报告
+│  │  ├─ components/                       # 表格、分子卡片、文件上传器
+│  │  ├─ api-client/                       # 调后端 API 的客户端
+│  │  └─ styles/                           # 主题和样式
+│  │
+│  └─ worker/                             # 后台任务进程
+│     ├─ main.py                           # Worker 启动入口
+│     ├─ queues.py                         # 队列定义
+│     └─ jobs/                             # 长任务：解析、生成、Docking、ADMET
+│
+├─ packages/                              # 核心业务包
+│  ├─ domain/                              # 领域模型与统一数据结构
+│  │  ├─ project.py                        # ProjectSpec
+│  │  ├─ molecule.py                       # MoleculeRecord
+│  │  ├─ evidence.py                       # EvidenceRecord
+│  │  ├─ agent_run.py                      # AgentRun
+│  │  └─ constraints.py                    # OptimizationConstraint
+│  │
+│  ├─ database/                            # 数据库层
+│  │  ├─ models.py                         # SQLAlchemy ORM 表模型
+│  │  ├─ session.py                        # DB session
+│  │  ├─ migrations/                       # Alembic 迁移
+│  │  └─ repositories/                     # 数据访问封装
+│  │
+│  ├─ storage/                             # 文件存储层
+│  │  ├─ local.py                          # 本地文件存储
+│  │  ├─ minio.py                          # MinIO/S3 存储
+│  │  └─ paths.py                          # 文件路径规范
+│  │
+│  ├─ ingestion/                           # 文件解析与知识导入
+│  │  ├─ parsers/                          # 各类文件解析器
+│  │  │  ├─ pdf.py                         # PDF 文本抽取
+│  │  │  ├─ csv.py                         # 活性表解析
+│  │  │  ├─ sdf.py                         # SDF 分子解析
+│  │  │  ├─ smiles.py                      # SMILES 文件解析
+│  │  │  └─ pdb.py                         # PDB 结构解析
+│  │  ├─ normalizers.py                    # 字段归一化
+│  │  └─ service.py                        # 导入编排
+│  │
+│  ├─ rag/                                 # RAG 系统
+│  │  ├─ chunking.py                       # 文档切分
+│  │  ├─ embedding.py                      # text-embedding-v4
+│  │  ├─ retrieval.py                      # BM25 + pgvector 检索
+│  │  ├─ rerank.py                         # qwen3-rerank
+│  │  └─ evidence.py                       # evidence_id 生成与引用
+│  │
+│  ├─ chemistry/                           # 分子处理
+│  │  ├─ standardize.py                    # SMILES 标准化
+│  │  ├─ descriptors.py                    # MW、LogP、TPSA、HBD、HBA
+│  │  ├─ filters.py                        # PAINS、Brenk、Lipinski
+│  │  ├─ similarity.py                     # Tanimoto、新颖性、多样性
+│  │  ├─ conformers.py                     # 3D 构象生成
+│  │  └─ labels.py                         # 分子标签规则
+│  │
+│  ├─ agents/                              # 智能体实现
+│  │  ├─ conversation_agent.py             # 对话理解
+│  │  ├─ central_host_agent.py             # 中枢编排
+│  │  ├─ knowledge_ingestion_agent.py      # 知识导入
+│  │  ├─ rag_agent.py                      # 文献检索与证据
+│  │  ├─ target_agent.py                   # 靶点/口袋分析
+│  │  ├─ sar_agent.py                      # SAR 分析
+│  │  ├─ generator_agent.py                # 候选分子生成
+│  │  ├─ filter_agent.py                   # 规则过滤
+│  │  ├─ docking_agent.py                  # Docking 调度
+│  │  ├─ admet_agent.py                    # ADMET 调度
+│  │  ├─ synthesis_agent.py                # 合成可及性评估
+│  │  ├─ self_refutation_agent.py          # DeepSeek 反驳
+│  │  ├─ ranker_agent.py                   # 综合排序
+│  │  ├─ advisor_agent.py                  # 下一轮建议
+│  │  └─ report_agent.py                   # 报告生成
+│  │
+│  ├─ llm/                                 # 大模型调用封装
+│  │  ├─ qwen.py                           # qwen3.7-max / plus
+│  │  ├─ deepseek.py                       # deepseek-v4-pro
+│  │  ├─ prompts/                          # prompt 模板
+│  │  └─ json_repair.py                    # JSON 输出修复
+│  │
+│  ├─ tools/                               # 外部科学计算工具适配器
+│  │  ├─ base.py                           # 标准 ToolRunResult
+│  │  ├─ rdkit_tool.py                     # RDKit/Datamol
+│  │  ├─ gnina.py                          # GNINA docking
+│  │  ├─ vina.py                           # AutoDock Vina
+│  │  ├─ admetlab.py                       # ADMETlab
+│  │  ├─ chemprop.py                       # Chemprop
+│  │  └─ aizynthfinder.py                  # 合成路线
+│  │
+│  ├─ pipeline/                            # 主流程编排
+│  │  ├─ graph.py                          # Agent 流程图
+│  │  ├─ tasks.py                          # Prefect/Celery 任务
+│  │  ├─ state.py                          # 流程状态机
+│  │  └─ recovery.py                       # 失败重试和断点续跑
+│  │
+│  ├─ scoring/                             # 综合评分
+│  │  ├─ normalization.py                   # 0-100 归一化
+│  │  ├─ weights.py                        # 多目标权重
+│  │  ├─ penalties.py                      # 风险扣分
+│  │  └─ ranking.py                        # Top 20-50 排序
+│  │
+│  └─ reporting/                           # 报告生成
+│     ├─ markdown.py                       # Markdown 报告
+│     ├─ pdf.py                            # PDF 报告
+│     ├─ tables.py                         # Top 分子表格
+│     └─ molecule_cards.py                 # 单分子证据卡
+│
+├─ data/                                   # 项目数据，不放大文件进 git
+│  ├─ seed/                                # 内置靶点-药物种子库
+│  ├─ uploads/                             # 用户上传原始文件
+│  ├─ parsed/                              # 解析后的中间文件
+│  ├─ poses/                               # docking pose 文件
+│  └─ reports/                             # 最终报告
+│
+├─ database/                               # 数据库快照和初始化资产
+│  ├─ seed.sqlite                          # 轻量种子库
+│  ├─ init.sql                             # PostgreSQL 初始化
+│  └─ backups/                             # 数据库备份
+│
+├─ infra/                                  # 部署与基础设施
+│  ├─ docker-compose.yml                   # 本地开发环境
+│  ├─ docker/                              # 各服务 Dockerfile
+│  ├─ minio/                               # MinIO 初始化
+│  ├─ postgres/                            # PostgreSQL 扩展配置
+│  └─ prefect/                             # Prefect 工作流配置
+│
+├─ configs/                                # 配置文件
+│  ├─ models.yaml                          # 模型栈配置
+│  ├─ scoring.yaml                         # 打分权重
+│  ├─ filters.yaml                         # 分子过滤阈值
+│  └─ tools.yaml                           # 外部工具路径和超时
+│
+├─ tests/                                  # 自动化测试
+│  ├─ unit/                                # 单元测试
+│  ├─ integration/                         # API/数据库/文件解析集成测试
+│  ├─ fixtures/                            # 测试文件样例
+│  └─ e2e/                                 # 端到端流程测试
+│
+├─ scripts/                                # 运维和数据脚本
+│  ├─ download_pubchem_seed.py             # 下载 PubChem 种子数据
+│  ├─ init_database.py                     # 初始化数据库
+│  ├─ run_demo_project.py                  # 跑演示项目
+│  └─ export_report.py                     # 导出报告
+│
+├─ docs/                                   # 人类阅读文档
+│  ├─ architecture.md                      # 架构说明
+│  ├─ api.md                               # API 说明
+│  ├─ database.md                          # 数据库表说明
+│  ├─ deployment.md                        # 部署说明
+│  ├─ workflow.md                          # Agent 流程说明
+│  └─ migration.md                         # 迁移文档
+│
+├─ .env.example                            # 环境变量模板
+├─ pyproject.toml                          # Python 项目配置
+├─ package.json                            # 如果前端独立构建，则放这里
+└─ README.md                               # 项目总入口
+```
+
+最终结构的核心分层：
+
+- `apps/`：真正启动的应用，包括 API、前端和后台 worker。
+- `packages/`：可复用业务能力，包括数据库、RAG、分子处理、Agent、工具适配器和报告生成。
+- `data/`：运行产生的数据，不建议把大文件提交进 git。
+- `database/`：数据库快照、初始化脚本和备份。
+- `infra/`：部署和基础设施配置。
+- `configs/`：模型、评分、过滤阈值和工具超时等可调参数。
+- `tests/`：单元测试、集成测试和端到端测试。
+- `docs/`：给开发者、迁移者和使用者看的说明文档。
+
+## 4. 环境要求
 
 推荐环境：
 
