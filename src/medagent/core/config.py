@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    app_name: str = "Small Molecule Drug Design Agent"
+    app_name: str = "小分子药物设计 Agent"
     database_url: str = "sqlite:///./.local/medagent.db"
 
     storage_endpoint: str = "localhost:9000"
