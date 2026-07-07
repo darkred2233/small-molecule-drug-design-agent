@@ -110,6 +110,15 @@ class MoleculeRead(BaseModel):
     scaffold: str | None = Field(title="骨架")
     status: str = Field(title="分子状态")
     labels: list[str] = Field(title="标签")
+    source_agent: str | None = Field(default=None, title="来源 Agent")
+
+
+class MoleculeImportResponse(BaseModel):
+    imported_count: int = Field(title="导入数量")
+    duplicate_count: int = Field(title="重复跳过数量")
+    invalid_count: int = Field(title="非法跳过数量")
+    imported_molecule_ids: list[str] = Field(title="已导入分子编号")
+    skipped: list[dict[str, Any]] = Field(title="跳过明细")
 
 
 class AdviceRead(BaseModel):

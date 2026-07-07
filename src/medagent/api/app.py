@@ -29,6 +29,7 @@ from medagent.domain.schemas import (
     ChatResponse,
     ConstraintRead,
     FileParseResult,
+    MoleculeImportResponse,
     MoleculeRead,
     ProjectCreate,
     ProjectRead,
@@ -45,6 +46,7 @@ from medagent.services.file_ingestion import (
     save_upload_file,
 )
 from medagent.services.ids import new_id
+from medagent.services.molecule_import import import_seed_ligands_as_molecules
 
 SessionLocal: sessionmaker[Session]
 
@@ -484,6 +486,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     <p>返回由 SMILES、CSV 或 SDF 文件解析得到的种子配体。</p>
                   </article>
                   <article class="card">
+                    <div class="route"><span class="method post">POST</span><code>/projects/{project_id}/molecules/import-seeds</code></div>
+                    <h2>导入种子配体为候选分子</h2>
+                    <p>轻量校验 SMILES、按项目去重，并写入 molecules 表。</p>
+                  </article>
+                  <article class="card">
                     <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/report</code></div>
                     <h2>查看报告骨架</h2>
                     <p>返回可追踪报告的章节骨架和当前项目摘要。</p>
@@ -808,9 +815,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 scaffold=item.scaffold,
                 status=item.status,
                 labels=item.labels,
+                source_agent=item.source_agent,
             )
             for item in molecules
         ]
+
+    @app.post(
+        "/projects/{project_id}/molecules/import-seeds",
+        response_model=MoleculeImportResponse,
+        status_code=201,
+        tags=["结果查询"],
+        summary="导入种子配体为候选分子",
+    )
+    def import_seed_molecules(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        return import_seed_ligands_as_molecules(db, project)
+
+    @app.get(
+        "/projects/{project_id}/molecules/{molecule_id}",
+        response_model=MoleculeRead,
+        tags=["结果查询"],
+        summary="查看单个候选分子",
+    )
+    def get_molecule(project_id: str, molecule_id: str, db: Session = Depends(get_db)):
+        _get_project(db, project_id)
+        molecule = db.query(Molecule).filter_by(project_id=project_id, molecule_id=molecule_id).one_or_none()
+        if molecule is None:
+            raise HTTPException(status_code=404, detail="未找到该分子")
+        return MoleculeRead(
+            molecule_id=molecule.molecule_id,
+            smiles=molecule.smiles,
+            scaffold=molecule.scaffold,
+            status=molecule.status,
+            labels=molecule.labels,
+            source_agent=molecule.source_agent,
+        )
 
     @app.get(
         "/projects/{project_id}/seed-ligands",
