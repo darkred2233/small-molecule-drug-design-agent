@@ -14,6 +14,7 @@ from medagent.db.models import (
     Base,
     ConversationMessage,
     Molecule,
+    MoleculeProperty,
     OptimizationConstraint,
     Project,
     SeedLigand,
@@ -30,7 +31,9 @@ from medagent.domain.schemas import (
     ConstraintRead,
     FileParseResult,
     MoleculeImportResponse,
+    MoleculePropertyRead,
     MoleculeRead,
+    MoleculeValidationResponse,
     ProjectCreate,
     ProjectRead,
     ProjectStatus,
@@ -47,6 +50,7 @@ from medagent.services.file_ingestion import (
 )
 from medagent.services.ids import new_id
 from medagent.services.molecule_import import import_seed_ligands_as_molecules
+from medagent.services.molecule_validation import validate_project_molecules
 
 SessionLocal: sessionmaker[Session]
 
@@ -491,6 +495,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     <p>轻量校验 SMILES、按项目去重，并写入 molecules 表。</p>
                   </article>
                   <article class="card">
+                    <div class="route"><span class="method post">POST</span><code>/projects/{project_id}/molecules/validate</code></div>
+                    <h2>轻量校验候选分子</h2>
+                    <p>检查括号、环编号等基础结构问题，并为通过校验的分子写入估算性质。</p>
+                  </article>
+                  <article class="card">
+                    <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/molecules/{molecule_id}/properties</code></div>
+                    <h2>查看候选分子性质</h2>
+                    <p>返回分子量、氢键供体/受体和校验元数据；当前结果仍需后续 RDKit 复核。</p>
+                  </article>
+                  <article class="card">
                     <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/report</code></div>
                     <h2>查看报告骨架</h2>
                     <p>返回可追踪报告的章节骨架和当前项目摘要。</p>
@@ -830,6 +844,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def import_seed_molecules(project_id: str, db: Session = Depends(get_db)):
         project = _get_project(db, project_id)
         return import_seed_ligands_as_molecules(db, project)
+
+    @app.post(
+        "/projects/{project_id}/molecules/validate",
+        response_model=MoleculeValidationResponse,
+        tags=["结果查询"],
+        summary="轻量校验候选分子",
+    )
+    def validate_molecules(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        return validate_project_molecules(db, project)
+
+    @app.get(
+        "/projects/{project_id}/molecules/{molecule_id}/properties",
+        response_model=MoleculePropertyRead,
+        tags=["结果查询"],
+        summary="查看候选分子性质",
+    )
+    def get_molecule_properties(project_id: str, molecule_id: str, db: Session = Depends(get_db)):
+        _get_project(db, project_id)
+        molecule = db.query(Molecule).filter_by(project_id=project_id, molecule_id=molecule_id).one_or_none()
+        if molecule is None:
+            raise HTTPException(status_code=404, detail="未找到该分子")
+
+        properties = db.query(MoleculeProperty).filter_by(molecule_id=molecule_id).one_or_none()
+        if properties is None:
+            raise HTTPException(status_code=404, detail="该分子尚未生成性质记录，请先运行轻量校验")
+
+        return MoleculePropertyRead(
+            molecule_id=properties.molecule_id,
+            mw=properties.mw,
+            logp=properties.logp,
+            tpsa=properties.tpsa,
+            hbd=properties.hbd,
+            hba=properties.hba,
+            sa_score=properties.sa_score,
+            tool_metadata=properties.tool_metadata or {},
+        )
 
     @app.get(
         "/projects/{project_id}/molecules/{molecule_id}",

@@ -121,6 +121,25 @@ class MoleculeImportResponse(BaseModel):
     skipped: list[dict[str, Any]] = Field(title="跳过明细")
 
 
+class MoleculeValidationResponse(BaseModel):
+    validated_count: int = Field(title="校验通过数量")
+    invalid_count: int = Field(title="结构异常数量")
+    property_count: int = Field(title="性质记录数量")
+    validated_molecule_ids: list[str] = Field(title="校验通过分子编号")
+    invalid_molecule_ids: list[str] = Field(title="结构异常分子编号")
+
+
+class MoleculePropertyRead(BaseModel):
+    molecule_id: str = Field(title="分子编号")
+    mw: float | None = Field(title="估算分子量")
+    logp: float | None = Field(title="LogP")
+    tpsa: float | None = Field(title="TPSA")
+    hbd: int | None = Field(title="氢键供体数")
+    hba: int | None = Field(title="氢键受体数")
+    sa_score: float | None = Field(title="合成可及性分数")
+    tool_metadata: dict[str, Any] = Field(title="工具元数据")
+
+
 class AdviceRead(BaseModel):
     suggestion_id: str = Field(title="建议编号")
     summary: str = Field(title="建议摘要")
