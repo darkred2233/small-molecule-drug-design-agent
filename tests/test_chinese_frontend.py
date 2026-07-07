@@ -25,6 +25,8 @@ def test_swagger_page_uses_chinese_title(tmp_path):
 
     assert response.status_code == 200
     assert "小分子药物设计 Agent - 接口文档" in response.text
+    assert "/projects/{project_id}/seed-ligands" in response.text
+    assert "查看文件解析结果" in response.text
 
 
 def test_openapi_metadata_is_chinese(tmp_path):

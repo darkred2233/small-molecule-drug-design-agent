@@ -70,6 +70,22 @@ class UploadedFileRead(BaseModel):
     parse_status: str = Field(title="解析状态")
 
 
+class FileParseResult(BaseModel):
+    file_id: str = Field(title="文件编号")
+    filename: str = Field(title="文件名")
+    parse_status: str = Field(title="解析状态")
+    metadata: dict[str, Any] = Field(title="解析元数据")
+
+
+class SeedLigandRead(BaseModel):
+    ligand_id: str = Field(title="种子配体编号")
+    name: str | None = Field(title="名称")
+    smiles: str = Field(title="SMILES")
+    activity_value: float | None = Field(title="活性值")
+    activity_unit: str | None = Field(title="活性单位")
+    source: str | None = Field(title="来源文件编号")
+
+
 class AgentRunRead(BaseModel):
     agent_run_id: str = Field(title="Agent 运行编号")
     agent_name: str = Field(title="Agent 名称")

@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     storage_access_key: str = "medagent"
     storage_secret_key: str = "medagent-secret"
     storage_bucket: str = "medagent-files"
+    storage_local_root: str = "./.local/uploads"
 
     qwen_reasoning_model: str = "qwen3.7-max"
     qwen_task_model: str = "qwen3.7-plus"

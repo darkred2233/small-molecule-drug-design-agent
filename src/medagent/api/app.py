@@ -16,7 +16,9 @@ from medagent.db.models import (
     Molecule,
     OptimizationConstraint,
     Project,
+    SeedLigand,
     Target,
+    UploadedFile as UploadedFileModel,
 )
 from medagent.db.session import build_session_factory
 from medagent.domain.schemas import (
@@ -26,15 +28,22 @@ from medagent.domain.schemas import (
     ChatRequest,
     ChatResponse,
     ConstraintRead,
+    FileParseResult,
     MoleculeRead,
     ProjectCreate,
     ProjectRead,
     ProjectStatus,
     RunPipelineRequest,
+    SeedLigandRead,
     UploadedFileRead,
 )
 from medagent.services.bootstrap import seed_builtin_targets
 from medagent.services.database import database_summary, ensure_relational_schema
+from medagent.services.file_ingestion import (
+    parse_pending_project_files,
+    parse_single_file,
+    save_upload_file,
+)
 from medagent.services.ids import new_id
 
 SessionLocal: sessionmaker[Session]
@@ -455,9 +464,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     <p>创建知识导入 Agent 运行记录；RAG 暂未接入。</p>
                   </article>
                   <article class="card">
+                    <div class="route"><span class="method post">POST</span><code>/projects/{project_id}/files/{file_id}/parse</code></div>
+                    <h2>重新解析单个文件</h2>
+                    <p>重新读取已上传文件，并把 SMILES、CSV、SDF 或 PDB 内容写入关系数据库。</p>
+                  </article>
+                  <article class="card">
+                    <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/files/{file_id}/parse-result</code></div>
+                    <h2>查看文件解析结果</h2>
+                    <p>查看解析状态、记录数、seed ligand 数量、PDB 摘要或失败原因。</p>
+                  </article>
+                  <article class="card">
                     <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/constraints</code></div>
                     <h2>查看当前优化约束</h2>
                     <p>按优先级返回当前项目的结构化约束。</p>
+                  </article>
+                  <article class="card">
+                    <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/seed-ligands</code></div>
+                    <h2>查看种子配体</h2>
+                    <p>返回由 SMILES、CSV 或 SDF 文件解析得到的种子配体。</p>
                   </article>
                   <article class="card">
                     <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/report</code></div>
@@ -595,17 +619,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Session = Depends(get_db),
     ):
         _get_project(db, project_id)
-        from medagent.db.models import UploadedFile as UploadedFileModel
-
         file_id = new_id("FILE")
+        await file.seek(0)
+        storage_path = save_upload_file(
+            app_settings,
+            project_id,
+            file_id,
+            file.filename or file_id,
+            file.file,
+        )
         uploaded = UploadedFileModel(
             file_id=file_id,
             project_id=project_id,
             filename=file.filename or file_id,
             file_type=file.content_type or "application/octet-stream",
-            storage_path=f"pending://{project_id}/{file_id}/{file.filename}",
+            storage_path=f"local://{storage_path}",
             parse_status="uploaded",
-            metadata_json={"note": "Storage adapter is not connected in M1 scaffold."},
+            metadata_json={"storage_backend": "local", "original_filename": file.filename or file_id},
         )
         db.add(uploaded)
         db.commit()
@@ -616,21 +646,69 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             parse_status=uploaded.parse_status,
         )
 
+    @app.get(
+        "/projects/{project_id}/files",
+        response_model=list[UploadedFileRead],
+        tags=["文件与导入"],
+        summary="查看项目上传文件",
+    )
+    def list_project_files(project_id: str, db: Session = Depends(get_db)):
+        _get_project(db, project_id)
+        files = (
+            db.query(UploadedFileModel)
+            .filter_by(project_id=project_id)
+            .order_by(UploadedFileModel.created_at.asc())
+            .all()
+        )
+        return [
+            UploadedFileRead(
+                file_id=item.file_id,
+                filename=item.filename,
+                file_type=item.file_type,
+                parse_status=item.parse_status,
+            )
+            for item in files
+        ]
+
     @app.post("/projects/{project_id}/ingest", status_code=202, tags=["文件与导入"], summary="创建知识导入任务")
     def ingest(project_id: str, db: Session = Depends(get_db)):
-        _get_project(db, project_id)
+        project = _get_project(db, project_id)
+        parse_summary = parse_pending_project_files(db, app_settings, project)
         run = AgentRun(
             agent_run_id=new_id("RUN"),
             project_id=project_id,
             agent_name="knowledge_ingestion_agent",
             model_name=app_settings.qwen_task_model,
-            status="queued",
+            status="completed",
             input_json={"project_id": project_id},
-            output_json={"message": "Ingestion job queued; parsers will be attached in M2."},
+            output_json=parse_summary,
         )
         db.add(run)
         db.commit()
-        return {"agent_run_id": run.agent_run_id, "status": run.status}
+        return {"agent_run_id": run.agent_run_id, "status": run.status, **parse_summary}
+
+    @app.post(
+        "/projects/{project_id}/files/{file_id}/parse",
+        response_model=FileParseResult,
+        tags=["文件与导入"],
+        summary="重新解析单个文件",
+    )
+    def parse_project_file(project_id: str, file_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        uploaded_file = _get_uploaded_file(db, project_id, file_id)
+        parse_single_file(db, app_settings, project, uploaded_file)
+        db.refresh(uploaded_file)
+        return _file_parse_result(uploaded_file)
+
+    @app.get(
+        "/projects/{project_id}/files/{file_id}/parse-result",
+        response_model=FileParseResult,
+        tags=["文件与导入"],
+        summary="查看文件解析结果",
+    )
+    def get_file_parse_result(project_id: str, file_id: str, db: Session = Depends(get_db)):
+        uploaded_file = _get_uploaded_file(db, project_id, file_id)
+        return _file_parse_result(uploaded_file)
 
     @app.post(
         "/projects/{project_id}/run",
@@ -735,6 +813,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
 
     @app.get(
+        "/projects/{project_id}/seed-ligands",
+        response_model=list[SeedLigandRead],
+        tags=["结果查询"],
+        summary="查看种子配体",
+    )
+    def list_seed_ligands(project_id: str, db: Session = Depends(get_db)):
+        _get_project(db, project_id)
+        ligands = db.query(SeedLigand).filter_by(project_id=project_id).order_by(SeedLigand.id.asc()).all()
+        return [
+            SeedLigandRead(
+                ligand_id=item.ligand_id,
+                name=item.name,
+                smiles=item.smiles,
+                activity_value=item.activity_value,
+                activity_unit=item.activity_unit,
+                source=item.source,
+            )
+            for item in ligands
+        ]
+
+    @app.get(
         "/projects/{project_id}/advice",
         response_model=list[AdviceRead],
         tags=["结果查询"],
@@ -808,6 +907,22 @@ def _get_project(db: Session, project_id: str) -> Project:
     if project is None:
         raise HTTPException(status_code=404, detail="未找到该项目")
     return project
+
+
+def _get_uploaded_file(db: Session, project_id: str, file_id: str) -> UploadedFileModel:
+    uploaded_file = db.query(UploadedFileModel).filter_by(project_id=project_id, file_id=file_id).one_or_none()
+    if uploaded_file is None:
+        raise HTTPException(status_code=404, detail="未找到该文件")
+    return uploaded_file
+
+
+def _file_parse_result(uploaded_file: UploadedFileModel) -> FileParseResult:
+    return FileParseResult(
+        file_id=uploaded_file.file_id,
+        filename=uploaded_file.filename,
+        parse_status=uploaded_file.parse_status,
+        metadata=uploaded_file.metadata_json or {},
+    )
 
 
 def _project_to_read(project: Project) -> ProjectRead:
