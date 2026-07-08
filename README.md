@@ -1,21 +1,29 @@
-# 小分子药物设计 Agent
+# Small Molecule Drug Design Agent
 
-这是按《小分子药物设计 Agent 开发文档 v2.1》启动的项目骨架。当前版本聚焦 M1：FastAPI 服务、核心数据模型、内置靶点-药物库、自然语言约束解析入口、Agent 运行日志和可追踪报告接口。
+小分子药物设计 Agent 是一个面向小分子药物设计的可追踪、证据驱动多智能体系统。项目目标是把靶点资料、用户上传数据、候选分子导入、结构校验、规则过滤、RAG 证据、自我反驳、综合排序和报告生成串成一个可审计的智能体工作流，帮助用户理解每个候选分子为什么被推荐或淘汰。
+
+当前代码处于 MVP 早期阶段，重点是先打通后端 API、关系数据库、内置靶点库、文件上传解析、候选分子导入、轻量分子校验和中文接口页面。RAG、Docking、ADMET、合成路线和真实分子生成将在后续阶段接入。
 
 ## 当前已包含
 
 - FastAPI 后端骨架
+- 中文首页和中文接口说明页
+- Swagger 调试页：`/swagger`
 - PostgreSQL/pgvector/MinIO 的 Docker Compose 配置
-- 文档要求的核心关系表 SQLAlchemy 模型
+- SQLAlchemy 关系数据库模型
 - 内置靶点-药物关系库：10 个 MVP 靶点、32 个代表药物
-- 数据库摘要接口：`GET /database/summary`
-- 内置靶点接口：`GET /builtin-targets`
+- 可迁移 SQLite 种子库快照：`database/medagent_seed.sqlite`
 - 项目创建接口：`POST /projects`
-- 对话约束接口：`POST /projects/{id}/chat`
-- 流程启动占位接口：`POST /projects/{id}/run`
-- 状态、分子、约束、建议、报告查询接口
-- 标准化工具运行输出结构
-- 基础 pytest 测试
+- 自然语言约束解析接口：`POST /projects/{project_id}/chat`
+- 文件上传接口：`POST /projects/{project_id}/files`
+- 文件解析接口：`POST /projects/{project_id}/ingest`
+- 单文件重新解析接口：`POST /projects/{project_id}/files/{file_id}/parse`
+- 种子配体查询接口：`GET /projects/{project_id}/seed-ligands`
+- 候选分子导入接口：`POST /projects/{project_id}/molecules/import-seeds`
+- 候选分子轻量校验接口：`POST /projects/{project_id}/molecules/validate`
+- 候选分子性质查询接口：`GET /projects/{project_id}/molecules/{molecule_id}/properties`
+- 流程 dry-run、状态查询、约束查询、报告骨架接口
+- pytest 自动化测试
 
 ## 本地运行
 
@@ -24,15 +32,18 @@ cd C:\Users\34471\Desktop\small-molecule-drug-design-agent
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
-python -m uvicorn medagent.main:app --reload --host 127.0.0.1 --port 8000
+$env:PYTHONPATH='src'
+python -m uvicorn medagent.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
 打开：
 
-- API 文档：http://127.0.0.1:8000/docs
+- 中文首页：http://127.0.0.1:8000/
+- 中文接口说明：http://127.0.0.1:8000/docs
+- Swagger 调试页：http://127.0.0.1:8000/swagger
 - 健康检查：http://127.0.0.1:8000/health
 
-默认使用本地 SQLite，方便快速试跑。生产或完整 M1 环境请复制 `.env.example`，把 `MEDAGENT_DATABASE_URL` 指向 PostgreSQL。
+默认使用本地 SQLite，方便快速试跑。生产或完整环境请复制 `.env.example`，把 `MEDAGENT_DATABASE_URL` 指向 PostgreSQL。
 
 ## 启动基础设施
 
@@ -40,37 +51,37 @@ python -m uvicorn medagent.main:app --reload --host 127.0.0.1 --port 8000
 docker compose up -d
 ```
 
-Compose 会启动 PostgreSQL + pgvector 和 MinIO。RDKit cartridge 在不同发行镜像中支持差异较大，当前迁移脚本将 RDKit 作为可选扩展记录，真正分子计算建议放在独立工具容器中，通过标准化 tool-run 接口接入。
+Compose 会启动 PostgreSQL + pgvector 和 MinIO。RDKit cartridge 在不同发行镜像中支持差异较大，真实分子计算建议放在独立工具容器或 Python 化学工具适配器中，通过标准化 tool-run 接口接入。
 
 ## 测试
 
 ```powershell
 python -m pytest
+python -m ruff check .
 ```
 
 ## 关系数据库快照
 
-已生成可迁移 SQLite 种子库：
-
-```text
-database/medagent_seed.sqlite
-```
-
-重新生成：
+重新生成 SQLite 种子库快照：
 
 ```powershell
 $env:PYTHONPATH='src'
 python -m medagent.cli db snapshot --output database/medagent_seed.sqlite
 ```
 
-详细说明见：
+相关文档：
 
-```text
-docs/RELATIONAL_DATABASE_BUILD.md
-```
+- `docs/RELATIONAL_DATABASE_BUILD.md`
+- `docs/FILE_INGESTION_BUILD.md`
+- `docs/MOLECULE_IMPORT_BUILD.md`
+- `docs/MOLECULE_VALIDATION_BUILD.md`
+- `docs/MIGRATION_GUIDE.md`
 
-## 下一步建议
+## 下一步路线
 
-1. M2：补齐文件上传解析流水线，接入 PDF/CSV/SDF/PDB parser。
-2. M3：接入 embedding 与 rerank，落地 RAG chunk、检索和 evidence_id。
-3. M4：接入 RDKit/Datamol 规则过滤，形成真实 MoleculeRecord 生命周期。
+1. 接入 RDKit/Datamol，替换当前轻量分子校验和粗略性质估算。
+2. 增加 Lipinski、PAINS、Brenk、基础毒性团等规则过滤。
+3. 实现 ReasoningTrace 和 DecisionCard，让推荐/淘汰理由可解释、可追踪。
+4. 接入 RAG 文献证据库。
+5. 接入 Docking、ADMET、合成可及性评估。
+6. 实现 Self-Refutation、Ranker、Advisor 和最终报告生成。
