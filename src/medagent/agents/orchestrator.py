@@ -5,7 +5,9 @@ from sqlalchemy.orm import Session
 
 from medagent.core.config import Settings
 from medagent.db.models import AgentRun, Molecule, Project
+from medagent.services.advisor import generate_project_advice
 from medagent.services.candidate_assessment import run_project_candidate_assessment
+from medagent.services.candidate_ranking import generate_project_rankings
 from medagent.services.decision_cards import generate_project_decision_cards
 from medagent.services.file_ingestion import parse_pending_project_files
 from medagent.services.ids import new_id
@@ -13,6 +15,8 @@ from medagent.services.molecule_generation import generate_project_molecules
 from medagent.services.molecule_import import import_seed_ligands_as_molecules
 from medagent.services.molecule_validation import validate_project_molecules
 from medagent.services.rag import build_project_rag_index
+from medagent.services.project_report import build_project_report
+from medagent.services.self_refutation import generate_project_critiques
 from medagent.services.rule_filtering import filter_project_molecules
 
 
@@ -160,6 +164,55 @@ class PipelineOrchestrator:
             self._run_step(
                 db,
                 project,
+                "self_refutation_agent",
+                "deepseek-v4-pro",
+                {"mode": "full", "max_molecules": 50},
+                lambda: record_output(
+                    "self_refutation_agent",
+                    generate_project_critiques(
+                        db,
+                        project,
+                        settings=self.settings,
+                        max_molecules=50,
+                    ),
+                ),
+            )
+        )
+        runs.append(
+            self._run_step(
+                db,
+                project,
+                "ranker_agent",
+                "qwen3.7-max",
+                {
+                    "mode": "full",
+                    "max_molecules": 50,
+                    "top_n": 50,
+                    "source": "self_refutation",
+                },
+                lambda: record_output(
+                    "ranker_agent",
+                    generate_project_rankings(db, project, max_molecules=50, top_n=50).as_dict(),
+                ),
+            )
+        )
+        runs.append(
+            self._run_step(
+                db,
+                project,
+                "advisor_agent",
+                "qwen3.7-plus",
+                {"mode": "full"},
+                lambda: record_output(
+                    "advisor_agent",
+                    generate_project_advice(db, project),
+                ),
+            )
+        )
+        runs.append(
+            self._run_step(
+                db,
+                project,
                 "decision_card_agent",
                 "qwen3.7-plus",
                 {"mode": "full", "molecule_count": self._molecule_count(db, project)},
@@ -169,8 +222,22 @@ class PipelineOrchestrator:
                 ),
             )
         )
-
         project.status = "pipeline_completed"
+        db.commit()
+        runs.append(
+            self._run_step(
+                db,
+                project,
+                "report_agent",
+                "qwen3.7-plus",
+                {"mode": "full"},
+                lambda: record_output(
+                    "report_agent",
+                    build_project_report(db, project),
+                ),
+            )
+        )
+
         db.commit()
         return runs
 

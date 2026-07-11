@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from medagent.db.models import (
     ADMETResult,
     AgentRun,
+    Critique,
     DockingResult,
     EvidenceLink,
     Molecule,
@@ -66,6 +67,7 @@ class EvidenceBundle:
     docking: DockingResult | None
     admet: ADMETResult | None
     synthesis: SynthesisRoute | None
+    critique: Critique | None
     rag_evidence: list[EvidenceLink]
 
 
@@ -172,6 +174,7 @@ def _load_evidence_bundle(db: Session, molecule: Molecule) -> EvidenceBundle:
         docking=db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
         admet=db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
         synthesis=db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
+        critique=db.query(Critique).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
         rag_evidence=(
             db.query(EvidenceLink)
             .filter_by(molecule_id=molecule.molecule_id)
@@ -187,6 +190,7 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
     synthesis = _score_synthesis(bundle.synthesis)
     rule_filter = _score_rule_filter(bundle.rule_filter)
     properties = _score_properties(bundle.properties)
+    critique = _score_critique(bundle.critique)
     rag_evidence = _score_rag_evidence(bundle.rag_evidence)
     components = {
         "docking": docking,
@@ -194,6 +198,7 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
         "synthesis": synthesis,
         "rule_filter": rule_filter,
         "properties": properties,
+        "critique": critique,
         "rag_evidence": rag_evidence,
     }
 
@@ -210,17 +215,24 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
     )
     con_score = round(
         100
-        * (
+        * _clamp(
             docking.risk * 0.25
             + admet.risk * 0.35
             + synthesis.risk * 0.20
             + rule_filter.risk * 0.10
             + properties.risk * 0.10
+            + critique.risk * 0.20,
+            0,
+            1,
         ),
         3,
     )
     evidence_confidence = _evidence_confidence(components)
-    overall_score = round(_clamp(pro_score - con_score * 0.55 + evidence_confidence * 8, 0, 100), 3)
+    critique_penalty = _critique_overall_penalty(critique)
+    overall_score = round(
+        _clamp(pro_score - con_score * 0.55 + evidence_confidence * 8 - critique_penalty, 0, 100),
+        3,
+    )
     blockers = _dedupe(
         docking.blockers
         + admet.blockers
@@ -234,6 +246,7 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
         con_score=con_score,
         evidence_confidence=evidence_confidence,
         blockers=blockers,
+        critique=critique,
     )
     score_breakdown = {
         "adapter_mode": RANKING_ADAPTER_MODE,
@@ -244,6 +257,7 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
                 "synthesis": 0.20,
                 "rule_filter": 0.10,
                 "properties": 0.10,
+                "critique": 0.00,
             },
             "con": {
                 "docking": 0.25,
@@ -251,6 +265,7 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
                 "synthesis": 0.20,
                 "rule_filter": 0.10,
                 "properties": 0.10,
+                "critique": 0.20,
             },
         },
         "docking": docking.details,
@@ -258,6 +273,8 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
         "synthesis": synthesis.details,
         "rule_filter": rule_filter.details,
         "properties": properties.details,
+        "critique": critique.details,
+        "critique_overall_penalty": critique_penalty,
         "rag_evidence": rag_evidence.details,
         "blockers": blockers,
         "molecule_labels": molecule.labels or [],
@@ -482,6 +499,54 @@ def _score_properties(result: MoleculeProperty | None) -> ComponentScore:
     )
 
 
+def _score_critique(result: Critique | None) -> ComponentScore:
+    if result is None:
+        return ComponentScore(
+            available=False,
+            positive=0.50,
+            risk=0.15,
+            details={"available": False, "reason": "missing_self_refutation_result"},
+        )
+
+    con_score = _clamp(float(result.con_score or 0.0) / 100.0, 0, 1)
+    decision = result.refutation_decision or "reserve"
+    if decision == "reject":
+        positive = 0.05
+        risk = 0.95
+    elif decision == "reserve":
+        positive = 0.35
+        risk = _clamp(0.45 + con_score * 0.40, 0, 1)
+    else:
+        positive = 0.90
+        risk = 0.10
+
+    return ComponentScore(
+        available=True,
+        positive=positive,
+        risk=risk,
+        details={
+            "available": True,
+            "positive_score": round(positive, 3),
+            "risk_score": round(risk, 3),
+            "con_score": round(float(result.con_score or 0.0), 3),
+            "risk_level": result.risk_level,
+            "refutation_decision": decision,
+            "reason": result.reason,
+            "evidence_ids": result.evidence_ids or [],
+        },
+        blockers=["self_refutation_reject"] if decision == "reject" else [],
+    )
+
+
+def _critique_overall_penalty(critique: ComponentScore) -> float:
+    decision = critique.details.get("refutation_decision")
+    if decision == "reject":
+        return 30.0
+    if decision == "reserve":
+        return 12.0
+    return 0.0
+
+
 def _score_rag_evidence(links: list[EvidenceLink]) -> ComponentScore:
     if not links:
         return ComponentScore(
@@ -541,6 +606,7 @@ def _final_decision(
     con_score: float,
     evidence_confidence: float,
     blockers: list[str],
+    critique: ComponentScore,
 ) -> str:
     labels = set(molecule.labels or [])
     hard_blockers = {
@@ -552,6 +618,12 @@ def _final_decision(
     has_hard_blocker = bool(hard_blockers.intersection(blockers))
     if "invalid_structure" in labels:
         return "reject"
+    if critique.details.get("refutation_decision") == "reject":
+        return "reject"
+    if critique.details.get("refutation_decision") == "reserve":
+        if overall_score >= 70 and evidence_confidence >= 0.55:
+            return "watch"
+        return "reserve"
     if con_score >= 70 or (has_hard_blocker and overall_score < 45):
         return "reject"
     if overall_score >= 70 and con_score <= 35 and evidence_confidence >= 0.65 and not has_hard_blocker:

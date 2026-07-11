@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from medagent.api.app import create_app
@@ -126,7 +128,11 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         assert "knowledge_ingestion_agent" in agent_names
         assert "filter_agent" in agent_names
         assert "candidate_assessment_agent" in agent_names
+        assert "ranker_agent" in agent_names
+        assert "self_refutation_agent" in agent_names
+        assert "advisor_agent" in agent_names
         assert "decision_card_agent" in agent_names
+        assert "report_agent" in agent_names
         pipeline_run_names = {
             "knowledge_ingestion_agent",
             "molecule_import_agent",
@@ -134,12 +140,16 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
             "validation_agent",
             "filter_agent",
             "candidate_assessment_agent",
+            "ranker_agent",
+            "self_refutation_agent",
+            "advisor_agent",
             "decision_card_agent",
+            "report_agent",
         }
         pipeline_runs = [
             run for run in body["agent_runs"] if run["agent_name"] in pipeline_run_names
         ]
-        assert len(pipeline_runs) == 7
+        assert len(pipeline_runs) == 11
         assert all(run["status"] == "completed" for run in pipeline_runs)
 
         molecules = client.get(f"/projects/{project_id}/molecules").json()
@@ -152,3 +162,21 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         decision_cards = client.get(f"/projects/{project_id}/decision-cards").json()
         assert len(decision_cards) >= 2
         assert all(card["trace_id"] for card in decision_cards)
+
+        advice = client.get(f"/projects/{project_id}/advice").json()
+        assert len(advice) == 1
+        assert len(advice[0]["suggestions"]) >= 3
+        assert advice[0]["next_round_constraints"]
+        assert advice[0]["suggested_generation_config"]["rerank_after_generation"] is True
+
+        constraints = client.get(f"/projects/{project_id}/constraints").json()
+        assert any(item["label"].startswith("advisor_") for item in constraints)
+
+        report = client.get(f"/projects/{project_id}/report").json()
+        assert report["project_summary"]["project_id"] == project_id
+        assert report["project_summary"]["status"] == "pipeline_completed"
+        assert len(report["top_candidates"]) >= 2
+        assert report["self_refutation"]["critique_count"] >= 2
+        assert report["candidate_summary"]["top_molecule_count"] >= 2
+        assert report["top_candidates"][0]["refutation_chain"]
+        assert Path(report["report_file"]).exists()

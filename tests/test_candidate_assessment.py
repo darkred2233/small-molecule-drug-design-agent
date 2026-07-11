@@ -1,7 +1,9 @@
 from fastapi.testclient import TestClient
 
+import medagent.api.app as api_app
 from medagent.api.app import create_app
 from medagent.core.config import Settings
+from medagent.db.models import Critique
 from medagent.services import candidate_assessment
 from medagent.services.docking_adapters import DockingToolResult
 
@@ -143,6 +145,40 @@ def test_project_rankings_can_be_regenerated_without_duplicate_rows(tmp_path):
         assert len(rankings) == 2
         assert [item["rank"] for item in rankings] == [1, 2]
         assert all(item["evidence_confidence"] > 0 for item in rankings)
+
+
+def test_project_rankings_consume_self_refutation_critiques(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+        assert client.post(f"/projects/{project_id}/candidate-assessment/run", json={}).status_code == 200
+        initial_rankings = client.get(f"/projects/{project_id}/rankings").json()
+        penalized_id = initial_rankings[0]["molecule_id"]
+        initial_score = initial_rankings[0]["overall_score"]
+
+        with api_app.SessionLocal() as db:
+            db.add(
+                Critique(
+                    critique_id="CRT-TEST",
+                    molecule_id=penalized_id,
+                    con_score=95.0,
+                    risk_level="high",
+                    reason="Manual test critique that should force ranker rejection.",
+                    evidence_ids=["TEST:EVIDENCE"],
+                    refutation_decision="reject",
+                )
+            )
+            db.commit()
+
+        response = client.post(f"/projects/{project_id}/rankings/generate", json={})
+        assert response.status_code == 200
+
+        reranked = client.get(f"/projects/{project_id}/rankings").json()
+        penalized = next(item for item in reranked if item["molecule_id"] == penalized_id)
+        assert penalized["final_decision"] == "reject"
+        assert penalized["overall_score"] < initial_score
+        assert penalized["score_breakdown"]["critique"]["available"] is True
+        assert penalized["score_breakdown"]["critique"]["refutation_decision"] == "reject"
+        assert penalized["score_breakdown"]["critique_overall_penalty"] == 30.0
 
 
 def test_candidate_assessment_uses_external_gnina_adapter_when_ready(tmp_path, monkeypatch):

@@ -461,6 +461,16 @@ class AdviceRead(BaseModel):
     suggestions: list[dict[str, Any]] = Field(title="建议列表")
 
 
+    next_round_constraints: list[dict[str, Any]] = Field(
+        default_factory=list,
+        title="Next-round optimization constraints",
+    )
+    suggested_generation_config: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Suggested generation config",
+    )
+
+
 class ReasoningTraceRead(BaseModel):
     trace_id: str = Field(title="Reasoning trace id")
     project_id: str = Field(title="Project id")

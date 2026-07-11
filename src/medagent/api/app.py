@@ -94,6 +94,7 @@ from medagent.services.ids import new_id
 from medagent.services.molecule_generation import generate_project_molecules
 from medagent.services.molecule_import import import_seed_ligands_as_molecules
 from medagent.services.molecule_validation import validate_project_molecules
+from medagent.services.project_report import build_project_report
 from medagent.services.rag import build_project_rag_index, crawl_project_urls, query_project_rag
 from medagent.services.receptor_preparation import (
     binding_site_to_payload,
@@ -1442,6 +1443,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 suggestion_id=item.suggestion_id,
                 summary=item.summary,
                 suggestions=item.suggestions,
+                next_round_constraints=item.next_round_constraints or [],
+                suggested_generation_config=item.suggested_generation_config or {},
             )
             for item in suggestions
         ]
@@ -1449,48 +1452,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/projects/{project_id}/report", tags=["结果查询"], summary="查看报告骨架")
     def get_report(project_id: str, db: Session = Depends(get_db)):
         project = _get_project(db, project_id)
-        constraints = (
-            db.query(OptimizationConstraint)
-            .filter_by(project_id=project_id)
-            .order_by(OptimizationConstraint.priority.desc())
-            .all()
+        report_run = (
+            db.query(AgentRun)
+            .filter_by(project_id=project_id, agent_name="report_agent")
+            .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+            .first()
         )
-        return {
-            "project_summary": {
-                "project_id": project.project_id,
-                "name": project.name,
-                "target_id": project.target_id,
-                "objective": project.objective,
-                "status": project.status,
-            },
-            "constraints": [
-                {
-                    "constraint_id": item.constraint_id,
-                    "label": item.label,
-                    "field": item.field,
-                    "operator": item.operator,
-                    "value": item.value,
-                    "priority": item.priority,
-                }
-                for item in constraints
-            ],
-            "sections": [
-                "project_summary",
-                "input_information",
-                "rag_evidence_overview",
-                "target_and_pocket_analysis",
-                "candidate_molecules",
-                "filtering_statistics",
-                "docking_overview",
-                "admet_overview",
-                "synthesis_overview",
-                "self_refutation",
-                "advisor_suggestions",
-                "top_candidates",
-                "evidence_links",
-                "technical_appendix",
-            ],
-        }
+        if report_run is not None and report_run.output_json:
+            return report_run.output_json
+        return build_project_report(db, project)
 
     @app.post(
         "/projects/{project_id}/rag/collect",

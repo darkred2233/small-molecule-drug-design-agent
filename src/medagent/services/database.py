@@ -64,6 +64,20 @@ def ensure_relational_schema(engine: Engine) -> None:
             _ranking_columns(),
         )
 
+    if "critiques" in table_names:
+        _ensure_missing_columns(
+            engine,
+            "critiques",
+            _critique_columns(),
+        )
+
+    if "advisor_suggestions" in table_names:
+        _ensure_missing_columns(
+            engine,
+            "advisor_suggestions",
+            _advisor_suggestion_columns(engine.dialect.name),
+        )
+
     if "rag_chunks" in table_names:
         _ensure_missing_columns(
             engine,
@@ -126,6 +140,19 @@ def _binding_site_columns(dialect_name: str) -> list[tuple[str, str]]:
 
 def _ranking_columns() -> list[tuple[str, str]]:
     return [("project_id", "VARCHAR(80)")]
+
+
+def _critique_columns() -> list[tuple[str, str]]:
+    return [("con_score", "FLOAT")]
+
+
+def _advisor_suggestion_columns(dialect_name: str) -> list[tuple[str, str]]:
+    json_list = "JSONB DEFAULT '[]'::jsonb" if dialect_name == "postgresql" else "JSON DEFAULT '[]'"
+    json_dict = "JSONB DEFAULT '{}'::jsonb" if dialect_name == "postgresql" else "JSON DEFAULT '{}'"
+    return [
+        ("next_round_constraints", json_list),
+        ("suggested_generation_config", json_dict),
+    ]
 
 
 def _rag_chunk_columns(dialect_name: str) -> list[tuple[str, str]]:

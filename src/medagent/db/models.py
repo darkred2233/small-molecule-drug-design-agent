@@ -325,6 +325,7 @@ class Critique(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     critique_id: Mapped[str] = mapped_column(String(80), unique=True)
     molecule_id: Mapped[str] = mapped_column(ForeignKey("molecules.molecule_id"), index=True)
+    con_score: Mapped[float | None] = mapped_column(Float)
     risk_level: Mapped[str] = mapped_column(String(80))
     reason: Mapped[str] = mapped_column(Text)
     evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -378,6 +379,8 @@ class AdvisorSuggestion(TimestampMixin, Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
     summary: Mapped[str] = mapped_column(Text)
     suggestions: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    next_round_constraints: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    suggested_generation_config: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class Ranking(TimestampMixin, Base):
