@@ -1,0 +1,12 @@
+ranking:
+  weights:
+    docking: 0.30
+    admet: 0.25
+    synthesis: 0.15
+    novelty: 0.10
+    evidence: 0.20
+  penalties:
+    structural_alert: 15
+    high_admet_risk: 20
+    missing_evidence: 10
+

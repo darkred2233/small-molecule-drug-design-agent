@@ -1,0 +1,30 @@
+tools:
+  gnina:
+    command: gnina
+    docker_images:
+      - gnina/gnina:latest
+      - gnina/gnina:1.0.3
+    timeout_seconds: 300
+  vina:
+    command: vina
+    docker_image: vina:latest
+    timeout_seconds: 300
+  chemprop:
+    command: chemprop
+    docker_image: chemprop:latest
+    timeout_seconds: 300
+  diffdock:
+    docker_image: diffdock:latest
+    timeout_seconds: 900
+  reinvent4:
+    command: reinvent
+    docker_image: reinvent4:latest
+    timeout_seconds: 600
+  autogrow4:
+    docker_image: autogrow4:latest
+    timeout_seconds: 1200
+  aizynthfinder:
+    command: aizynthcli
+    docker_image: aizynthfinder:latest
+    timeout_seconds: 900
+

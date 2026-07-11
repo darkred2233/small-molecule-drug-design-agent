@@ -1,0 +1,13 @@
+filters:
+  lipinski:
+    max_mw: 500
+    max_logp: 5
+    max_hbd: 5
+    max_hba: 10
+  veber:
+    max_tpsa: 140
+    max_rotatable_bonds: 10
+  alerts:
+    block_pains: true
+    block_brenk: false
+

@@ -12,6 +12,7 @@ Reference: https://github.com/MolecularAI/REINVENT4
 """
 
 import csv
+import importlib
 import subprocess
 import tempfile
 import time
@@ -65,15 +66,17 @@ def check_reinvent4_available() -> dict[str, Any]:
         "docker_image": None,
     }
 
-    # Check local Python package
-    try:
-        import reinvent4
-        result["available"] = True
-        result["mode"] = "python_package"
-        result["version"] = getattr(reinvent4, "__version__", "unknown")
-        return result
-    except ImportError:
-        pass
+    # Check local Python package. Some installs expose `reinvent4`, while
+    # others expose the historical `reinvent` package/module.
+    for package_name in ["reinvent4", "reinvent"]:
+        try:
+            package = importlib.import_module(package_name)
+            result["available"] = True
+            result["mode"] = "python_package"
+            result["version"] = getattr(package, "__version__", "unknown")
+            return result
+        except ImportError:
+            pass
 
     # Check CLI
     try:

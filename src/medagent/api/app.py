@@ -7,8 +7,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from medagent.agents.conversation import ConversationAgent
-from medagent.agents.orchestrator import PipelineOrchestrator
-from medagent.core.config import Settings, get_settings
+from medagent.configs.settings import Settings, get_settings
 from medagent.db.models import (
     AgentRun,
     Base,
@@ -99,7 +98,8 @@ from medagent.services.ids import new_id
 from medagent.services.molecule_generation import generate_project_molecules
 from medagent.services.molecule_import import import_seed_ligands_as_molecules
 from medagent.services.molecule_validation import validate_project_molecules
-from medagent.services.project_report import build_project_report
+from medagent.pipeline.orchestrator import PipelineOrchestrator
+from medagent.reporting.project_report import build_project_report
 from medagent.services.rag import build_project_rag_index, crawl_project_urls, query_project_rag
 from medagent.services.receptor_preparation import (
     binding_site_to_payload,

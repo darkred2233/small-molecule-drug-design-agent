@@ -1,0 +1,17 @@
+models:
+  reasoning:
+    provider: qwen
+    name: qwen3.7-max
+  task:
+    provider: qwen
+    name: qwen3.7-plus
+  refutation:
+    provider: deepseek
+    name: deepseek-v4-pro
+  embedding:
+    provider: qwen
+    name: text-embedding-v4
+  rerank:
+    provider: qwen
+    name: qwen3-rerank
+

@@ -289,37 +289,38 @@ def run_retrosynthesis_analysis(
     - IBM RXN
     - Molecular Transformer
     """
+    import os
+    from pathlib import Path
+
+    from medagent.services.aizynthfinder_adapter import (
+        AiZynthFinderRequest,
+        run_aizynthfinder_retrosynthesis,
+    )
+
     warnings: list[str] = []
-
-    # 尝试使用AiZynthFinder
-    try:
-        from importlib.util import find_spec
-
-        # 配置AiZynthFinder
-        if find_spec("aizynthfinder.aizynthfinder") is None:
-            raise ImportError("aizynthfinder_not_available")
-        # 这里需要配置模型和策略，简化处理
-        warnings.append("aizynthfinder_available_but_not_configured")
-
-        # 实际使用时的代码示例：
-        # finder.target_smiles = smiles
-        # finder.tree_search()
-        # finder.build_routes()
-        # routes = finder.routes
-
-        # 暂时返回未配置状态
+    config_file = os.environ.get("AIZYNTHFINDER_CONFIG") or os.environ.get(
+        "MEDAGENT_AIZYNTHFINDER_CONFIG"
+    )
+    external_result = run_aizynthfinder_retrosynthesis(
+        AiZynthFinderRequest(
+            smiles=smiles,
+            output_dir=str(Path(".local") / "retrosynthesis"),
+            config_file=config_file,
+            max_steps=max_steps,
+        )
+    )
+    if external_result.success:
         return RetrosynthesisResult(
-            success=False,
-            route_found=False,
-            num_steps=None,
+            success=True,
+            route_found=external_result.route_found,
+            num_steps=external_result.num_steps,
             building_blocks=[],
-            route_score=None,
-            route_summary=None,
-            warnings=warnings,
+            route_score=external_result.route_score,
+            route_summary=external_result.route_summary,
+            warnings=external_result.warnings,
         )
 
-    except ImportError:
-        warnings.append("aizynthfinder_not_available")
+    warnings.extend(external_result.warnings)
 
     # 回退到简化分析
     return _simple_retrosynthesis_estimate(smiles, max_steps, warnings)

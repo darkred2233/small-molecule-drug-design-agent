@@ -25,6 +25,7 @@ from medagent.services.admet_adapter import (
     chemprop_tool_status,
     run_chemprop_admet,
 )
+from medagent.services.aizynthfinder_adapter import aizynthfinder_tool_status
 from medagent.services.candidate_ranking import generate_project_rankings
 from medagent.services.docking_adapters import (
     DockingToolRequest,
@@ -578,7 +579,7 @@ def candidate_assessment_tool_status() -> dict[str, Any]:
         "admetlab": _package_status("admetlab"),
         "chemprop": chemprop_tool_status(),
         "deepchem": _package_status("deepchem"),
-        "aizynthfinder": _package_status("aizynthfinder"),
+        "aizynthfinder": aizynthfinder_tool_status(),
         "askcos": _package_status("askcos"),
     }
 

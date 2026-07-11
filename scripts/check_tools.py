@@ -9,6 +9,7 @@
 - DiffDock：基于扩散模型的对接
 - REINVENT4：强化学习分子生成
 - AutoGrow4：遗传算法分子生成
+- AiZynthFinder：逆合成路线分析
 
 用法：
     python scripts/check_tools.py
@@ -349,78 +350,46 @@ def check_diffdock() -> dict[str, Any]:
 
 def check_reinvent4() -> dict[str, Any]:
     """检查REINVENT4可用性"""
-    result = {
+    from medagent.services.reinvent4_adapter import reinvent4_tool_status
+
+    status = reinvent4_tool_status()
+    return {
         "name": "REINVENT4",
-        "available": False,
-        "mode": None,
-        "version": None,
+        "available": status["available"],
+        "mode": status.get("mode"),
+        "version": status.get("version"),
+        "docker_image": status.get("docker_image"),
     }
-
-    # 检查Python包
-    try:
-        import reinvent
-        result["available"] = True
-        result["mode"] = "python_package"
-        result["version"] = getattr(reinvent, "__version__", "unknown")
-        return result
-    except ImportError:
-        pass
-
-    # 检查Docker
-    try:
-        proc = subprocess.run(
-            ["docker", "image", "inspect", "reinvent4:latest"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            result["available"] = True
-            result["mode"] = "docker"
-            result["docker_image"] = "reinvent4:latest"
-            return result
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    return result
 
 
 def check_autogrow4() -> dict[str, Any]:
     """检查AutoGrow4可用性"""
-    result = {
+    from medagent.services.autogrow4_adapter import autogrow4_tool_status
+
+    status = autogrow4_tool_status()
+    return {
         "name": "AutoGrow4",
-        "available": False,
-        "mode": None,
-        "version": None,
+        "available": status["available"],
+        "mode": status.get("mode"),
+        "version": status.get("version"),
+        "docker_image": status.get("docker_image"),
     }
 
-    # 检查Python包
-    try:
-        import autogrow4
-        result["available"] = True
-        result["mode"] = "python_package"
-        result["version"] = getattr(autogrow4, "__version__", "unknown")
-        return result
-    except ImportError:
-        pass
 
-    # 检查Docker
-    try:
-        proc = subprocess.run(
-            ["docker", "image", "inspect", "autogrow4:latest"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            result["available"] = True
-            result["mode"] = "docker"
-            result["docker_image"] = "autogrow4:latest"
-            return result
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+def check_aizynthfinder() -> dict[str, Any]:
+    """检查AiZynthFinder可用性"""
+    from medagent.services.aizynthfinder_adapter import aizynthfinder_tool_status
 
-    return result
+    status = aizynthfinder_tool_status()
+    return {
+        "name": "AiZynthFinder",
+        "available": status["available"],
+        "mode": status.get("mode"),
+        "version": status.get("version"),
+        "path": status.get("path"),
+        "docker_image": status.get("docker_image"),
+        "model_configured": status.get("model_configured", False),
+    }
 
 
 def print_tool_status(result: dict[str, Any], verbose: bool = False) -> None:
@@ -444,6 +413,8 @@ def print_tool_status(result: dict[str, Any], verbose: bool = False) -> None:
             print(f"   ADMET-AI models: {result['models_dir']}")
         if result.get("model_count") is not None:
             print(f"   Model files: {result['model_count']}")
+        if "model_configured" in result:
+            print(f"   Model configured: {result['model_configured']}")
         if result.get("features") and verbose:
             print(f"   功能: {', '.join(result['features'])}")
         if result.get("missing") and verbose:
@@ -515,6 +486,7 @@ def main():
         check_diffdock(),
         check_reinvent4(),
         check_autogrow4(),
+        check_aizynthfinder(),
     ]
 
     for tool in tools:
@@ -567,6 +539,13 @@ def main():
         print("   💡 安装分子生成工具:")
         print("      REINVENT4: pip install reinvent4")
         print("      或使用Docker: docker compose build reinvent4")
+
+    retrosynthesis_available = any(
+        t["name"] == "AiZynthFinder" and t["available"]
+        for t in tools
+    )
+    if not retrosynthesis_available:
+        print("   💡 安装AiZynthFinder以获得真实逆合成路线: pip install aizynthfinder")
 
     print("\n✨ 即使工具不完整，系统也会使用RDKit代理回退机制保证可用性")
 

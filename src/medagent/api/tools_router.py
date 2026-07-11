@@ -19,11 +19,14 @@ from medagent.services.admet_adapter import (
     check_chemprop_available,
     run_chemprop_admet,
 )
+from medagent.services.aizynthfinder_adapter import aizynthfinder_tool_status
+from medagent.services.autogrow4_adapter import autogrow4_tool_status
 from medagent.services.docking_adapters import (
     DockingToolRequest,
     run_external_docking,
 )
 from medagent.services.rdkit_enhanced import validate_and_calculate_enhanced
+from medagent.services.reinvent4_adapter import reinvent4_tool_status
 
 
 router = APIRouter(prefix="/tools", tags=["计算工具"])
@@ -42,6 +45,7 @@ class ToolStatusResponse(BaseModel):
     diffdock: dict[str, Any] = Field(description="DiffDock状态")
     reinvent4: dict[str, Any] = Field(description="REINVENT4状态")
     autogrow4: dict[str, Any] = Field(description="AutoGrow4状态")
+    aizynthfinder: dict[str, Any] = Field(description="AiZynthFinder状态")
     summary: dict[str, Any] = Field(description="汇总信息")
 
 
@@ -143,8 +147,9 @@ async def get_tools_status():
     diffdock_status = _check_tool_docker("diffdock:latest")
 
     # 检查生成工具
-    reinvent4_status = _check_tool_docker("reinvent4:latest")
-    autogrow4_status = _check_tool_docker("autogrow4:latest")
+    reinvent4_status = reinvent4_tool_status()
+    autogrow4_status = autogrow4_tool_status()
+    aizynthfinder_status = aizynthfinder_tool_status()
 
     # 汇总
     available_count = sum([
@@ -155,6 +160,7 @@ async def get_tools_status():
         diffdock_status.get("available", False),
         reinvent4_status.get("available", False),
         autogrow4_status.get("available", False),
+        aizynthfinder_status.get("available", False),
     ])
 
     return ToolStatusResponse(
@@ -165,8 +171,9 @@ async def get_tools_status():
         diffdock=diffdock_status,
         reinvent4=reinvent4_status,
         autogrow4=autogrow4_status,
+        aizynthfinder=aizynthfinder_status,
         summary={
-            "total_tools": 7,
+            "total_tools": 8,
             "available_tools": available_count,
             "critical_missing": [] if rdkit_status.get("available") else ["RDKit"],
         }
