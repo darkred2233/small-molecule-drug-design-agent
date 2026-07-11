@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: medagent
+      POSTGRES_USER: medagent
+      POSTGRES_PASSWORD: medagent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docs/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medagent -d medagent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: medagent
+      MINIO_ROOT_PASSWORD: medagent-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  # Chemprop ADMET prediction service
+  chemprop:
+    image: chemprop:latest
+    build: docker/chemprop
+    volumes:
+      - ./data/predictions:/data/output
+      - ./data/models:/data/models
+    command: ["--help"]
+    profiles:
+      - tools
+
+  # GNINA docking service
+  gnina:
+    image: ${GNINA_IMAGE:-gnina/gnina:latest}
+    volumes:
+      - ./data/poses:/data/output
+    command: ["--help"]
+    profiles:
+      - tools
+
+  # AutoDock Vina docking service
+  vina:
+    image: vina:latest
+    build: docker/vina
+    volumes:
+      - ./data/poses:/data/output
+    command: ["-c", "import vina; print('AutoDock Vina installed')"]
+    profiles:
+      - tools
+
+  # DiffDock pose prediction service
+  diffdock:
+    image: diffdock:latest
+    build: docker/diffdock
+    volumes:
+      - ./data/poses:/data/output
+    command: ["--help"]
+    profiles:
+      - tools
+
+  # REINVENT4 molecule generation service
+  reinvent4:
+    image: reinvent4:latest
+    build: docker/reinvent4
+    volumes:
+      - ./data/generated:/data/output
+    command: ["--help"]
+    profiles:
+      - tools
+
+  # AutoGrow4 molecule generation service
+  autogrow4:
+    image: autogrow4:latest
+    build: docker/autogrow4
+    volumes:
+      - ./data/generated:/data/output
+    command: ["--help"]
+    profiles:
+      - tools
+
+volumes:
+  postgres-data:
+  minio-data:

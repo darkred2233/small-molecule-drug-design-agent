@@ -1,0 +1,94 @@
+# Small Molecule Drug Design Agent
+
+小分子药物设计 Agent 是一个面向小分子药物设计的可追踪、证据驱动多智能体系统。项目目标是把靶点资料、用户上传数据、候选分子导入、结构校验、规则过滤、RAG 证据、自我反驳、综合排序和报告生成串成一个可审计的智能体工作流，帮助用户理解每个候选分子为什么被推荐或淘汰。
+
+当前代码处于 MVP 早期阶段，重点是先打通后端 API、关系数据库、内置靶点库、文件上传解析、RAG 建库检索、候选分子导入、轻量分子校验和中文接口页面。Docking、ADMET、合成路线和真实分子生成将在后续阶段继续增强。
+
+## 当前已包含
+
+- FastAPI 后端骨架
+- 中文首页和中文接口说明页
+- Swagger 调试页：`/swagger`
+- PostgreSQL/pgvector/MinIO 的 Docker Compose 配置
+- SQLAlchemy 关系数据库模型
+- RAG 文档表、chunk 表和 evidence link 表
+- 内置靶点-药物库 RAG 入库
+- 上传文本/PDF/DOCX/Markdown/HTML 的 RAG 建库
+- URL 静态页面爬取入库：`POST /projects/{project_id}/rag/crawl`
+- RAG 混合检索：本地向量 + BM25 + 可选 `qwen3-rerank`
+- RAG 查询和证据编号：`POST /projects/{project_id}/rag/query`
+- 内置靶点-药物关系库：10 个 MVP 靶点、32 个代表药物
+- 可迁移 SQLite 种子库快照：`database/medagent_seed.sqlite`
+- 项目创建接口：`POST /projects`
+- 自然语言约束解析接口：`POST /projects/{project_id}/chat`
+- 文件上传接口：`POST /projects/{project_id}/files`
+- 文件解析接口：`POST /projects/{project_id}/ingest`
+- 单文件重新解析接口：`POST /projects/{project_id}/files/{file_id}/parse`
+- 种子配体查询接口：`GET /projects/{project_id}/seed-ligands`
+- 候选分子导入接口：`POST /projects/{project_id}/molecules/import-seeds`
+- 候选分子轻量校验接口：`POST /projects/{project_id}/molecules/validate`
+- 候选分子性质查询接口：`GET /projects/{project_id}/molecules/{molecule_id}/properties`
+- 流程 dry-run、状态查询、约束查询、报告骨架接口
+- pytest 自动化测试
+
+## 本地运行
+
+```powershell
+cd C:\Users\34471\Desktop\small-molecule-drug-design-agent
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+$env:PYTHONPATH='src'
+python -m uvicorn medagent.api.app:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+打开：
+
+- 中文首页：http://127.0.0.1:8000/
+- 中文接口说明：http://127.0.0.1:8000/docs
+- Swagger 调试页：http://127.0.0.1:8000/swagger
+- 健康检查：http://127.0.0.1:8000/health
+
+默认使用本地 SQLite，方便快速试跑。生产或完整环境请复制 `.env.example`，把 `MEDAGENT_DATABASE_URL` 指向 PostgreSQL。
+
+## 启动基础设施
+
+```powershell
+docker compose up -d
+```
+
+Compose 会启动 PostgreSQL + pgvector 和 MinIO。RDKit cartridge 在不同发行镜像中支持差异较大，真实分子计算建议放在独立工具容器或 Python 化学工具适配器中，通过标准化 tool-run 接口接入。
+
+## 测试
+
+```powershell
+python -m pytest
+python -m ruff check .
+```
+
+## 关系数据库快照
+
+重新生成 SQLite 种子库快照：
+
+```powershell
+$env:PYTHONPATH='src'
+python -m medagent.cli db snapshot --output database/medagent_seed.sqlite
+```
+
+相关文档：
+
+- `docs/RELATIONAL_DATABASE_BUILD.md`
+- `docs/FILE_INGESTION_BUILD.md`
+- `docs/MOLECULE_IMPORT_BUILD.md`
+- `docs/MOLECULE_VALIDATION_BUILD.md`
+- `docs/RAG_BUILD.md`
+- `docs/MIGRATION_GUIDE.md`
+
+## 下一步路线
+
+1. 接入 RDKit/Datamol，替换当前轻量分子校验和粗略性质估算。
+2. 增加 Lipinski、PAINS、Brenk、基础毒性团等规则过滤。
+3. 实现 ReasoningTrace 和 DecisionCard，让推荐/淘汰理由可解释、可追踪。
+4. 用真实文献和项目资料扩充 RAG 证据库，评估 Top 10 相关证据比例。
+5. 接入 Docking、ADMET、合成可及性评估。
+6. 实现 Self-Refutation、Ranker、Advisor 和最终报告生成。

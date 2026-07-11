@@ -1,0 +1,17 @@
+.venv/
+.local/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+dist/
+build/
+*.egg-info/
+logs/
+database/*
+!database/README.md
+*.sqlite
+*.db
+*.log
+*.pid

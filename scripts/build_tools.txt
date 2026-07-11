@@ -1,0 +1,36 @@
+推荐运行:
+
+  scripts\build_tools.bat core
+
+core 会先安装最常用、下载量相对可控的工具:
+
+  GNINA
+  AutoDock Vina
+  Chemprop
+
+安装全部工具:
+
+  scripts\build_tools.bat all
+
+GNINA latest 镜像很大。想优先省下载时间，可以用较小的 GNINA 1.0.3:
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_docker_tools.ps1 gnina -SmallGnina
+
+只重试单个工具:
+
+  scripts\build_tools.bat chemprop
+  scripts\build_tools.bat diffdock
+  scripts\build_tools.bat reinvent4
+  scripts\build_tools.bat autogrow4
+
+网络足够快时可以并行构建:
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_docker_tools.ps1 all -Parallel
+
+如果 Docker Hub 直连超时，可以临时指定镜像前缀，例如:
+
+  set DOCKER_HUB_MIRROR_PREFIX=docker.1ms.run
+  scripts\build_tools.bat gnina
+
+这个脚本已开启 Docker BuildKit，并且 Dockerfile 使用 pip/apt 下载缓存。
+如果 Chemprop 或其他工具下载到一半被打断，再次运行同一个命令会尽量复用缓存。

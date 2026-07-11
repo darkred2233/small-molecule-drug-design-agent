@@ -1,0 +1,133 @@
+# 小分子药物设计Agent - 配置文件
+
+app:
+  name: "小分子药物设计Agent"
+  version: "1.0.0"
+  debug: false
+  log_level: "INFO"
+
+database:
+  url: "postgresql://medagent:medagent@localhost:5432/medagent"
+  pool_size: 10
+  max_overflow: 20
+  pool_pre_ping: true
+
+storage:
+  type: "minio"
+  endpoint: "localhost:9000"
+  access_key: "medagent"
+  secret_key: "medagent-secret"
+  bucket: "medagent-files"
+  local_root: "./.local/uploads"
+
+llm:
+  providers:
+    qwen:
+      api_key: "${MEDAGENT_DASHSCOPE_API_KEY}"
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      default_model: "qwen-plus"
+      reasoning_model: "qwen-max"
+      temperature: 0.7
+      max_tokens: 4000
+      retry_count: 3
+
+    deepseek:
+      api_key: "${MEDAGENT_DEEPSEEK_API_KEY}"
+      base_url: "https://api.deepseek.com/v1"
+      default_model: "deepseek-chat"
+      temperature: 0.7
+      max_tokens: 4000
+      retry_count: 3
+
+  embedding:
+    provider: "dashscope"
+    model: "text-embedding-v3"
+    dimension: 2048
+
+agents:
+  target:
+    use_llm: true
+    provider: "qwen"
+    model: "qwen-max"
+
+  sar:
+    use_llm: true
+    provider: "qwen"
+    model: "qwen-max"
+
+  self_refutation:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    strict_mode: false
+
+  ranker:
+    weights:
+      structure: 0.20
+      admet: 0.30
+      docking: 0.35
+      synthesis: 0.15
+
+  advisor:
+    provider: "qwen"
+    model: "qwen-plus"
+
+  report:
+    include_details: true
+    max_molecules: 10
+
+tools:
+  rdkit:
+    enabled: true
+
+  chemprop:
+    enabled: true
+    mode: "docker"
+    batch_size: 100
+
+  gnina:
+    enabled: true
+    mode: "docker"
+    exhaustiveness: 8
+
+  vina:
+    enabled: true
+    exhaustiveness: 8
+
+  diffdock:
+    enabled: false
+    mode: "docker"
+
+workflows:
+  admet:
+    use_chemprop: true
+    fallback_to_rdkit: true
+    batch_size: 100
+
+  docking:
+    prepare_receptor: true
+    prepare_ligand: true
+    num_conformers: 10
+
+  synthesis:
+    calculate_sa_score: true
+    run_retrosynthesis: false
+
+rag:
+  chunk_size: 1800
+  chunk_overlap: 180
+  vector_top_k: 80
+  keyword_top_k: 80
+  default_top_k: 10
+  use_remote_embeddings: true
+  use_remote_rerank: false
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:8080"
+  rate_limit:
+    enabled: true
+    max_requests: 100
+    window_seconds: 60

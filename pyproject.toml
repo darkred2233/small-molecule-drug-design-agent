@@ -1,0 +1,47 @@
+[project]
+name = "small-molecule-drug-design-agent"
+version = "0.1.0"
+description = "FastAPI scaffold for a traceable small-molecule drug design agent."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.27.0",
+    "minio>=7.2.0",
+    "openai>=1.0.0",
+    "pydantic-settings>=2.6.0",
+    "python-multipart>=0.0.12",
+    "sqlalchemy>=2.0.35",
+    "uvicorn[standard]>=0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.7.0",
+]
+chem = [
+    "admet-ai==2.0.1",
+    "datamol>=0.12.0",
+    "rdkit>=2023.9.1",
+]
+rag = [
+    "pypdf>=5.0.0",
+]
+
+[project.scripts]
+medagent = "medagent.cli:main"
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
