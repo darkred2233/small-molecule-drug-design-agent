@@ -124,7 +124,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="小分子药物设计 Agent",
         description=(
             "面向小分子药物设计流程的智能体后端。当前已完成关系数据库、内置靶点-药物库、"
-            "项目创建、自然语言约束解析、RAG 建库检索和流程 dry-run。Docking、ADMET 等能力后续接入。"
+            "项目创建、自然语言约束解析、RAG 建库检索、MVP full pipeline 和候选分子评估。"
         ),
         version="0.1.0",
         docs_url=None,
@@ -133,7 +133,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_tags=[
             {"name": "系统状态", "description": "服务健康检查和数据库摘要。"},
             {"name": "内置靶点库", "description": "查询 MVP 内置靶点和代表药物。"},
-            {"name": "项目管理", "description": "创建项目、查询项目状态、启动流程 dry-run。"},
+            {"name": "项目管理", "description": "创建项目、查询项目状态、启动 dry-run 或 full MVP 流程。"},
             {"name": "对话与约束", "description": "把自然语言优化方向转为结构化约束。"},
             {"name": "文件与导入", "description": "上传资料并创建知识导入任务。"},
             {"name": "RAG", "description": "构建、爬取、查询 RAG 证据库和 evidence links。"},
@@ -276,7 +276,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 <div class="wrap hero">
                   <div>
                     <h1>小分子药物设计 Agent</h1>
-                    <p>中文 API 控制台。当前阶段已完成关系数据库、内置靶点-药物库、项目创建、约束解析、RAG 建库检索和流程 dry-run。</p>
+                    <p>中文 API 控制台。当前阶段已完成关系数据库、内置靶点-药物库、项目创建、约束解析、RAG 建库检索和 full MVP 流程。</p>
                   </div>
                   <nav class="actions">
                     <a class="button primary" href="/docs">打开接口文档</a>
@@ -301,8 +301,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     <p>使用 <code>GET /database/summary</code> 检查靶点和药物种子库是否已正确初始化。</p>
                   </article>
                   <article class="card">
-                    <h2>流程 dry-run</h2>
-                    <p>使用 <code>POST /projects/{id}/run</code> 生成完整 Agent 运行记录，方便后续逐步接入真实工具。</p>
+                    <h2>流程运行</h2>
+                    <p>使用 <code>POST /projects/{id}/run</code> 创建 dry-run 记录，或用 <code>mode=full</code> 执行 MVP 候选评估流程。</p>
                   </article>
                 </section>
               </main>
@@ -448,7 +448,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
               <header>
                 <div class="wrap">
                   <h1>接口文档</h1>
-                  <p>所有业务说明已中文化。当前后端支持内置靶点库、关系数据库摘要、项目创建、自然语言约束解析、流程模拟运行和结果查询。</p>
+                  <p>所有业务说明已中文化。当前后端支持内置靶点库、关系数据库摘要、项目创建、自然语言约束解析、流程运行和结果查询。</p>
                   <nav>
                     <a class="button primary" href="/">返回首页</a>
                     <a class="button" href="/swagger">打开 Swagger 调试页</a>
@@ -499,8 +499,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   </article>
                   <article class="card">
                     <div class="route"><span class="method post">POST</span><code>/projects/{project_id}/run</code></div>
-                    <h2>启动项目流程模拟运行</h2>
-                    <p>创建完整 Agent 流程记录，目前只支持 dry_run。</p>
+                    <h2>启动项目流程运行</h2>
+                    <p>创建完整 Agent 流程记录；使用 <code>dry_run</code> 只登记步骤，使用 <code>full</code> 执行 MVP 工作流。</p>
                   </article>
                   <article class="card">
                     <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/status</code></div>
@@ -939,7 +939,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response_model=ProjectStatus,
         status_code=202,
         tags=["项目管理"],
-        summary="启动项目流程 dry-run",
+        summary="启动项目流程",
     )
     def run_pipeline(
         project_id: str,
@@ -955,7 +955,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if requested.mode != "dry_run":
             raise HTTPException(
                 status_code=422,
-                detail="当前仅支持 dry_run；真实工具适配器接入后再开放 full 模式。",
+                detail="运行模式必须是 dry_run 或 full。",
             )
         PipelineOrchestrator(app_settings).create_dry_run(db, project)
         db.refresh(project)

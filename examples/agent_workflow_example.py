@@ -61,7 +61,7 @@ def run_complete_agent_workflow(
     acceptable = sum(1 for r in refutation_results if r.overall_assessment == "acceptable")
     recommended = sum(1 for r in refutation_results if r.overall_assessment == "recommended")
 
-    print(f"反驳评估完成：")
+    print("反驳评估完成：")
     print(f"  - 拒绝: {rejected}个")
     print(f"  - 存疑: {questionable}个")
     print(f"  - 可接受: {acceptable}个")
@@ -93,7 +93,7 @@ def run_complete_agent_workflow(
         strict_mode=strict_mode,
     )
 
-    print(f"排序完成：")
+    print("排序完成：")
     print(f"  - 优秀（≥80分）: {ranking_result.excellent_count}个")
     print(f"  - 良好（65-79分）: {ranking_result.good_count}个")
     print(f"  - 可接受（50-64分）: {ranking_result.acceptable_count}个")
@@ -226,6 +226,7 @@ def quick_evaluate_top_molecules(
     # 反驳
     refutation_agent = SelfRefutationAgent(db)
     refutation_results = refutation_agent.batch_refute(project, molecules)
+    print(f"反驳评估完成：{len(refutation_results)} 个分子")
 
     # 排序
     ranker_agent = RankerAgent(db)

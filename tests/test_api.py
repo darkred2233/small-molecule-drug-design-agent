@@ -51,6 +51,36 @@ def test_create_project_and_parse_constraints(tmp_path):
         }
 
 
+def test_project_router_uses_current_project_schema(tmp_path):
+    with make_client(tmp_path) as client:
+        project_response = client.post(
+            "/projects/",
+            json={
+                "name": "Trailing slash project",
+                "target_id": "TGT-EGFR",
+                "objective": "verify project router schema",
+            },
+        )
+
+        assert project_response.status_code == 201
+        body = project_response.json()
+        project_id = body["project_id"]
+        assert body["name"] == "Trailing slash project"
+        assert body["target_id"] == "TGT-EGFR"
+
+        list_response = client.get("/projects")
+        assert list_response.status_code == 200
+        assert any(project["project_id"] == project_id for project in list_response.json())
+
+        trailing_list_response = client.get("/projects/")
+        assert trailing_list_response.status_code == 200
+        assert any(project["project_id"] == project_id for project in trailing_list_response.json())
+
+        detail_response = client.get(f"/projects/{project_id}")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["objective"] == "verify project router schema"
+
+
 def test_pipeline_dry_run_registers_agent_steps(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post("/projects", json={"name": "KRAS program"}).json()["project_id"]

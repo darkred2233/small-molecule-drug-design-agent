@@ -2,7 +2,7 @@
 
 小分子药物设计 Agent 是一个面向小分子药物设计的可追踪、证据驱动多智能体系统。项目目标是把靶点资料、用户上传数据、候选分子导入、结构校验、规则过滤、RAG 证据、自我反驳、综合排序和报告生成串成一个可审计的智能体工作流，帮助用户理解每个候选分子为什么被推荐或淘汰。
 
-当前代码处于 MVP 早期阶段，重点是先打通后端 API、关系数据库、内置靶点库、文件上传解析、RAG 建库检索、候选分子导入、轻量分子校验和中文接口页面。Docking、ADMET、合成路线和真实分子生成将在后续阶段继续增强。
+当前代码已进入 MVP 集成验证阶段：后端 API、关系数据库、内置靶点库、文件上传解析、RAG 建库检索、候选分子导入/生成、结构校验、规则过滤、候选评估、综合排序和 DecisionCard 已经连成可执行的 full pipeline。Docker 计算工具适配已就绪，下一步重点是用真实项目资料验证 Docking、ADMET、合成可及性和报告链路的科学可用性。
 
 ## 当前已包含
 
@@ -26,15 +26,22 @@
 - 单文件重新解析接口：`POST /projects/{project_id}/files/{file_id}/parse`
 - 种子配体查询接口：`GET /projects/{project_id}/seed-ligands`
 - 候选分子导入接口：`POST /projects/{project_id}/molecules/import-seeds`
+- 候选分子生成接口：`POST /projects/{project_id}/molecules/generate`
 - 候选分子轻量校验接口：`POST /projects/{project_id}/molecules/validate`
+- 规则过滤接口：`POST /projects/{project_id}/molecules/filter-rules`
+- 受体准备接口：`POST /projects/{project_id}/receptors/prepare`
+- 候选评估接口：`POST /projects/{project_id}/candidate-assessment/run`
+- 排名生成接口：`POST /projects/{project_id}/rankings/generate`
+- ReasoningTrace 和 DecisionCard 生成接口：`POST /projects/{project_id}/decision-cards/generate`
 - 候选分子性质查询接口：`GET /projects/{project_id}/molecules/{molecule_id}/properties`
-- 流程 dry-run、状态查询、约束查询、报告骨架接口
+- 流程 dry-run 和 full MVP 模式、状态查询、约束查询、报告骨架接口
+- 计算工具状态和直接调用接口：`GET /tools/status`
 - pytest 自动化测试
 
 ## 本地运行
 
 ```powershell
-cd C:\Users\34471\Desktop\small-molecule-drug-design-agent
+cd C:\Users\zhihong\Desktop\small-molecule-drug-design-agent
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -58,6 +65,12 @@ docker compose up -d
 ```
 
 Compose 会启动 PostgreSQL + pgvector 和 MinIO。RDKit cartridge 在不同发行镜像中支持差异较大，真实分子计算建议放在独立工具容器或 Python 化学工具适配器中，通过标准化 tool-run 接口接入。
+
+检查本地计算工具状态：
+
+```powershell
+python scripts\check_tools.py
+```
 
 ## 测试
 
@@ -86,9 +99,8 @@ python -m medagent.cli db snapshot --output database/medagent_seed.sqlite
 
 ## 下一步路线
 
-1. 接入 RDKit/Datamol，替换当前轻量分子校验和粗略性质估算。
-2. 增加 Lipinski、PAINS、Brenk、基础毒性团等规则过滤。
-3. 实现 ReasoningTrace 和 DecisionCard，让推荐/淘汰理由可解释、可追踪。
-4. 用真实文献和项目资料扩充 RAG 证据库，评估 Top 10 相关证据比例。
-5. 接入 Docking、ADMET、合成可及性评估。
-6. 实现 Self-Refutation、Ranker、Advisor 和最终报告生成。
+1. 清理旧 Agent 草稿与当前 `services/*` 主线之间的字段分叉，统一使用当前 ORM 和领域 schema。
+2. 用真实靶点资料、受体文件和种子配体跑一轮 `mode=full`，沉淀可复现 demo 数据。
+3. 校准 Docking、ADMET 和合成可及性结果的阈值、标签和失败原因，避免把代理结果当成实验结论。
+4. 把 Self-Refutation、Advisor 和 Report Agent 接入 full pipeline 的 AgentRun 记录。
+5. 扩充真实文献和项目资料 RAG 证据库，评估 Top 10 相关证据比例。

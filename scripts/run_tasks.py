@@ -6,7 +6,6 @@
 
 import argparse
 import sys
-from pathlib import Path
 
 from sqlalchemy.orm import Session
 
@@ -39,7 +38,7 @@ def task_validate_molecules(db: Session, project_id: str):
         result = validate_and_calculate_enhanced(molecule.smiles)
 
         if result.valid:
-            print(f"  ✓ 验证通过")
+            print("  ✓ 验证通过")
             print(f"    MW: {result.descriptors.mw:.1f}")
             print(f"    LogP: {result.descriptors.logp:.2f}")
             print(f"    QED: {result.descriptors.qed:.3f}")
@@ -72,7 +71,7 @@ def task_predict_admet(db: Session, project_id: str, use_chemprop: bool = True):
         batch_size=100,
     )
 
-    print(f"\n完成:")
+    print("\n完成:")
     print(f"  评估: {result.evaluated_count} 个")
     print(f"  存储: {result.stored_count} 个")
     print(f"  工具: {result.tool_name}")
@@ -130,14 +129,14 @@ def task_run_docking(
         )
 
         if result.success:
-            print(f"  ✓ 对接成功")
+            print("  ✓ 对接成功")
             print(f"    工具: {result.docking_tool}")
             print(f"    Vina评分: {result.vina_score:.2f}")
             if result.cnn_score:
                 print(f"    CNN评分: {result.cnn_score:.3f}")
             success_count += 1
         else:
-            print(f"  ✗ 对接失败")
+            print("  ✗ 对接失败")
 
     print(f"\n完成: {success_count}/{len(molecules)} 个分子对接成功")
 
@@ -168,14 +167,14 @@ def task_assess_synthesis(db: Session, project_id: str):
         )
 
         if result.success:
-            print(f"  ✓ 评估完成")
+            print("  ✓ 评估完成")
             if result.sa_score_result:
                 print(f"    SA Score: {result.sa_score_result.sa_score:.2f}")
                 print(f"    复杂度: {result.sa_score_result.complexity_level}")
             print(f"    总体: {result.overall_assessment}")
             success_count += 1
         else:
-            print(f"  ✗ 评估失败")
+            print("  ✗ 评估失败")
 
     print(f"\n完成: {success_count}/{len(molecules)} 个分子评估成功")
 
@@ -227,7 +226,7 @@ def task_run_agents(db: Session, project_id: str, strict_mode: bool = False):
     project_report = report_agent.generate_report(
         project, ranking_result, advisor_report, refutation_results
     )
-    print(f"  完成: 报告已生成")
+    print("  完成: 报告已生成")
 
     # 显示摘要
     print("\n" + "=" * 60)

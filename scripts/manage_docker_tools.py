@@ -18,7 +18,6 @@ Docker工具管理和测试脚本
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -109,7 +108,7 @@ def check_docker_available() -> bool:
         return True
     else:
         print("❌ Docker不可用")
-        print(f"   请安装Docker Desktop: https://www.docker.com/products/docker-desktop/")
+        print("   请安装Docker Desktop: https://www.docker.com/products/docker-desktop/")
         return False
 
 
@@ -175,15 +174,15 @@ def print_status():
         print(f"   镜像名: {status['image']}")
 
         if status["image_exists"]:
-            print(f"   ✅ 镜像已构建")
+            print("   ✅ 镜像已构建")
         else:
             action = "docker compose pull" if not tool["has_build"] else "docker compose build"
             print(f"   ❌ 镜像未就绪 (运行: {action} {status['service']})")
 
         if status["container_running"]:
-            print(f"   ✅ 容器运行中")
+            print("   ✅ 容器运行中")
         else:
-            print(f"   ⚪ 容器未运行")
+            print("   ⚪ 容器未运行")
 
     print("\n" + "=" * 70)
     print("快速命令:")
@@ -278,7 +277,7 @@ def test_tool(tool_key: str):
         return 1
 
     # 运行测试命令
-    print(f"\n运行测试命令...")
+    print("\n运行测试命令...")
     cmd = ["docker", "compose", "run", "--rm", service] + tool["test_command"]
     returncode, stdout, stderr = run_command(cmd, timeout=60)
 
@@ -340,7 +339,7 @@ def test_chemprop_prediction():
             # 读取结果
             with open(output_csv) as f:
                 results = f.read()
-            print(f"\n预测结果预览:")
+            print("\n预测结果预览:")
             print(results[:500])
             return 0
         else:

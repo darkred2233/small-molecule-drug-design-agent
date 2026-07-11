@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 sys.path.insert(0, 'src')
 
 from medagent.data.builtin_targets import BUILTIN_TARGETS
-from medagent.data.collect_target_pack import TargetPackBuilder
 from medagent.data.collectors.uniprot import UniProtCollector
 from medagent.data.collectors.chembl import ChEMBLCollector
 from medagent.data.collectors.pubchem import PubChemCollector
