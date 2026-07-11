@@ -32,6 +32,7 @@
 - 受体准备接口：`POST /projects/{project_id}/receptors/prepare`
 - 候选评估接口：`POST /projects/{project_id}/candidate-assessment/run`
 - 排名生成接口：`POST /projects/{project_id}/rankings/generate`
+- Advisor 建议应用接口：`POST /projects/{project_id}/advisor/apply`
 - ReasoningTrace 和 DecisionCard 生成接口：`POST /projects/{project_id}/decision-cards/generate`
 - 候选分子性质查询接口：`GET /projects/{project_id}/molecules/{molecule_id}/properties`
 - 流程 dry-run 和 full MVP 模式、状态查询、约束查询、报告骨架接口

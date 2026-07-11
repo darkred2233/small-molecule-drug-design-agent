@@ -2,13 +2,19 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import medagent.api.app as api_app
 from medagent.api.app import create_app
 from medagent.core.config import Settings
+from medagent.db.models import AdvisorSuggestion
 
 
 def make_client(tmp_path):
     app = create_app(Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}"))
     return TestClient(app)
+
+
+def advisor_constraints(items):
+    return [item for item in items if item["label"].startswith("advisor_")]
 
 
 def test_builtin_targets_are_seeded(tmp_path):
@@ -169,8 +175,34 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         assert advice[0]["next_round_constraints"]
         assert advice[0]["suggested_generation_config"]["rerank_after_generation"] is True
 
+        constraints_before_apply = client.get(f"/projects/{project_id}/constraints").json()
+        assert not advisor_constraints(constraints_before_apply)
+
+        apply_response = client.post(f"/projects/{project_id}/advisor/apply")
+        assert apply_response.status_code == 202
+        applied = apply_response.json()
+        assert applied["status"] == "applied"
+        assert applied["suggestion_id"] == advice[0]["suggestion_id"]
+        assert applied["applied_constraint_count"] == len(advice[0]["next_round_constraints"])
+        assert applied["created_constraint_count"] == applied["applied_constraint_count"]
+        assert applied["updated_constraint_count"] == 0
+        assert applied["unchanged_constraint_count"] == 0
+        assert applied["generation_payload"]["generation_request"]["generation_size"] == 50
+        assert applied["generation_payload"]["generation_request"]["strategies"] == ["crem"]
+        assert applied["generation_payload"]["rerank_after_generation"] is True
+
         constraints = client.get(f"/projects/{project_id}/constraints").json()
-        assert any(item["label"].startswith("advisor_") for item in constraints)
+        assert len(advisor_constraints(constraints)) == applied["applied_constraint_count"]
+
+        second_apply = client.post(f"/projects/{project_id}/advisor/apply").json()
+        assert second_apply["created_constraint_count"] == 0
+        assert second_apply["updated_constraint_count"] == 0
+        assert second_apply["unchanged_constraint_count"] == applied["applied_constraint_count"]
+        constraints_after_second_apply = client.get(f"/projects/{project_id}/constraints").json()
+        assert (
+            len(advisor_constraints(constraints_after_second_apply))
+            == applied["applied_constraint_count"]
+        )
 
         report = client.get(f"/projects/{project_id}/report").json()
         assert report["project_summary"]["project_id"] == project_id
@@ -180,3 +212,97 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         assert report["candidate_summary"]["top_molecule_count"] >= 2
         assert report["top_candidates"][0]["refutation_chain"]
         assert Path(report["report_file"]).exists()
+
+
+def test_advisor_apply_requires_existing_advice(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post(
+            "/projects",
+            json={
+                "name": "Advisor apply guard",
+                "target_id": "TGT-EGFR",
+                "objective": "do not apply missing advice",
+            },
+        ).json()["project_id"]
+
+        response = client.post(f"/projects/{project_id}/advisor/apply")
+
+        assert response.status_code == 404
+        assert "No advisor suggestion" in response.json()["detail"]
+
+
+def test_advisor_apply_accepts_document_shaped_advice(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post(
+            "/projects",
+            json={
+                "name": "Advisor document shape",
+                "target_id": "TGT-EGFR",
+                "objective": "apply doc-shaped Advisor constraints",
+            },
+        ).json()["project_id"]
+
+        with api_app.SessionLocal() as db:
+            db.add(
+                AdvisorSuggestion(
+                    suggestion_id="ADV-DOC-SHAPE",
+                    project_id=project_id,
+                    summary="Doc-shaped Advisor output.",
+                    suggestions=[],
+                    next_round_constraints=[
+                        {
+                            "constraint_type": "hard_constraint",
+                            "name": "protected_motif",
+                            "value": "quinazoline_core",
+                        },
+                        {
+                            "constraint_type": "soft_constraint",
+                            "name": "cLogP",
+                            "target_range": [1.5, 3.5],
+                        },
+                    ],
+                    suggested_generation_config={
+                        "generation_size": 15000,
+                        "min_tanimoto_to_seed": 0.45,
+                        "max_tanimoto_to_seed": 0.82,
+                        "rerank_after_generation": True,
+                    },
+                )
+            )
+            db.commit()
+
+        response = client.post(f"/projects/{project_id}/advisor/apply")
+
+        assert response.status_code == 202
+        applied = response.json()
+        assert applied["applied_constraint_count"] == 2
+        assert applied["generation_payload"]["generation_request"]["generation_size"] == 500
+        assert applied["generation_payload"]["generation_config_normalization"] == {
+            "requested_generation_size": 15000,
+            "applied_generation_size": 500,
+            "max_generation_size": 500,
+        }
+        generation_constraints = applied["generation_payload"]["generation_request"]["constraints"]
+        assert generation_constraints["min_tanimoto_to_seed"] == 0.45
+        assert generation_constraints["max_tanimoto_to_seed"] == 0.82
+        assert len(generation_constraints["advisor_constraints"]) == 2
+
+        constraints = advisor_constraints(client.get(f"/projects/{project_id}/constraints").json())
+        assert {item["label"] for item in constraints} == {
+            "advisor_protected_motif",
+            "advisor_cLogP",
+        }
+        assert next(
+            item for item in constraints if item["label"] == "advisor_cLogP"
+        )["operator"] == "target_range"
+
+        round_response = client.post(f"/projects/{project_id}/rounds")
+        assert round_response.status_code == 202
+        generator_runs = [
+            run
+            for run in round_response.json()["agent_runs"]
+            if run["agent_name"] == "generator_agent"
+        ]
+        assert generator_runs[-1]["output_json"]["generation_payload"]["source_suggestion_id"] == (
+            "ADV-DOC-SHAPE"
+        )

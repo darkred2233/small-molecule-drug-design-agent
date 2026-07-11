@@ -30,6 +30,7 @@ from medagent.db.models import (
 from medagent.db.session import build_session_factory
 from medagent.domain.schemas import (
     ADMETResultRead,
+    AdvisorApplyResponse,
     AdviceRead,
     BindingSiteRead,
     BuiltinDrugRead,
@@ -73,6 +74,10 @@ from medagent.domain.schemas import (
     SeedLigandRead,
     SynthesisRouteRead,
     UploadedFileRead,
+)
+from medagent.services.advisor import (
+    AdvisorSuggestionNotFoundError,
+    apply_latest_advisor_suggestion,
 )
 from medagent.services.bootstrap import seed_builtin_targets
 from medagent.services.candidate_assessment import (
@@ -971,19 +976,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def create_round(project_id: str, db: Session = Depends(get_db)):
         project = _get_project(db, project_id)
-        PipelineOrchestrator(app_settings).create_dry_run(db, project)
+        advisor_apply: dict | None = None
+        try:
+            advisor_apply = apply_latest_advisor_suggestion(db, project)
+        except AdvisorSuggestionNotFoundError:
+            advisor_apply = None
+
+        runs = PipelineOrchestrator(app_settings).create_dry_run(db, project)
+        if advisor_apply is not None:
+            for run in runs:
+                if run.agent_name != "generator_agent":
+                    continue
+                run.input_json = {
+                    **(run.input_json or {}),
+                    "mode": "next_round_dry_run",
+                    "source": "advisor_apply",
+                    "advisor_apply_agent_run_id": advisor_apply["agent_run_id"],
+                    "generation_payload": advisor_apply["generation_payload"],
+                }
+                run.output_json = {
+                    "message": "Registered next-round generation from Advisor apply.",
+                    "applied_constraint_count": advisor_apply["applied_constraint_count"],
+                    "generation_payload": advisor_apply["generation_payload"],
+                }
+            db.commit()
         db.refresh(project)
         return _project_status(db, project)
 
     @app.post(
         "/projects/{project_id}/advisor/apply",
+        response_model=AdvisorApplyResponse,
         status_code=202,
         tags=["对话与约束"],
         summary="应用 Advisor 建议",
     )
     def apply_advice(project_id: str, db: Session = Depends(get_db)):
-        _get_project(db, project_id)
-        return {"status": "queued", "message": "Advisor 建议应用将在 M6 阶段实现。"}
+        project = _get_project(db, project_id)
+        try:
+            return apply_latest_advisor_suggestion(db, project)
+        except AdvisorSuggestionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get(
         "/projects/{project_id}/status",

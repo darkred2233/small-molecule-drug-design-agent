@@ -471,6 +471,31 @@ class AdviceRead(BaseModel):
     )
 
 
+class AdvisorApplyResponse(BaseModel):
+    status: str = Field(title="Apply status")
+    project_id: str = Field(title="Project id")
+    suggestion_id: str = Field(title="Advisor suggestion id")
+    agent_run_id: str = Field(title="Apply agent run id")
+    applied_constraint_count: int = Field(title="Applied next-round constraint count")
+    created_constraint_count: int = Field(title="Created constraint count")
+    updated_constraint_count: int = Field(title="Updated constraint count")
+    unchanged_constraint_count: int = Field(title="Unchanged constraint count")
+    removed_constraint_count: int = Field(title="Removed stale Advisor constraint count")
+    applied_constraint_ids: list[str] = Field(title="Applied constraint ids")
+    next_round_constraints: list[dict[str, Any]] = Field(
+        default_factory=list,
+        title="Applied next-round constraints",
+    )
+    suggested_generation_config: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Suggested generation config",
+    )
+    generation_payload: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Prepared next-round generation payload",
+    )
+
+
 class ReasoningTraceRead(BaseModel):
     trace_id: str = Field(title="Reasoning trace id")
     project_id: str = Field(title="Project id")

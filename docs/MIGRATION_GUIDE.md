@@ -365,8 +365,8 @@ python -m pip install "psycopg[binary]"
 | `POST` | `/projects/{project_id}/files` | 占位 | 记录上传文件，真实 MinIO 存储待 M2 接入 |
 | `POST` | `/projects/{project_id}/ingest` | 占位 | 创建知识导入 Agent run |
 | `POST` | `/projects/{project_id}/run` | dry-run | 注册完整 Agent 流程步骤 |
-| `POST` | `/projects/{project_id}/rounds` | dry-run | 启动新一轮 dry-run |
-| `POST` | `/projects/{project_id}/advisor/apply` | 占位 | 应用 Advisor 建议，待 M6 |
+| `POST` | `/projects/{project_id}/rounds` | dry-run | 按当前约束启动新一轮 dry-run；如存在 Advisor 建议，会把下一轮生成 payload 写入 generator run |
+| `POST` | `/projects/{project_id}/advisor/apply` | 已实现 | 幂等应用最新 Advisor 建议，写入下一轮约束并准备生成 payload |
 | `GET` | `/projects/{project_id}/status` | 已实现 | 查询流程状态和 Agent runs |
 | `GET` | `/projects/{project_id}/molecules` | 已实现 | 查询候选分子，目前通常为空 |
 | `GET` | `/projects/{project_id}/constraints` | 已实现 | 查询结构化优化约束 |

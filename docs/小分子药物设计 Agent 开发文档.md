@@ -1389,7 +1389,7 @@ overall_score =
 - `top_molecule_patterns`：高排名分子的共同结构趋势。
 
 是否调用 RAG：需要，尤其当建议涉及文献证据、SAR 规律或已知风险时。  
-是否写关系数据库：写 `advisor_suggestions`、`optimization_constraints`。
+是否写关系数据库：Advisor Agent 写 `advisor_suggestions`；用户或流程调用 `/projects/{id}/advisor/apply` 后，将 `next_round_constraints` 幂等写入 `optimization_constraints`，并准备下一轮生成 payload。
 
 ### 7.14 Report Agent
 
@@ -2201,7 +2201,7 @@ overall_score =
 - `POST /projects/{id}/ingest`：解析上传资料并导入知识库。
 - `POST /projects/{id}/documents`：上传文档，兼容旧接口，建议新实现使用 `/files`。
 - `POST /projects/{id}/run`：启动完整流程。
-- `POST /projects/{id}/rounds`：按当前约束启动新一轮优化。
+- `POST /projects/{id}/rounds`：按当前约束启动新一轮优化；如存在 Advisor 建议，先应用建议并把下一轮生成 payload 写入本轮 `generator_agent` dry-run。
 - `POST /projects/{id}/advisor/apply`：接受 Advisor 建议并转成下一轮约束。
 - `GET /projects/{id}/status`：查看流程状态。
 - `GET /projects/{id}/molecules`：查看候选分子。
