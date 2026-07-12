@@ -191,9 +191,13 @@ def _default_config_path() -> Path | None:
     env_path = os.environ.get("AIZYNTHFINDER_CONFIG") or os.environ.get(
         "MEDAGENT_AIZYNTHFINDER_CONFIG"
     )
-    if not env_path:
-        return None
-    return Path(env_path).expanduser().resolve()
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+
+    default_config = Path.cwd().resolve() / "data" / "aizynthfinder" / "config.yml"
+    if default_config.exists():
+        return default_config
+    return None
 
 
 def _default_config_available() -> bool:
