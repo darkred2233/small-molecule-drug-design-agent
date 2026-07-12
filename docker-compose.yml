@@ -88,6 +88,17 @@ services:
     profiles:
       - tools
 
+  # AiZynthFinder retrosynthesis planning service
+  aizynthfinder:
+    image: aizynthfinder:latest
+    build: docker/aizynthfinder
+    volumes:
+      - ./data/retrosynthesis:/data/output
+      - ./data/aizynthfinder:/data/aizynthfinder:ro
+    command: ["--help"]
+    profiles:
+      - tools
+
 volumes:
   postgres-data:
   minio-data:

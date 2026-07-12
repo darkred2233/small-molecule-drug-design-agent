@@ -57,6 +57,12 @@ $toolMap = [ordered]@{
         Description = "Genetic molecule generation"
         HasBuild = $true
     }
+    "aizynthfinder" = @{
+        Name = "AiZynthFinder"
+        Service = "aizynthfinder"
+        Description = "Retrosynthesis planning"
+        HasBuild = $true
+    }
 }
 
 function Resolve-SelectedTools {
@@ -71,7 +77,7 @@ function Resolve-SelectedTools {
     }
 
     if ($normalized.Count -eq 0 -or $normalized -contains "all") {
-        return @("gnina", "vina", "chemprop", "diffdock", "reinvent4", "autogrow4")
+        return @("gnina", "vina", "chemprop", "diffdock", "reinvent4", "autogrow4", "aizynthfinder")
     }
 
     if ($normalized -contains "core") {

@@ -8,6 +8,7 @@ Docker工具管理和测试脚本
 - DiffDock (分子对接)
 - REINVENT4 (分子生成)
 - AutoGrow4 (分子生成)
+- AiZynthFinder (逆合成路线分析)
 
 用法：
     python scripts/manage_docker_tools.py status
@@ -77,6 +78,14 @@ TOOLS = {
         "image": "autogrow4:latest",
         "has_build": True,
         "test_command": ["-c", "import autogrow4; print('AutoGrow4 installed')"],
+    },
+    "aizynthfinder": {
+        "name": "AiZynthFinder",
+        "description": "逆合成路线分析服务",
+        "service": "aizynthfinder",
+        "image": "aizynthfinder:latest",
+        "has_build": True,
+        "test_command": ["--help"],
     },
 }
 

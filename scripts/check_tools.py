@@ -467,6 +467,27 @@ def test_chemprop_basic() -> bool:
         return False
 
 
+def test_aizynthfinder_basic() -> bool:
+    """测试AiZynthFinder适配器和模型配置状态"""
+    try:
+        from medagent.services.aizynthfinder_adapter import aizynthfinder_tool_status
+
+        status = aizynthfinder_tool_status()
+        if not status["available"]:
+            print("   ⚠️  AiZynthFinder不可用，将使用RDKit规则回退")
+            return False
+        if not status.get("model_configured"):
+            print("   ⚠️  AiZynthFinder已安装，但未配置可读的AiZynthFinder配置文件")
+            print("      设置 AIZYNTHFINDER_CONFIG 或 MEDAGENT_AIZYNTHFINDER_CONFIG")
+            return False
+
+        print(f"   ✅ AiZynthFinder可用 (模式: {status.get('mode')})")
+        return True
+    except Exception as e:
+        print(f"   ❌ 测试失败: {e}")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="检查计算化学工具可用性")
     parser.add_argument("--verbose", "-v", action="store_true", help="显示详细信息")
@@ -509,6 +530,9 @@ def main():
 
         print("\n测试 Chemprop:")
         test_chemprop_basic()
+
+        print("\n测试 AiZynthFinder:")
+        test_aizynthfinder_basic()
 
     # 给出建议
     print("\n📋 建议:")

@@ -22,6 +22,7 @@ GNINA latest 镜像很大。想优先省下载时间，可以用较小的 GNINA 
   scripts\build_tools.bat diffdock
   scripts\build_tools.bat reinvent4
   scripts\build_tools.bat autogrow4
+  scripts\build_tools.bat aizynthfinder
 
 网络足够快时可以并行构建:
 

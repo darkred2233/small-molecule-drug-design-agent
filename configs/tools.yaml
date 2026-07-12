@@ -26,5 +26,12 @@ tools:
   aizynthfinder:
     command: aizynthcli
     docker_image: aizynthfinder:latest
+    config_env:
+      - AIZYNTHFINDER_CONFIG
+      - MEDAGENT_AIZYNTHFINDER_CONFIG
+    data_env:
+      - AIZYNTHFINDER_DATA_DIR
+      - MEDAGENT_AIZYNTHFINDER_DATA_DIR
+    data_dir: data/aizynthfinder
+    output_dir: data/retrosynthesis
     timeout_seconds: 900
-
