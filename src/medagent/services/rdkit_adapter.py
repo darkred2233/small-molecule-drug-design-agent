@@ -66,24 +66,29 @@ def find_rdkit_filter_matches(smiles: str) -> tuple[bool, list[RdkitCatalogMatch
     if mol is None:
         return True, []
 
-    params = filter_catalog.FilterCatalogParams()
+    matches: list[RdkitCatalogMatch] = []
+    seen: set[tuple[str, str]] = set()
     for catalog_name in ("PAINS_A", "PAINS_B", "PAINS_C", "BRENK"):
         catalog = getattr(filter_catalog.FilterCatalogParams.FilterCatalogs, catalog_name, None)
-        if catalog is not None:
-            params.AddCatalog(catalog)
-
-    catalog = filter_catalog.FilterCatalog(params)
-    matches = [
-        RdkitCatalogMatch(catalog="rdkit_filter_catalog", description=match.GetDescription())
-        for match in catalog.GetMatches(mol)
-    ]
+        if catalog is None:
+            continue
+        params = filter_catalog.FilterCatalogParams()
+        params.AddCatalog(catalog)
+        catalog_filter = filter_catalog.FilterCatalog(params)
+        for match in catalog_filter.GetMatches(mol):
+            description = match.GetDescription()
+            key = (catalog_name, description)
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(RdkitCatalogMatch(catalog=catalog_name, description=description))
     return True, matches
 
 
 def _load_rdkit_modules() -> dict[str, Any] | None:
     try:
         from rdkit import Chem
-        from rdkit.Chem import Crippen, Descriptors, FilterCatalog, Lipinski, rdMolDescriptors
+        from rdkit.Chem import Crippen, Descriptors, FilterCatalog, Lipinski, QED, rdMolDescriptors
         from rdkit.Chem.Scaffolds import MurckoScaffold
     except ImportError:
         return None
@@ -95,6 +100,7 @@ def _load_rdkit_modules() -> dict[str, Any] | None:
         "FilterCatalog": FilterCatalog,
         "Lipinski": Lipinski,
         "MurckoScaffold": MurckoScaffold,
+        "QED": QED,
         "rdMolDescriptors": rdMolDescriptors,
     }
 
@@ -105,6 +111,7 @@ def _calculate_descriptors(mol: Any, modules: dict[str, Any]) -> dict[str, Any]:
     descriptors = modules["Descriptors"]
     lipinski = modules["Lipinski"]
     murcko_scaffold = modules["MurckoScaffold"]
+    qed = modules["QED"]
     rd_mol_descriptors = modules["rdMolDescriptors"]
 
     canonical_smiles = chem.MolToSmiles(mol, canonical=True)
@@ -133,6 +140,7 @@ def _calculate_descriptors(mol: Any, modules: dict[str, Any]) -> dict[str, Any]:
         "hba": int(lipinski.NumHAcceptors(mol)),
         "heavy_atom_count": int(mol.GetNumHeavyAtoms()),
         "rotatable_bond_count": int(lipinski.NumRotatableBonds(mol)),
+        "qed": round(float(qed.qed(mol)), 3),
         "ring_count": int(ring_info.NumRings()),
         "aromatic_ring_count": int(rd_mol_descriptors.CalcNumAromaticRings(mol)),
         "formula": rd_mol_descriptors.CalcMolFormula(mol),

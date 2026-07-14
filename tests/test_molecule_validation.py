@@ -1,7 +1,9 @@
 from fastapi.testclient import TestClient
 
+import medagent.api.app as api_app
 from medagent.api.app import create_app
 from medagent.core.config import Settings
+from medagent.db.models import MoleculeProperty
 from medagent.services.molecule_validation import validate_smiles_lightweight
 
 
@@ -18,7 +20,7 @@ def make_client(tmp_path):
 def create_project_with_molecules(client: TestClient) -> str:
     project = client.post(
         "/projects",
-        json={"name": "Molecule validation", "target_id": "TGT-EGFR"},
+        json={"name": "Molecule validation"},
     ).json()
     project_id = project["project_id"]
     client.post(
@@ -64,6 +66,9 @@ def test_validate_molecules_writes_properties_and_updates_status(tmp_path):
         assert properties["mw"] > 30
         assert properties["tool_metadata"]["validator"] in {"lightweight_smiles_validator", "rdkit"}
         assert properties["tool_metadata"]["heavy_atom_count"] == 3
+        assert properties["tool_metadata"].get("rotatable_bond_count") is not None
+        if properties["tool_metadata"]["validator"] == "rdkit":
+            assert 0 <= properties["tool_metadata"]["qed"] <= 1
 
 
 def test_validate_molecules_is_idempotent(tmp_path):
@@ -84,6 +89,33 @@ def test_validate_molecules_is_idempotent(tmp_path):
             f"/projects/{project_id}/molecules/{valid_molecule['molecule_id']}/properties"
         ).json()
         assert properties["tool_metadata"]["validation_run_count"] == 2
+
+
+def test_properties_endpoint_backfills_missing_qed_metadata(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = create_project_with_molecules(client)
+        assert client.post(f"/projects/{project_id}/molecules/validate").status_code == 200
+
+        valid_molecule = next(
+            molecule
+            for molecule in client.get(f"/projects/{project_id}/molecules").json()
+            if molecule["smiles"] == "CCO"
+        )
+        with api_app.SessionLocal() as db:
+            properties = db.query(MoleculeProperty).filter_by(
+                molecule_id=valid_molecule["molecule_id"]
+            ).one()
+            metadata = dict(properties.tool_metadata or {})
+            metadata.pop("qed", None)
+            properties.tool_metadata = metadata
+            db.commit()
+
+        properties = client.get(
+            f"/projects/{project_id}/molecules/{valid_molecule['molecule_id']}/properties"
+        ).json()
+
+        assert properties["tool_metadata"]["rotatable_bond_count"] == 0
+        assert 0 <= properties["tool_metadata"]["qed"] <= 1
 
 
 def test_lightweight_validation_rejects_unsupported_atom_tokens():

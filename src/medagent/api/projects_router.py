@@ -1,11 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from medagent.configs.settings import get_settings
 from medagent.db.models import Molecule, Project
 from medagent.db.session import get_db
 from medagent.domain.schemas import ProjectCreate, ProjectRead
+from medagent.services.bootstrap import ensure_project_target, seed_project_target_ligands
 from medagent.services.ids import new_id
+from medagent.services.project_deletion import cleanup_project_artifacts, delete_project_data
 
 router = APIRouter(prefix="/projects", tags=["项目管理"])
 
@@ -22,16 +25,22 @@ def create_project(
     payload: ProjectCreate,
     db: Session = Depends(get_db),
 ):
+    ensure_project_target(db, payload.target_id, payload.target_name)
+    constraints_json = dict(payload.constraints or {})
+    if payload.generation_config:
+        constraints_json["pipeline_config"] = payload.generation_config
     new_project = Project(
         project_id=new_id("PROJ"),
         name=payload.name,
         target_id=payload.target_id,
         objective=payload.objective,
-        constraints_json=payload.constraints,
+        constraints_json=constraints_json,
         status="created",
     )
 
     db.add(new_project)
+    db.flush()
+    seed_project_target_ligands(db, new_project)
     db.commit()
     db.refresh(new_project)
 
@@ -111,6 +120,7 @@ def get_project_stats(
 @router.delete("/{project_id}")
 def delete_project(
     project_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     project = db.query(Project).filter_by(project_id=project_id).first()
@@ -118,10 +128,22 @@ def delete_project(
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
 
-    db.delete(project)
-    db.commit()
+    try:
+        deleted_counts = delete_project_data(db, project)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
-    return {"message": "项目已删除"}
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    artifact_warnings = cleanup_project_artifacts(settings, project_id)
+
+    return {
+        "message": "项目已删除",
+        "deleted": deleted_counts,
+        "artifact_warnings": artifact_warnings,
+    }
+
 
 
 def _project_to_read(project: Project) -> ProjectRead:

@@ -115,6 +115,27 @@ def test_generation_is_idempotent_for_same_project(tmp_path):
         assert len(molecules) == 6
 
 
+def test_generation_accepts_per_strategy_counts(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = create_project_with_generation_seeds(client)
+
+        response = client.post(
+            f"/projects/{project_id}/molecules/generate",
+            json={
+                "generation_size": 30,
+                "strategy_counts": {"reinvent4": 2, "crem": 1, "autogrow4": 0},
+            },
+        )
+
+        assert response.status_code == 201
+        summary = response.json()
+        assert summary["requested_count"] == 3
+        assert summary["stored_count"] == 3
+        assert summary["strategy_summaries"]["reinvent4"]["requested_count"] == 2
+        assert summary["strategy_summaries"]["crem"]["requested_count"] == 1
+        assert "autogrow4" not in summary["strategy_summaries"]
+
+
 def test_generation_can_use_builtin_target_library_as_seed_source(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post(

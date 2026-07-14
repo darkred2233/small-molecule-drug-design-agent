@@ -5,16 +5,24 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from medagent.data.target_metadata import get_target_admet_risks, get_target_sar_rules
 from medagent.db.models import (
+    ADMETResult,
     AdvisorSuggestion,
+    BindingSite,
     Critique,
     DecisionCard,
+    DockingResult,
     EvidenceLink,
     Molecule,
     OptimizationConstraint,
     Project,
     Ranking,
     ReasoningTrace,
+    RuleFilterResult,
+    SeedLigand,
+    SynthesisRoute,
+    Target,
 )
 
 
@@ -38,8 +46,15 @@ REPORT_SECTIONS = [
 
 def build_project_report(db: Session, project: Project) -> dict[str, Any]:
     constraints = _constraints(db, project)
+    target = _target(db, project)
+    binding_sites = _binding_sites(db, project)
+    seed_ligands = _seed_ligands(db, project)
     rankings = _rankings(db, project)
     molecules = _molecules_by_id(db, project)
+    rule_filters = _rule_filters_by_molecule_id(db, molecules)
+    docking_results = _docking_results_by_molecule_id(db, molecules)
+    admet_results = _admet_results_by_molecule_id(db, molecules)
+    synthesis_routes = _synthesis_routes_by_molecule_id(db, molecules)
     critiques = _critiques_by_molecule_id(db, project)
     advisor = _latest_advisor_suggestion(db, project)
     decision_cards = _decision_cards(db, project)
@@ -51,9 +66,16 @@ def build_project_report(db: Session, project: Project) -> dict[str, Any]:
             "project_id": project.project_id,
             "name": project.name,
             "target_id": project.target_id,
+            "target_name": target.name if target else None,
             "objective": project.objective,
             "status": project.status,
         },
+        "target_and_pocket_analysis": _target_and_pocket_analysis(
+            project,
+            target,
+            binding_sites,
+            seed_ligands,
+        ),
         "constraints": [
             {
                 "constraint_id": item.constraint_id,
@@ -71,8 +93,25 @@ def build_project_report(db: Session, project: Project) -> dict[str, Any]:
             "top_molecule_count": min(len(rankings), 50),
             "decision_card_count": len(decision_cards),
             "reasoning_trace_count": len(traces),
+            "seed_ligand_count": len(seed_ligands),
+            "binding_site_count": len(binding_sites),
+            "rule_filter_count": sum(len(items) for items in rule_filters.values()),
+            "admet_result_count": len(admet_results),
+            "synthesis_route_count": len(synthesis_routes),
         },
-        "top_candidates": _top_candidates(rankings, molecules, critiques, evidence_links),
+        "sar_overview": _sar_overview(project, rule_filters),
+        "admet_overview": _admet_overview(project, admet_results),
+        "synthesis_overview": _synthesis_overview(synthesis_routes),
+        "top_candidates": _top_candidates(
+            rankings,
+            molecules,
+            critiques,
+            evidence_links,
+            rule_filters,
+            docking_results,
+            admet_results,
+            synthesis_routes,
+        ),
         "self_refutation": _self_refutation_summary(critiques),
         "advisor_suggestions": {
             "suggestion_id": advisor.suggestion_id if advisor else None,
@@ -103,6 +142,42 @@ def build_project_report(db: Session, project: Project) -> dict[str, Any]:
     return report
 
 
+def _target(db: Session, project: Project) -> Target | None:
+    if not project.target_id:
+        return None
+    return db.query(Target).filter_by(target_id=project.target_id).one_or_none()
+
+
+def _binding_sites(db: Session, project: Project) -> list[BindingSite]:
+    project_sites = (
+        db.query(BindingSite)
+        .filter_by(project_id=project.project_id)
+        .order_by(BindingSite.created_at.asc(), BindingSite.id.asc())
+        .all()
+    )
+    target_sites: list[BindingSite] = []
+    if project.target_id:
+        target_sites = (
+            db.query(BindingSite)
+            .filter(BindingSite.project_id.is_(None), BindingSite.target_id == project.target_id)
+            .order_by(BindingSite.created_at.asc(), BindingSite.id.asc())
+            .all()
+        )
+    by_id: dict[str, BindingSite] = {}
+    for site in project_sites + target_sites:
+        by_id[site.binding_site_id] = site
+    return list(by_id.values())
+
+
+def _seed_ligands(db: Session, project: Project) -> list[SeedLigand]:
+    return (
+        db.query(SeedLigand)
+        .filter_by(project_id=project.project_id)
+        .order_by(SeedLigand.id.asc())
+        .all()
+    )
+
+
 def _constraints(db: Session, project: Project) -> list[OptimizationConstraint]:
     return (
         db.query(OptimizationConstraint)
@@ -129,6 +204,69 @@ def _molecules_by_id(db: Session, project: Project) -> dict[str, Molecule]:
         .all()
     )
     return {molecule.molecule_id: molecule for molecule in molecules}
+
+
+def _rule_filters_by_molecule_id(
+    db: Session,
+    molecules: dict[str, Molecule],
+) -> dict[str, list[RuleFilterResult]]:
+    if not molecules:
+        return {}
+    results = (
+        db.query(RuleFilterResult)
+        .filter(RuleFilterResult.molecule_id.in_(list(molecules.keys())))
+        .order_by(RuleFilterResult.created_at.asc(), RuleFilterResult.id.asc())
+        .all()
+    )
+    by_molecule: dict[str, list[RuleFilterResult]] = {molecule_id: [] for molecule_id in molecules}
+    for result in results:
+        by_molecule.setdefault(result.molecule_id, []).append(result)
+    return by_molecule
+
+
+def _docking_results_by_molecule_id(
+    db: Session,
+    molecules: dict[str, Molecule],
+) -> dict[str, DockingResult]:
+    if not molecules:
+        return {}
+    results = (
+        db.query(DockingResult)
+        .filter(DockingResult.molecule_id.in_(list(molecules.keys())))
+        .order_by(DockingResult.created_at.asc(), DockingResult.id.asc())
+        .all()
+    )
+    return {result.molecule_id: result for result in results}
+
+
+def _admet_results_by_molecule_id(
+    db: Session,
+    molecules: dict[str, Molecule],
+) -> dict[str, ADMETResult]:
+    if not molecules:
+        return {}
+    results = (
+        db.query(ADMETResult)
+        .filter(ADMETResult.molecule_id.in_(list(molecules.keys())))
+        .order_by(ADMETResult.created_at.asc(), ADMETResult.id.asc())
+        .all()
+    )
+    return {result.molecule_id: result for result in results}
+
+
+def _synthesis_routes_by_molecule_id(
+    db: Session,
+    molecules: dict[str, Molecule],
+) -> dict[str, SynthesisRoute]:
+    if not molecules:
+        return {}
+    results = (
+        db.query(SynthesisRoute)
+        .filter(SynthesisRoute.molecule_id.in_(list(molecules.keys())))
+        .order_by(SynthesisRoute.created_at.asc(), SynthesisRoute.id.asc())
+        .all()
+    )
+    return {result.molecule_id: result for result in results}
 
 
 def _critiques_by_molecule_id(db: Session, project: Project) -> dict[str, Critique]:
@@ -188,11 +326,174 @@ def _reasoning_traces(db: Session, project: Project) -> list[ReasoningTrace]:
     )
 
 
+def _target_and_pocket_analysis(
+    project: Project,
+    target: Target | None,
+    binding_sites: list[BindingSite],
+    seed_ligands: list[SeedLigand],
+) -> dict[str, Any]:
+    return {
+        "target": {
+            "target_id": project.target_id,
+            "name": target.name if target else project.target_id,
+            "aliases": target.aliases if target else [],
+            "uniprot_id": target.uniprot_id if target else None,
+            "species": target.species if target else None,
+            "pdb_ids": target.pdb_ids if target else [],
+            "summary": target.summary if target else None,
+            "pocket_summary": target.pocket_summary if target else None,
+        },
+        "binding_sites": [_binding_site_summary(site) for site in binding_sites],
+        "seed_ligands": [
+            {
+                "ligand_id": ligand.ligand_id,
+                "name": ligand.name,
+                "smiles": ligand.smiles,
+                "activity_value": ligand.activity_value,
+                "activity_unit": ligand.activity_unit,
+                "source": ligand.source,
+            }
+            for ligand in seed_ligands
+        ],
+        "counts": {
+            "binding_site_count": len(binding_sites),
+            "seed_ligand_count": len(seed_ligands),
+        },
+    }
+
+
+def _binding_site_summary(site: BindingSite) -> dict[str, Any]:
+    grid_box = site.grid_box or {}
+    preparation_json = site.preparation_json or {}
+    return {
+        "binding_site_id": site.binding_site_id,
+        "target_id": site.target_id,
+        "project_id": site.project_id,
+        "pdb_id": site.pdb_id,
+        "site_name": grid_box.get("site_name"),
+        "reference_ligand": grid_box.get("reference_ligand"),
+        "source_url": grid_box.get("source_url"),
+        "preparation_status": site.preparation_status,
+        "key_residues": site.key_residues or [],
+        "grid_box": {
+            "center": grid_box.get("center") or grid_box.get("grid_center"),
+            "size": grid_box.get("size") or grid_box.get("grid_size"),
+            "unit": grid_box.get("unit"),
+            "method": grid_box.get("method"),
+        },
+        "labels": preparation_json.get("labels", []),
+        "warnings": preparation_json.get("warnings", []),
+    }
+
+
+def _sar_overview(
+    project: Project,
+    rule_filters: dict[str, list[RuleFilterResult]],
+) -> dict[str, Any]:
+    all_results = [result for results in rule_filters.values() for result in results]
+    failed_rule_counts: dict[str, int] = {}
+    warning_counts: dict[str, int] = {}
+    decision_counts: dict[str, int] = {}
+    for result in all_results:
+        decision_counts[result.decision] = decision_counts.get(result.decision, 0) + 1
+        for rule_name in result.failed_rules or []:
+            failed_rule_counts[rule_name] = failed_rule_counts.get(rule_name, 0) + 1
+        for warning in result.warnings or []:
+            warning_counts[warning] = warning_counts.get(warning, 0) + 1
+
+    return {
+        "target_sar_rules": get_target_sar_rules(project.target_id),
+        "rule_filter_statistics": {
+            "result_count": len(all_results),
+            "decision_counts": decision_counts,
+            "failed_rule_counts": failed_rule_counts,
+            "warning_counts": warning_counts,
+        },
+        "molecule_rule_findings": [
+            _rule_filter_summary(result)
+            for result in all_results
+            if result.failed_rules or result.warnings or result.labels
+        ],
+    }
+
+
+def _admet_overview(
+    project: Project,
+    admet_results: dict[str, ADMETResult],
+) -> dict[str, Any]:
+    herg_counts: dict[str, int] = {}
+    ames_counts: dict[str, int] = {}
+    solubility_counts: dict[str, int] = {}
+    permeability_counts: dict[str, int] = {}
+    raw_risk_counts: dict[str, dict[str, int]] = {}
+    high_risk_molecules: list[dict[str, Any]] = []
+
+    for molecule_id, result in admet_results.items():
+        _count(herg_counts, result.hERG_risk)
+        _count(ames_counts, result.Ames_risk)
+        _count(solubility_counts, result.solubility)
+        _count(permeability_counts, result.permeability)
+        raw_output = result.raw_output or {}
+        for key in ("CYP3A4_inhibition", "CYP2D6_inhibition", "DILI_risk", "Pgp_substrate", "BBB_penetration"):
+            risk = _raw_risk_label(raw_output.get(key))
+            if risk:
+                raw_risk_counts.setdefault(key, {})
+                raw_risk_counts[key][risk] = raw_risk_counts[key].get(risk, 0) + 1
+        if result.hERG_risk == "high_risk" or result.Ames_risk == "high_risk":
+            high_risk_molecules.append(_admet_summary(molecule_id, result))
+
+    return {
+        "target_admet_risks": get_target_admet_risks(project.target_id),
+        "result_count": len(admet_results),
+        "risk_counts": {
+            "hERG": herg_counts,
+            "Ames": ames_counts,
+            "solubility": solubility_counts,
+            "permeability": permeability_counts,
+            **raw_risk_counts,
+        },
+        "high_risk_molecules": high_risk_molecules,
+    }
+
+
+def _synthesis_overview(synthesis_routes: dict[str, SynthesisRoute]) -> dict[str, Any]:
+    route_found_count = sum(1 for route in synthesis_routes.values() if route.route_found)
+    route_step_values = [
+        route.route_steps for route in synthesis_routes.values() if route.route_steps is not None
+    ]
+    confidence_values = [
+        route.route_confidence
+        for route in synthesis_routes.values()
+        if route.route_confidence is not None
+    ]
+    label_counts: dict[str, int] = {}
+    for route in synthesis_routes.values():
+        for label in route.labels or []:
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+    return {
+        "result_count": len(synthesis_routes),
+        "route_found_count": route_found_count,
+        "route_missing_count": len(synthesis_routes) - route_found_count,
+        "average_route_steps": _average(route_step_values),
+        "average_route_confidence": _average(confidence_values),
+        "label_counts": label_counts,
+        "routes": [
+            _synthesis_summary(molecule_id, route)
+            for molecule_id, route in synthesis_routes.items()
+        ],
+    }
+
+
 def _top_candidates(
     rankings: list[Ranking],
     molecules: dict[str, Molecule],
     critiques: dict[str, Critique],
     evidence_links: dict[str, list[EvidenceLink]],
+    rule_filters: dict[str, list[RuleFilterResult]],
+    docking_results: dict[str, DockingResult],
+    admet_results: dict[str, ADMETResult],
+    synthesis_routes: dict[str, SynthesisRoute],
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for ranking in rankings[:50]:
@@ -207,6 +508,19 @@ def _top_candidates(
                 "final_decision": ranking.final_decision,
                 "risk_level": critique.risk_level if critique else None,
                 "refutation_decision": critique.refutation_decision if critique else None,
+                "rule_filter": [
+                    _rule_filter_summary(result)
+                    for result in rule_filters.get(ranking.molecule_id, [])
+                ],
+                "docking": _docking_summary(docking_results.get(ranking.molecule_id)),
+                "admet": _admet_summary(
+                    ranking.molecule_id,
+                    admet_results.get(ranking.molecule_id),
+                ),
+                "synthesis": _synthesis_summary(
+                    ranking.molecule_id,
+                    synthesis_routes.get(ranking.molecule_id),
+                ),
                 "evidence_chain": _evidence_chain(evidence_links.get(ranking.molecule_id, [])),
                 "refutation_chain": _refutation_chain(critique),
             }
@@ -238,6 +552,157 @@ def _refutation_chain(critique: Critique | None) -> dict[str, Any] | None:
         "reason": critique.reason,
         "evidence_ids": critique.evidence_ids or [],
     }
+
+
+def _rule_filter_summary(result: RuleFilterResult) -> dict[str, Any]:
+    return {
+        "filter_result_id": result.filter_result_id,
+        "molecule_id": result.molecule_id,
+        "rule_set": result.rule_set,
+        "decision": result.decision,
+        "failed_rules": result.failed_rules or [],
+        "warnings": result.warnings or [],
+        "labels": result.labels or [],
+        "properties_snapshot": result.properties_snapshot or {},
+        "sar_notes": (result.raw_output or {}).get("sar_notes", []),
+    }
+
+
+def _docking_summary(result: DockingResult | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    return {
+        "vina_score": result.vina_score,
+        "cnn_score": result.cnn_score,
+        "key_hbond_count": result.key_hbond_count,
+        "clash_count": result.clash_count,
+        "pose_file": result.pose_file,
+        "labels": result.labels or [],
+    }
+
+
+def _admet_summary(molecule_id: str, result: ADMETResult | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    raw_output = result.raw_output or {}
+    return {
+        "molecule_id": molecule_id,
+        "hERG": {
+            "probability": result.hERG_probability,
+            "risk": result.hERG_risk,
+        },
+        "Ames": {
+            "probability": result.Ames_probability,
+            "risk": result.Ames_risk,
+        },
+        "solubility": result.solubility,
+        "permeability": result.permeability,
+        "admet_risk_score": result.admet_risk_score,
+        "CYP3A4": raw_output.get("CYP3A4_inhibition"),
+        "CYP2D6": raw_output.get("CYP2D6_inhibition"),
+        "DILI": raw_output.get("DILI_risk"),
+        "Pgp": raw_output.get("Pgp_substrate"),
+        "BBB": raw_output.get("BBB_penetration"),
+        "labels": result.labels or [],
+        "adapter_mode": raw_output.get("adapter_mode"),
+    }
+
+
+def _synthesis_summary(molecule_id: str, route: SynthesisRoute | None) -> dict[str, Any] | None:
+    if route is None:
+        return None
+    route_json = route.route_json or {}
+    return {
+        "molecule_id": molecule_id,
+        "route_found": route.route_found,
+        "route_steps": route.route_steps,
+        "route_confidence": route.route_confidence,
+        "buyable_building_blocks": route.buyable_building_blocks,
+        "SA_score": route_json.get("SA_score"),
+        "SCScore": route_json.get("SCScore"),
+        "hazardous_reaction_count": route_json.get("hazardous_reaction_count"),
+        "protecting_group_count": route_json.get("protecting_group_count"),
+        "route_summary": route_json.get("route_summary"),
+        "route_plan": route_json.get("route_plan")
+        or _fallback_route_plan(route.route_found, route.route_steps, route.buyable_building_blocks),
+        "starting_materials": route_json.get("starting_materials")
+        or _fallback_starting_materials(route.buyable_building_blocks),
+        "route_risks": route_json.get("route_risks")
+        or _fallback_route_risks(route.route_found, route.route_steps),
+        "route_note": route_json.get("route_note")
+        or "Route details are a surrogate synthesis blueprint unless AiZynthFinder output is configured.",
+        "adapter_mode": route_json.get("adapter_mode"),
+        "labels": route.labels or [],
+    }
+
+
+def _fallback_starting_materials(buyable_blocks: int | None) -> list[str]:
+    count = max(1, buyable_blocks or 1)
+    materials = ["commercial aryl/heteroaryl core", "polar linker fragment", "late-stage R-group fragment"]
+    return materials[:count]
+
+
+def _fallback_route_plan(
+    route_found: bool,
+    route_steps: int | None,
+    buyable_blocks: int | None,
+) -> list[dict[str, Any]]:
+    steps = route_steps or 3
+    plan = [
+        {
+            "step": 1,
+            "stage": "Building-block selection",
+            "input": _fallback_starting_materials(buyable_blocks),
+            "operation": "Select purchasable fragments compatible with the candidate scaffold.",
+            "output": "Fragment set for analog synthesis.",
+        },
+        {
+            "step": 2,
+            "stage": "Scaffold assembly",
+            "input": ["core fragment", "linker or cap fragment"],
+            "operation": "Assemble the candidate core through the main bond-forming transformation.",
+            "output": "Advanced intermediate.",
+        },
+        {
+            "step": 3,
+            "stage": "Late-stage optimization",
+            "input": ["advanced intermediate"],
+            "operation": "Install final substituents and purify the candidate.",
+            "output": "Target molecule candidate.",
+        },
+    ]
+    if steps > 3:
+        plan.append(
+            {
+                "step": 4,
+                "stage": "Complexity management",
+                "input": ["target molecule candidate"],
+                "operation": "Resolve additional purification, salt/form, or protecting-group needs.",
+                "output": "Screening-ready batch.",
+            }
+        )
+    if not route_found:
+        plan.append(
+            {
+                "step": len(plan) + 1,
+                "stage": "Route redesign",
+                "input": ["current candidate"],
+                "operation": "Simplify motifs or choose alternate building blocks before nomination.",
+                "output": "Revised candidate proposal.",
+            }
+        )
+    return plan
+
+
+def _fallback_route_risks(route_found: bool, route_steps: int | None) -> list[str]:
+    risks: list[str] = []
+    if not route_found:
+        risks.append("No confident route was found within the surrogate assessment.")
+    if route_steps is not None and route_steps > 6:
+        risks.append(f"Estimated route length is high: {route_steps} steps.")
+    if not risks:
+        risks.append("No major surrogate route risk detected.")
+    return risks
 
 
 def _flatten_evidence_links(
@@ -272,6 +737,29 @@ def _self_refutation_summary(critiques: dict[str, Critique]) -> dict[str, Any]:
         "risk_counts": risk_counts,
         "decision_counts": decisions,
     }
+
+
+def _count(counter: dict[str, int], key: str | None) -> None:
+    if not key:
+        return
+    counter[str(key)] = counter.get(str(key), 0) + 1
+
+
+def _raw_risk_label(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        raw_value = value.get("risk") or value.get("label") or value.get("value")
+        return str(raw_value) if raw_value else None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _average(values: list[float | int]) -> float | None:
+    if not values:
+        return None
+    return round(float(sum(values)) / len(values), 4)
 
 
 def _write_report_file(project: Project, report: dict[str, Any]) -> str:

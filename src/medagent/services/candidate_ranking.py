@@ -17,10 +17,12 @@ from medagent.db.models import (
     SynthesisRoute,
 )
 from medagent.services.ids import new_id
+from medagent.services.molecule_validation import merge_labels
 
 
 RANKING_AGENT_NAME = "ranking_agent"
 RANKING_ADAPTER_MODE = "heuristic_candidate_ranking"
+TERMINAL_FAILURE_STATUSES = {"invalid_structure", "failed_filter", "failed_assessment"}
 RANKING_ELIGIBLE_STATUSES = {
     "generated",
     "imported_from_seed",
@@ -103,6 +105,9 @@ def generate_project_rankings(
     selected_molecules = molecules or _select_ranking_molecules(db, project, molecule_ids, max_molecules)
     top_n = top_n or max_molecules
     selected_ids = [molecule.molecule_id for molecule in selected_molecules]
+    external_refinement_present = any(
+        _is_externally_refined_candidate(molecule) for molecule in selected_molecules
+    )
     agent_run = _create_agent_run(
         db,
         project,
@@ -124,14 +129,23 @@ def generate_project_rankings(
     warnings: list[str] = []
     for molecule in selected_molecules:
         bundle = _load_evidence_bundle(db, molecule)
-        scored = _score_molecule(molecule, bundle)
+        scored = _score_molecule(
+            molecule,
+            bundle,
+            external_refinement_present=external_refinement_present,
+        )
         scored_molecules.append(scored)
         warnings.extend(_missing_evidence_warnings(scored.score_breakdown))
         summary.evaluated_count += 1
 
     ranked = sorted(
         scored_molecules,
-        key=lambda item: (-item.overall_score, item.con_score, item.molecule.molecule_id),
+        key=lambda item: (
+            _refinement_sort_tier(item, external_refinement_present),
+            -item.overall_score,
+            item.con_score,
+            item.molecule.molecule_id,
+        ),
     )
     stored = ranked[:top_n]
     _replace_project_rankings(db, project, stored)
@@ -184,7 +198,11 @@ def _load_evidence_bundle(db: Session, molecule: Molecule) -> EvidenceBundle:
     )
 
 
-def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecule:
+def _score_molecule(
+    molecule: Molecule,
+    bundle: EvidenceBundle,
+    external_refinement_present: bool = False,
+) -> ScoredMolecule:
     docking = _score_docking(bundle.docking)
     admet = _score_admet(bundle.admet)
     synthesis = _score_synthesis(bundle.synthesis)
@@ -229,8 +247,13 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
     )
     evidence_confidence = _evidence_confidence(components)
     critique_penalty = _critique_overall_penalty(critique)
-    overall_score = round(
+    base_overall_score = round(
         _clamp(pro_score - con_score * 0.55 + evidence_confidence * 8 - critique_penalty, 0, 100),
+        3,
+    )
+    refinement_context = _refinement_context(molecule, external_refinement_present)
+    overall_score = round(
+        _clamp(base_overall_score - refinement_context["provisional_penalty"], 0, 100),
         3,
     )
     blockers = _dedupe(
@@ -277,6 +300,8 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
         "critique_overall_penalty": critique_penalty,
         "rag_evidence": rag_evidence.details,
         "blockers": blockers,
+        "base_overall_score": base_overall_score,
+        "refinement": refinement_context,
         "molecule_labels": molecule.labels or [],
     }
     return ScoredMolecule(
@@ -288,6 +313,68 @@ def _score_molecule(molecule: Molecule, bundle: EvidenceBundle) -> ScoredMolecul
         final_decision=final_decision,
         score_breakdown=score_breakdown,
     )
+
+
+def _is_externally_refined_candidate(molecule: Molecule) -> bool:
+    return "externally_refined_candidate" in (molecule.labels or [])
+
+
+def _refinement_context(
+    molecule: Molecule,
+    external_refinement_present: bool,
+) -> dict[str, Any]:
+    labels = set(molecule.labels or [])
+    if not external_refinement_present:
+        return {
+            "external_refinement_present": False,
+            "state": "not_applicable",
+            "sort_tier": 0,
+            "provisional_penalty": 0.0,
+        }
+    if "externally_refined_candidate" in labels:
+        return {
+            "external_refinement_present": True,
+            "state": "externally_refined",
+            "sort_tier": 0,
+            "provisional_penalty": 0.0,
+        }
+    if "external_refinement_attempted" in labels:
+        return {
+            "external_refinement_present": True,
+            "state": "external_refinement_attempted_without_external_evidence",
+            "sort_tier": 1,
+            "provisional_penalty": 25.0,
+        }
+    if "coarse_only_candidate" in labels:
+        return {
+            "external_refinement_present": True,
+            "state": "coarse_only",
+            "sort_tier": 2,
+            "provisional_penalty": 40.0,
+        }
+    if "coarse_screen_failed" in labels or "rejected_by_coarse_screen" in labels:
+        return {
+            "external_refinement_present": True,
+            "state": "coarse_screen_failed",
+            "sort_tier": 3,
+            "provisional_penalty": 55.0,
+        }
+    return {
+        "external_refinement_present": True,
+        "state": "unrefined",
+        "sort_tier": 2,
+        "provisional_penalty": 40.0,
+    }
+
+
+def _refinement_sort_tier(
+    scored: ScoredMolecule,
+    external_refinement_present: bool,
+) -> int:
+    if not external_refinement_present:
+        return 0
+    refinement = scored.score_breakdown.get("refinement") or {}
+    return int(refinement.get("sort_tier", 2))
 
 
 def _score_docking(result: DockingResult | None) -> ComponentScore:
@@ -431,9 +518,13 @@ def _score_rule_filter(result: RuleFilterResult | None) -> ComponentScore:
         )
 
     failed_count = len(result.failed_rules or [])
+    warning_count = len(result.warnings or [])
     if result.decision == "passed":
         positive = 0.90
         risk = 0.05
+    elif result.decision == "passed_with_warnings":
+        positive = _clamp(0.78 - warning_count * 0.025, 0.55, 0.78)
+        risk = _clamp(0.12 + warning_count * 0.035, 0.12, 0.45)
     elif result.decision == "failed":
         positive = _clamp(0.65 - failed_count * 0.15, 0.10, 0.65)
         risk = _clamp(0.40 + failed_count * 0.12, 0, 1)
@@ -453,6 +544,7 @@ def _score_rule_filter(result: RuleFilterResult | None) -> ComponentScore:
             "decision": result.decision,
             "failed_rules": result.failed_rules or [],
             "warnings": result.warnings or [],
+            "warning_count": warning_count,
             "labels": result.labels or [],
         },
         blockers=blockers,
@@ -640,6 +732,14 @@ def _replace_project_rankings(
 ) -> None:
     db.query(Ranking).filter(Ranking.project_id == project.project_id).delete(synchronize_session=False)
     for index, scored in enumerate(ranked_molecules, start=1):
+        if scored.final_decision == "reject":
+            if scored.molecule.status not in TERMINAL_FAILURE_STATUSES:
+                scored.molecule.status = "rejected_by_ranking"
+            scored.molecule.labels = merge_labels(scored.molecule.labels, ["ranking_reject"])
+        elif scored.final_decision == "deprioritize":
+            scored.molecule.labels = merge_labels(scored.molecule.labels, ["ranking_deprioritize"])
+        elif scored.final_decision in {"advance", "watch", "reserve"}:
+            scored.molecule.labels = merge_labels(scored.molecule.labels, [f"ranking_{scored.final_decision}"])
         db.add(
             Ranking(
                 project_id=project.project_id,

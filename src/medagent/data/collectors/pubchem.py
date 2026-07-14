@@ -12,7 +12,8 @@ class PubChemCollector(BaseCollector):
     source_name = "pubchem"
     property_url = (
         "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{name}/property/"
-        "CanonicalSMILES,IsomericSMILES,InChIKey,MolecularFormula,MolecularWeight,ExactMass/JSON"
+        "SMILES,ConnectivitySMILES,CanonicalSMILES,IsomericSMILES,InChIKey,"
+        "MolecularFormula,MolecularWeight,ExactMass/JSON"
     )
     synonym_url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/synonyms/JSON"
     description_url = (
@@ -74,12 +75,19 @@ class PubChemCollector(BaseCollector):
             except Exception:
                 description = ""
 
+        canonical_smiles = (
+            properties.get("CanonicalSMILES")
+            or properties.get("ConnectivitySMILES")
+            or properties.get("SMILES")
+        )
+        isomeric_smiles = properties.get("IsomericSMILES") or properties.get("SMILES") or canonical_smiles
+
         parts = [
             f"Reference drug: {name}",
             f"Target context: {target_name} ({target_id})",
             f"CID: {cid}",
-            f"SMILES: {properties.get('CanonicalSMILES')}",
-            f"Isomeric SMILES: {properties.get('IsomericSMILES')}",
+            f"SMILES: {canonical_smiles}",
+            f"Isomeric SMILES: {isomeric_smiles}",
             f"InChIKey: {properties.get('InChIKey')}",
             f"Formula: {properties.get('MolecularFormula')}",
             f"MW: {properties.get('MolecularWeight')}",

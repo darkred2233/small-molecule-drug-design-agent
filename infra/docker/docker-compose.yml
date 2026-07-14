@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: medagent-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-medagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medagent_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-medagent}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../docs/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medagent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - medagent-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: medagent-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - medagent-network
+
+  # MinIO client for bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: medagent-minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      mc alias set medagent http://minio:9000 minioadmin minioadmin;
+      mc mb medagent/uploads --ignore-existing;
+      mc mb medagent/reports --ignore-existing;
+      mc mb medagent/docking-results --ignore-existing;
+      mc mb medagent/models --ignore-existing;
+      echo 'MinIO buckets initialized';
+      "
+    networks:
+      - medagent-network
+
+volumes:
+  postgres_data:
+    name: medagent-postgres-data
+  minio_data:
+    name: medagent-minio-data
+
+networks:
+  medagent-network:
+    name: medagent-network
+    driver: bridge

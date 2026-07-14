@@ -38,7 +38,10 @@ def test_aizynthfinder_unavailable_returns_safe_fallback(tmp_path):
     assert "aizynthfinder_not_installed" in result.warnings
 
 
-def test_aizynthfinder_available_without_config_does_not_claim_real_route(tmp_path):
+def test_aizynthfinder_available_without_config_does_not_claim_real_route(tmp_path, monkeypatch):
+    monkeypatch.delenv("AIZYNTHFINDER_CONFIG", raising=False)
+    monkeypatch.delenv("MEDAGENT_AIZYNTHFINDER_CONFIG", raising=False)
+    monkeypatch.setattr(aizynthfinder_adapter, "_default_config_path", lambda: None)
     request = AiZynthFinderRequest(smiles="CCO", output_dir=str(tmp_path))
 
     result = run_aizynthfinder_retrosynthesis(

@@ -354,10 +354,21 @@ def generate_project_molecules(
     project: Project,
     generation_size: int,
     strategies: list[str] | None = None,
+    strategy_counts: dict[str, int] | None = None,
     constraints: dict[str, Any] | None = None,
     include_target_library_seeds: bool = True,
+    agent_run_name: str = GENERATOR_AGENT_NAME,
 ) -> dict[str, Any]:
     selected_strategies = _normalize_strategies(strategies)
+    requested_by_strategy = _resolve_strategy_counts(
+        generation_size,
+        selected_strategies,
+        strategy_counts,
+    )
+    selected_strategies = [
+        strategy for strategy in selected_strategies if requested_by_strategy.get(strategy, 0) > 0
+    ]
+    generation_size = sum(requested_by_strategy[strategy] for strategy in selected_strategies)
     normalized_constraints = constraints or {}
     tool_status = generation_tool_status()
     seeds = collect_generation_seed_smiles(
@@ -368,17 +379,17 @@ def generate_project_molecules(
     if not seeds:
         raise ValueError("generation_requires_at_least_one_seed_ligand")
 
-    requested_by_strategy = _split_generation_size(generation_size, selected_strategies)
     agent_run = AgentRun(
         agent_run_id=new_id("RUN"),
         project_id=project.project_id,
-        agent_name=GENERATOR_AGENT_NAME,
+        agent_name=agent_run_name,
         model_name="tool-adapter",
         status="running",
         input_json={
             "project_id": project.project_id,
             "generation_size": generation_size,
             "strategies": selected_strategies,
+            "strategy_counts": requested_by_strategy,
             "constraints": normalized_constraints,
             "seed_count": len(seeds),
             "include_target_library_seeds": include_target_library_seeds,
@@ -698,6 +709,27 @@ def _split_generation_size(generation_size: int, strategies: list[str]) -> dict[
         strategy: base_count + (1 if index < remainder else 0)
         for index, strategy in enumerate(strategies)
     }
+
+
+def _resolve_strategy_counts(
+    generation_size: int,
+    strategies: list[str],
+    strategy_counts: dict[str, int] | None,
+) -> dict[str, int]:
+    if not strategies:
+        return {}
+    if not strategy_counts:
+        return _split_generation_size(generation_size, strategies)
+
+    resolved: dict[str, int] = {}
+    for strategy in strategies:
+        value = strategy_counts.get(strategy, 0)
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            count = 0
+        resolved[strategy] = max(0, min(count, 500))
+    return resolved
 
 
 def _unique_valid_smiles(smiles_values: Iterable[str | None]) -> list[str]:

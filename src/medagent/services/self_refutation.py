@@ -92,14 +92,36 @@ def _select_candidates(
         .limit(max_molecules)
         .all()
     )
-    if rankings:
-        molecule_ids = [ranking.molecule_id for ranking in rankings]
-        molecules = db.query(Molecule).filter(Molecule.molecule_id.in_(molecule_ids)).all()
+    ranking_by_molecule_id = {ranking.molecule_id: ranking for ranking in rankings}
+    selected_ids: list[str] = []
+    for ranking in rankings:
+        if ranking.molecule_id not in selected_ids:
+            selected_ids.append(ranking.molecule_id)
+
+    assessed_molecules = (
+        db.query(Molecule)
+        .filter_by(project_id=project.project_id, status="candidate_assessed")
+        .order_by(Molecule.id.asc())
+        .limit(max_molecules)
+        .all()
+    )
+    for molecule in assessed_molecules:
+        if len(selected_ids) >= max_molecules:
+            break
+        if molecule.molecule_id not in selected_ids:
+            selected_ids.append(molecule.molecule_id)
+
+    if selected_ids:
+        molecules = (
+            db.query(Molecule)
+            .filter(Molecule.project_id == project.project_id, Molecule.molecule_id.in_(selected_ids))
+            .all()
+        )
         molecule_by_id = {molecule.molecule_id: molecule for molecule in molecules}
         return [
-            (molecule_by_id[ranking.molecule_id], ranking)
-            for ranking in rankings
-            if ranking.molecule_id in molecule_by_id
+            (molecule_by_id[molecule_id], ranking_by_molecule_id.get(molecule_id))
+            for molecule_id in selected_ids
+            if molecule_id in molecule_by_id
         ]
 
     molecules = (

@@ -5,7 +5,30 @@ from fastapi.testclient import TestClient
 import medagent.api.app as api_app
 from medagent.api.app import create_app
 from medagent.core.config import Settings
-from medagent.db.models import AdvisorSuggestion
+from medagent.db.models import (
+    ADMETResult,
+    AgentRun,
+    AdvisorSuggestion,
+    BindingSite,
+    ConformerResult,
+    ConversationMessage,
+    Critique,
+    DecisionCard,
+    DockingResult,
+    EvidenceLink,
+    Molecule,
+    MoleculeProperty,
+    OptimizationConstraint,
+    RagChunk,
+    RagDocument,
+    Ranking,
+    ReasoningTrace,
+    RuleFilterResult,
+    SeedLigand,
+    SynthesisRoute,
+    Target,
+    UploadedFile,
+)
 
 
 def make_client(tmp_path):
@@ -24,6 +47,25 @@ def test_builtin_targets_are_seeded(tmp_path):
         assert response.status_code == 200
         targets = response.json()
         assert any(target["target_id"] == "TGT-EGFR" for target in targets)
+        egfr = next(target for target in targets if target["target_id"] == "TGT-EGFR")
+        assert egfr["pdb_ids"]
+        assert egfr["pocket_summary"]
+        assert egfr["binding_sites"]
+        assert egfr["binding_sites"][0]["grid_box"]["center"]
+        assert egfr["sar_rules"]
+        assert egfr["admet_risks"]
+        assert egfr["seed_ligand_count"] > 0
+        assert all(drug["smiles"] for drug in egfr["drugs"])
+
+        her2 = next(target for target in targets if target["target_id"] == "TGT-HER2")
+        assert her2["seed_ligand_count"] >= 3
+        assert {drug["drug_name"] for drug in her2["drugs"]} >= {"lapatinib", "neratinib", "tucatinib"}
+        assert all(drug["smiles"] and drug["pubchem_cid"] for drug in her2["drugs"])
+        assert her2["binding_sites"]
+        assert her2["binding_sites"][0]["pdb_id"] == "3PP0"
+        assert her2["binding_sites"][0]["grid_box"]["center"]
+        assert her2["sar_rules"]
+        assert her2["admet_risks"]
 
 
 def test_create_project_and_parse_constraints(tmp_path):
@@ -38,6 +80,11 @@ def test_create_project_and_parse_constraints(tmp_path):
         )
         assert project_response.status_code == 201
         project_id = project_response.json()["project_id"]
+        seed_response = client.get(f"/projects/{project_id}/seed-ligands")
+        assert seed_response.status_code == 200
+        seed_ligands = seed_response.json()
+        assert len(seed_ligands) > 0
+        assert all(ligand["smiles"] for ligand in seed_ligands)
 
         chat_response = client.post(
             f"/projects/{project_id}/chat",
@@ -89,6 +136,184 @@ def test_project_router_uses_current_project_schema(tmp_path):
         assert detail_response.json()["objective"] == "verify project router schema"
 
 
+def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'delete.db'}",
+        storage_local_root=str(tmp_path / "uploads"),
+    )
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        project_id = client.post(
+            "/projects",
+            json={
+                "name": "Delete cascade",
+                "target_id": "TGT-EGFR",
+                "objective": "verify cleanup",
+            },
+        ).json()["project_id"]
+
+        upload_file = tmp_path / "uploads" / project_id / "FILE-DELETE" / "seed.smi"
+        upload_file.parent.mkdir(parents=True)
+        upload_file.write_text("CCO ethanol\n", encoding="utf-8")
+
+        report_dir = tmp_path / ".local" / "reports" / project_id
+        report_dir.mkdir(parents=True)
+        (report_dir / "report.json").write_text("{}", encoding="utf-8")
+
+        with api_app.SessionLocal() as db:
+            target_site_count = db.query(BindingSite).filter(BindingSite.project_id.is_(None)).count()
+            db.add_all(
+                [
+                    UploadedFile(
+                        file_id="FILE-DELETE",
+                        project_id=project_id,
+                        filename="seed.smi",
+                        file_type="text/plain",
+                        storage_path=f"local://{upload_file}",
+                    ),
+                    ConversationMessage(
+                        message_id="MSG-DELETE",
+                        project_id=project_id,
+                        role="user",
+                        content="delete me",
+                    ),
+                    OptimizationConstraint(
+                        constraint_id="CONS-DELETE",
+                        project_id=project_id,
+                        label="delete",
+                    ),
+                    Molecule(
+                        molecule_id="MOL-DELETE",
+                        project_id=project_id,
+                        smiles="CCO",
+                    ),
+                    MoleculeProperty(molecule_id="MOL-DELETE", mw=46.07),
+                    RuleFilterResult(
+                        filter_result_id="FILTER-DELETE",
+                        project_id=project_id,
+                        molecule_id="MOL-DELETE",
+                        decision="pass",
+                    ),
+                    ConformerResult(molecule_id="MOL-DELETE", conformer_generated=True),
+                    DockingResult(molecule_id="MOL-DELETE", vina_score=-7.1),
+                    ADMETResult(molecule_id="MOL-DELETE", hERG_risk="low"),
+                    SynthesisRoute(molecule_id="MOL-DELETE", route_found=True),
+                    Critique(
+                        critique_id="CRIT-DELETE",
+                        molecule_id="MOL-DELETE",
+                        risk_level="low",
+                        reason="cleanup check",
+                    ),
+                    RagDocument(
+                        document_id="DOC-DELETE",
+                        project_id=project_id,
+                        title="Delete doc",
+                        document_type="upload",
+                    ),
+                    RagChunk(
+                        chunk_id="CHK-DELETE",
+                        document_id="DOC-DELETE",
+                        content="cleanup evidence",
+                    ),
+                    EvidenceLink(
+                        evidence_id="EVD-DELETE",
+                        molecule_id="MOL-DELETE",
+                        chunk_id="CHK-DELETE",
+                        claim_type="cleanup",
+                    ),
+                    AgentRun(
+                        agent_run_id="RUN-DELETE",
+                        project_id=project_id,
+                        agent_name="cleanup_agent",
+                    ),
+                    ReasoningTrace(
+                        trace_id="TRACE-DELETE",
+                        project_id=project_id,
+                        molecule_id="MOL-DELETE",
+                        claim="cleanup trace",
+                    ),
+                    DecisionCard(
+                        decision_id="CARD-DELETE",
+                        project_id=project_id,
+                        molecule_id="MOL-DELETE",
+                        trace_id="TRACE-DELETE",
+                        title="Cleanup",
+                        decision="remove",
+                        summary="cleanup card",
+                    ),
+                    AdvisorSuggestion(
+                        suggestion_id="ADV-DELETE",
+                        project_id=project_id,
+                        summary="cleanup advice",
+                        suggestions=[],
+                        next_round_constraints=[],
+                        suggested_generation_config={},
+                    ),
+                    Ranking(
+                        project_id=project_id,
+                        molecule_id="MOL-DELETE",
+                        rank=1,
+                        final_decision="remove",
+                        score_breakdown={},
+                    ),
+                    BindingSite(
+                        binding_site_id="SITE-DELETE",
+                        project_id=project_id,
+                        target_id="TGT-EGFR",
+                    ),
+                    SeedLigand(
+                        ligand_id="LIG-DELETE",
+                        project_id=project_id,
+                        target_id="TGT-EGFR",
+                        name="delete ligand",
+                        smiles="CCO",
+                    ),
+                ]
+            )
+            db.commit()
+
+        response = client.delete(f"/projects/{project_id}")
+
+        assert response.status_code == 200
+        assert client.get(f"/projects/{project_id}").status_code == 404
+        assert project_id not in {item["project_id"] for item in client.get("/projects").json()}
+        assert not (tmp_path / "uploads" / project_id).exists()
+        assert not report_dir.exists()
+
+        with api_app.SessionLocal() as db:
+            assert db.query(Target).filter_by(target_id="TGT-EGFR").count() == 1
+            assert db.query(BindingSite).filter(BindingSite.project_id.is_(None)).count() == target_site_count
+            for model in [
+                UploadedFile,
+                ConversationMessage,
+                OptimizationConstraint,
+                Molecule,
+                RuleFilterResult,
+                RagDocument,
+                AgentRun,
+                ReasoningTrace,
+                DecisionCard,
+                AdvisorSuggestion,
+                Ranking,
+                BindingSite,
+                SeedLigand,
+            ]:
+                assert db.query(model).filter_by(project_id=project_id).count() == 0
+            for model in [
+                MoleculeProperty,
+                ConformerResult,
+                DockingResult,
+                ADMETResult,
+                SynthesisRoute,
+                Critique,
+            ]:
+                assert db.query(model).filter_by(molecule_id="MOL-DELETE").count() == 0
+            assert db.query(RagChunk).filter_by(document_id="DOC-DELETE").count() == 0
+            assert db.query(EvidenceLink).filter_by(evidence_id="EVD-DELETE").count() == 0
+
+
 def test_pipeline_dry_run_registers_agent_steps(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post("/projects", json={"name": "KRAS program"}).json()["project_id"]
@@ -110,6 +335,13 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
                 "name": "Full pipeline",
                 "target_id": "TGT-EGFR",
                 "objective": "run the executable agent workflow",
+                "generation_config": {
+                    "strategy_counts": {"reinvent4": 1, "crem": 1, "autogrow4": 0},
+                    "top_n": 2,
+                    "max_assessment_molecules": 4,
+                    "assessment_mode": "fast",
+                    "generate_when_seeds_exist": True,
+                },
             },
         ).json()["project_id"]
 
@@ -162,7 +394,7 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         assert len(molecules) >= 2
 
         rankings = client.get(f"/projects/{project_id}/rankings").json()
-        assert len(rankings) >= 2
+        assert len(rankings) == 2
         assert rankings[0]["overall_score"] >= rankings[-1]["overall_score"]
 
         decision_cards = client.get(f"/projects/{project_id}/decision-cards").json()
@@ -210,8 +442,26 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         assert len(report["top_candidates"]) >= 2
         assert report["self_refutation"]["critique_count"] >= 2
         assert report["candidate_summary"]["top_molecule_count"] >= 2
+        assert report["candidate_summary"]["seed_ligand_count"] > 0
+        assert report["candidate_summary"]["binding_site_count"] > 0
+        assert report["target_and_pocket_analysis"]["target"]["pocket_summary"]
+        assert report["target_and_pocket_analysis"]["binding_sites"]
+        assert report["target_and_pocket_analysis"]["seed_ligands"]
+        assert report["sar_overview"]["target_sar_rules"]
+        assert report["admet_overview"]["target_admet_risks"]
+        assert report["synthesis_overview"]["result_count"] >= 2
+        assert report["synthesis_overview"]["routes"]
+        assert report["top_candidates"][0]["rule_filter"]
+        assert report["top_candidates"][0]["admet"]
+        assert report["top_candidates"][0]["synthesis"]
         assert report["top_candidates"][0]["refutation_chain"]
         assert Path(report["report_file"]).exists()
+
+        download = client.get(f"/projects/{project_id}/report/download")
+        assert download.status_code == 200
+        assert download.headers["content-type"].startswith("application/json")
+        assert "attachment" in download.headers["content-disposition"]
+        assert download.json()["project_summary"]["project_id"] == project_id
 
 
 def test_advisor_apply_requires_existing_advice(tmp_path):

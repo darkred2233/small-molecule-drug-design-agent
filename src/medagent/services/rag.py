@@ -13,6 +13,7 @@ from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from medagent.core.config import Settings
+from medagent.data.target_metadata import get_target_metadata
 from medagent.db.models import AgentRun, EvidenceLink, Project, RagChunk, RagDocument, Target, UploadedFile
 from medagent.rag.chunking import chunk_text
 from medagent.rag.embedding import build_embedding_client, embedding_ref
@@ -215,9 +216,36 @@ def index_builtin_target(
         f"Representative PDB structures: {', '.join(target.pdb_ids or [])}",
         "",
         target.summary or "",
-        "",
-        "Representative drugs and mechanisms:",
     ]
+    metadata = get_target_metadata(target.target_id)
+    if target.pocket_summary or metadata.get("pocket_summary"):
+        lines.extend(["", f"Pocket summary: {target.pocket_summary or metadata.get('pocket_summary')}"])
+    for site in metadata.get("binding_sites", []):
+        grid_box = site.get("grid_box") or {}
+        lines.extend(
+            [
+                "",
+                f"Binding site: {site.get('site_name') or site.get('binding_site_id')}",
+                f"PDB: {site.get('pdb_id')} reference ligand: {site.get('reference_ligand')}",
+                f"Grid center: {grid_box.get('center')} size: {grid_box.get('size')} {grid_box.get('unit') or ''}".strip(),
+                f"Key residues: {', '.join(site.get('key_residues') or [])}",
+            ]
+        )
+    if metadata.get("sar_rules"):
+        lines.extend(["", "Target SAR rules:"])
+        for rule in metadata["sar_rules"]:
+            lines.append(
+                f"- {rule.get('title')}: {rule.get('rationale')} "
+                f"Preferred: {rule.get('preferred_change')} Avoid: {rule.get('avoid')}"
+            )
+    if metadata.get("admet_risks"):
+        lines.extend(["", "Target ADMET risks:"])
+        for risk in metadata["admet_risks"]:
+            lines.append(
+                f"- {risk.get('category')}: {risk.get('signal')} "
+                f"Mitigation: {risk.get('mitigation')} Severity: {risk.get('severity')}"
+            )
+    lines.extend(["", "Representative drugs and mechanisms:"])
     for drug in target.drugs:
         refs = drug.external_refs or {}
         lines.extend(

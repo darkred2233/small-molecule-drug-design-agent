@@ -25,12 +25,19 @@ from medagent.services.admet_adapter import (
     chemprop_tool_status,
     run_chemprop_admet,
 )
-from medagent.services.aizynthfinder_adapter import aizynthfinder_tool_status
+from medagent.services.aizynthfinder_adapter import (
+    AiZynthFinderRequest,
+    AiZynthFinderResult,
+    aizynthfinder_tool_status,
+    run_aizynthfinder_retrosynthesis,
+)
 from medagent.services.candidate_ranking import generate_project_rankings
 from medagent.services.docking_adapters import (
     DockingToolRequest,
     DockingToolResult,
     check_diffdock_available,
+    check_gnina_available,
+    check_vina_available,
     run_external_docking,
     select_docking_tool,
 )
@@ -51,7 +58,83 @@ ASSESSMENT_ELIGIBLE_STATUSES = {
     "passed_filter",
     "candidate_assessed",
 }
+ASSESSMENT_STATUS_LABELS = {
+    "assessment_passed",
+    "assessment_failed",
+    "assessment_bad_pose",
+    "assessment_conformer_failed",
+    "assessment_admet_blocker",
+    "assessment_route_not_found",
+}
+ASSESSMENT_MODES = {"fast", "external", "full"}
 ASSESSMENT_RUNTIME_ROOT = Path(".local") / "candidate_assessment"
+COARSE_SCREEN_LABELS = {
+    "coarse_screen_passed",
+    "coarse_screen_failed",
+    "coarse_only_candidate",
+    "externally_refined_candidate",
+    "external_refinement_attempted",
+    "rejected_by_coarse_screen",
+}
+DOCKING_RESULT_LABELS = {
+    "external_docking_adapter_pending",
+    "external_docking_adapter_used",
+    "external_docking_adapter_failed",
+    "external_docking_setup_incomplete",
+    "external_docking_receptor_missing",
+    "external_docking_grid_missing",
+    "external_docking_tools_unavailable",
+    "rdkit_surrogate_docking",
+    "gnina_adapter",
+    "vina_adapter",
+    "diffdock_adapter",
+    "gnina_external_docking",
+    "gnina_docker_docking",
+    "vina_external_docking",
+    "vina_docker_docking",
+    "diffdock_external_docking",
+    "diffdock_docker_docking",
+    "docking_strong",
+    "docking_weak",
+    "pose_confident",
+    "pose_uncertain",
+    "key_interaction_present",
+    "key_interaction_estimated",
+    "key_interaction_missing",
+    "good_ligand_efficiency",
+    "steric_clash",
+    "bad_pose",
+}
+ADMET_RESULT_LABELS = {
+    "external_admet_adapter_pending",
+    "rdkit_surrogate_admet",
+    "chemprop_predicted",
+    "chemprop_admet",
+    "admet_ai_predicted",
+    "low_risk",
+    "medium_risk",
+    "high_risk",
+    "admet_clean",
+    "admet_warning",
+    "admet_blocker",
+}
+SYNTHESIS_RESULT_LABELS = {
+    "external_retrosynthesis_adapter_pending",
+    "external_retrosynthesis_adapter_used",
+    "rdkit_surrogate_synthesis",
+    "aizynthfinder_adapter",
+    "askcos_adapter",
+    "aizynthfinder_executed",
+    "aizynthfinder_route",
+    "easy_to_synthesize",
+    "moderate_synthesis",
+    "hard_to_synthesize",
+    "route_found",
+    "route_not_found",
+    "buyable_blocks_available",
+    "too_many_steps",
+    "hazardous_route",
+}
 
 
 @dataclass
@@ -105,6 +188,9 @@ def run_project_candidate_assessment(
     project: Project,
     molecule_ids: list[str] | None = None,
     max_molecules: int = 50,
+    top_n: int | None = None,
+    assessment_mode: str = "external",
+    external_top_n: int = 10,
     binding_site_id: str | None = None,
     protein_file: str | None = None,
     prepared_ligand_files: dict[str, str] | None = None,
@@ -115,14 +201,17 @@ def run_project_candidate_assessment(
     max_synthesis_steps: int = 5,
     prefer_buyable_building_blocks: bool = True,
 ) -> dict[str, Any]:
+    assessment_mode = _normalize_assessment_mode(assessment_mode)
     molecules = _select_assessment_molecules(db, project, molecule_ids, max_molecules)
     tool_status = candidate_assessment_tool_status()
+    ranking_top_n = top_n or max_molecules
     conformer = generate_project_conformers(db, project, molecules, tool_status)
     docking = run_project_docking(
         db,
         project,
         molecules,
         tool_status,
+        allow_external_tools=False,
         binding_site_id=binding_site_id,
         protein_file=protein_file,
         prepared_ligand_files=prepared_ligand_files,
@@ -135,6 +224,7 @@ def run_project_candidate_assessment(
         project,
         molecules,
         tool_status,
+        allow_external_tools=False,
         admet_properties=admet_properties or [],
     )
     synthesis = run_project_synthesis(
@@ -142,26 +232,80 @@ def run_project_candidate_assessment(
         project,
         molecules,
         tool_status,
+        allow_external_tools=False,
         max_synthesis_steps=max_synthesis_steps,
         prefer_buyable_building_blocks=prefer_buyable_building_blocks,
     )
+    coarse_screen = _apply_coarse_screen_labels(db, molecules)
     ranking = generate_project_rankings(
         db,
         project,
         molecules=molecules,
         max_molecules=max_molecules,
-        top_n=max_molecules,
+        top_n=ranking_top_n,
         tool_status=tool_status,
     )
+    if assessment_mode in {"external", "full"}:
+        coarse_passed_ids = set(coarse_screen["passed_molecule_ids"])
+        coarse_passed_molecules = [
+            molecule
+            for molecule in molecules
+            if molecule.molecule_id in coarse_passed_ids
+        ]
+        refinement_molecules = _top_ranked_molecules_for_external_refinement(
+            coarse_passed_molecules,
+            ranking,
+            external_top_n=external_top_n if assessment_mode == "external" else len(coarse_passed_molecules),
+        )
+        _mark_coarse_screen_summary(docking, coarse_screen, assessment_mode, len(refinement_molecules))
+        _mark_coarse_screen_summary(synthesis, coarse_screen, assessment_mode, len(refinement_molecules))
+        if refinement_molecules:
+            docking_refinement = run_project_docking(
+                db,
+                project,
+                refinement_molecules,
+                tool_status,
+                allow_external_tools=True,
+                binding_site_id=binding_site_id,
+                protein_file=protein_file,
+                prepared_ligand_files=prepared_ligand_files,
+                grid_center=grid_center,
+                grid_size=grid_size,
+                key_residues=key_residues or [],
+            )
+            synthesis_refinement = run_project_synthesis(
+                db,
+                project,
+                refinement_molecules,
+                tool_status,
+                allow_external_tools=True,
+                max_synthesis_steps=max_synthesis_steps,
+                prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+            )
+            _apply_external_refinement_labels(db, coarse_passed_molecules, refinement_molecules)
+            refinement_scope = "top_n" if assessment_mode == "external" else "full"
+            _mark_external_refinement_summary(docking, docking_refinement, refinement_scope=refinement_scope)
+            _mark_external_refinement_summary(synthesis, synthesis_refinement, refinement_scope=refinement_scope)
+            ranking = generate_project_rankings(
+                db,
+                project,
+                molecules=molecules,
+                max_molecules=max_molecules,
+                top_n=ranking_top_n,
+                tool_status=tool_status,
+            )
     project.status = "candidate_assessed"
     db.commit()
     return {
         "project_id": project.project_id,
+        "assessment_mode": assessment_mode,
+        "external_top_n": external_top_n,
         "conformer": conformer.as_dict(),
         "docking": docking.as_dict(),
         "admet": admet.as_dict(),
         "synthesis": synthesis.as_dict(),
         "ranking": ranking.as_dict(),
+        "coarse_screen": coarse_screen,
         "tool_status": tool_status,
     }
 
@@ -186,8 +330,25 @@ def generate_project_conformers(
         adapter_mode="rdkit_etkdg_conformer",
         requested_count=len(molecules),
     )
+    _update_agent_run_progress(
+        db,
+        agent_run,
+        summary,
+        phase="running",
+        message="正在用 RDKit 生成候选分子构象。",
+        completed_count=0,
+    )
 
-    for molecule in molecules:
+    for index, molecule in enumerate(molecules, start=1):
+        _update_agent_run_progress(
+            db,
+            agent_run,
+            summary,
+            phase="running",
+            message=f"正在生成构象 {index}/{len(molecules)}。",
+            completed_count=index - 1,
+            current_molecule_id=molecule.molecule_id,
+        )
         result = _calculate_conformer_result(molecule.smiles)
         conformer = _upsert_conformer_result(db, molecule, result)
         molecule.labels = merge_labels(molecule.labels, conformer.labels)
@@ -198,6 +359,15 @@ def generate_project_conformers(
         else:
             summary.failed_count += 1
             summary.failed_molecule_ids.append(molecule.molecule_id)
+        _update_agent_run_progress(
+            db,
+            agent_run,
+            summary,
+            phase="running",
+            message=f"已完成构象 {index}/{len(molecules)}。",
+            completed_count=index,
+            current_molecule_id=molecule.molecule_id,
+        )
 
     _finish_agent_run(agent_run, summary, tool_status)
     db.commit()
@@ -209,6 +379,7 @@ def run_project_docking(
     project: Project,
     molecules: list[Molecule],
     tool_status: dict[str, Any] | None = None,
+    allow_external_tools: bool = True,
     binding_site_id: str | None = None,
     protein_file: str | None = None,
     prepared_ligand_files: dict[str, str] | None = None,
@@ -220,6 +391,7 @@ def run_project_docking(
     key_residues = key_residues or []
     site_config = _binding_site_docking_config(db, project, binding_site_id)
     if site_config:
+        binding_site_id = binding_site_id or site_config.get("binding_site_id")
         protein_file = protein_file or site_config.get("protein_file")
         grid_center = grid_center or site_config.get("grid_center")
         grid_size = grid_size or site_config.get("grid_size")
@@ -253,30 +425,77 @@ def run_project_docking(
             grid_size=grid_size,
         ),
     )
+    if not allow_external_tools:
+        summary.warnings = ["external_docking_skipped_by_assessment_mode"]
     external_adapter_modes: set[str] = set()
+    _update_agent_run_progress(
+        db,
+        agent_run,
+        summary,
+        phase="running",
+        message=(
+            "正在运行外部对接细筛。"
+            if allow_external_tools
+            else "正在运行 RDKit 替代对接粗筛。"
+        ),
+        completed_count=0,
+        extra={"external_tools_enabled": allow_external_tools},
+    )
 
-    for molecule in molecules:
+    for index, molecule in enumerate(molecules, start=1):
+        _update_agent_run_progress(
+            db,
+            agent_run,
+            summary,
+            phase="running",
+            message=f"正在处理对接 {index}/{len(molecules)}。",
+            completed_count=index - 1,
+            current_molecule_id=molecule.molecule_id,
+            extra={"external_tools_enabled": allow_external_tools},
+        )
         conformer = db.query(ConformerResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
         if conformer is None or not conformer.conformer_generated:
             summary.skipped_count += 1
             summary.skipped_molecule_ids.append(molecule.molecule_id)
+            _update_agent_run_progress(
+                db,
+                agent_run,
+                summary,
+                phase="running",
+                message=f"已跳过对接 {index}/{len(molecules)}：缺少可用构象。",
+                completed_count=index,
+                current_molecule_id=molecule.molecule_id,
+                extra={"external_tools_enabled": allow_external_tools},
+            )
             continue
 
         descriptors = _descriptor_snapshot(molecule.smiles, db, molecule)
         if descriptors is None:
             summary.failed_count += 1
             summary.failed_molecule_ids.append(molecule.molecule_id)
+            _update_agent_run_progress(
+                db,
+                agent_run,
+                summary,
+                phase="running",
+                message=f"对接 {index}/{len(molecules)} 失败：缺少描述符。",
+                completed_count=index,
+                current_molecule_id=molecule.molecule_id,
+                extra={"external_tools_enabled": allow_external_tools},
+            )
             continue
 
-        external_result = _attempt_external_docking(
-            project,
-            molecule,
-            tool_status,
-            protein_file=protein_file,
-            prepared_ligand_files=prepared_ligand_files or {},
-            grid_center=grid_center,
-            grid_size=grid_size,
-        )
+        external_result = None
+        if allow_external_tools:
+            external_result = _attempt_external_docking(
+                project,
+                molecule,
+                tool_status,
+                protein_file=protein_file,
+                prepared_ligand_files=prepared_ligand_files or {},
+                grid_center=grid_center,
+                grid_size=grid_size,
+            )
         if external_result is not None and external_result.success:
             docking = _upsert_external_docking_result(
                 db,
@@ -296,11 +515,22 @@ def run_project_docking(
                 conformer,
                 descriptors,
                 key_residues=key_residues,
+                fallback_warnings=summary.warnings if allow_external_tools else [],
             )
-        molecule.labels = merge_labels(molecule.labels, docking.labels)
+        molecule.labels = _replace_result_labels(molecule.labels, DOCKING_RESULT_LABELS, docking.labels)
         summary.evaluated_count += 1
         summary.generated_count += 1
         summary.molecule_ids.append(molecule.molecule_id)
+        _update_agent_run_progress(
+            db,
+            agent_run,
+            summary,
+            phase="running",
+            message=f"已完成对接 {index}/{len(molecules)}。",
+            completed_count=index,
+            current_molecule_id=molecule.molecule_id,
+            extra={"external_tools_enabled": allow_external_tools},
+        )
 
     if len(external_adapter_modes) == 1:
         summary.adapter_mode = next(iter(external_adapter_modes))
@@ -317,12 +547,13 @@ def run_project_admet(
     project: Project,
     molecules: list[Molecule],
     tool_status: dict[str, Any] | None = None,
+    allow_external_tools: bool = True,
     admet_properties: list[str] | None = None,
 ) -> StageSummary:
     tool_status = tool_status or candidate_assessment_tool_status()
 
     # Try Chemprop first if available
-    chemprop_available = tool_status.get("chemprop", {}).get("available", False)
+    chemprop_available = allow_external_tools and tool_status.get("chemprop", {}).get("available", False)
     adapter_mode = "chemprop_admet" if chemprop_available else "rdkit_surrogate_admet"
 
     agent_run = _create_agent_run(
@@ -342,6 +573,19 @@ def run_project_admet(
         requested_count=len(molecules),
         warnings=[],
     )
+    _update_agent_run_progress(
+        db,
+        agent_run,
+        summary,
+        phase="running",
+        message=(
+            "正在运行 Chemprop/ADMET 外部预测。"
+            if chemprop_available
+            else "正在运行 RDKit 替代 ADMET 粗筛。"
+        ),
+        completed_count=0,
+        extra={"external_tools_enabled": chemprop_available},
+    )
 
     if chemprop_available:
         # Use Chemprop for real ADMET predictions
@@ -353,7 +597,7 @@ def run_project_admet(
         summary.warnings.extend(chemprop_result.warnings)
 
         # Process Chemprop results
-        for single_result in chemprop_result.results:
+        for index, single_result in enumerate(chemprop_result.results, start=1):
             molecule = next(
                 (m for m in molecules if m.molecule_id == single_result.molecule_id), None
             )
@@ -366,12 +610,22 @@ def run_project_admet(
                 single_result,
                 adapter_mode=chemprop_result.adapter_mode,
             )
-            molecule.labels = merge_labels(molecule.labels, admet.labels)
+            molecule.labels = _replace_result_labels(molecule.labels, ADMET_RESULT_LABELS, admet.labels)
+            _update_agent_run_progress(
+                db,
+                agent_run,
+                summary,
+                phase="running",
+                message=f"已完成 ADMET 预测 {index}/{len(molecules)}。",
+                completed_count=min(index, len(molecules)),
+                current_molecule_id=molecule.molecule_id,
+                extra={"external_tools_enabled": chemprop_available},
+            )
 
         # Fallback to RDKit surrogate for molecules without Chemprop results
         chemprop_ids = {r.molecule_id for r in chemprop_result.results}
         fallback_count = 0
-        for molecule in molecules:
+        for index, molecule in enumerate(molecules, start=1):
             if molecule.molecule_id not in chemprop_ids:
                 descriptors = _descriptor_snapshot(molecule.smiles, db, molecule)
                 if descriptors is None:
@@ -379,11 +633,21 @@ def run_project_admet(
                     summary.failed_molecule_ids.append(molecule.molecule_id)
                     continue
                 admet = _upsert_admet_result(db, molecule, descriptors, tool_status)
-                molecule.labels = merge_labels(molecule.labels, admet.labels)
+                molecule.labels = _replace_result_labels(molecule.labels, ADMET_RESULT_LABELS, admet.labels)
                 summary.evaluated_count += 1
                 summary.generated_count += 1
                 summary.molecule_ids.append(molecule.molecule_id)
                 fallback_count += 1
+            _update_agent_run_progress(
+                db,
+                agent_run,
+                summary,
+                phase="running",
+                message=f"已完成 ADMET 预测 {index}/{len(molecules)}。",
+                completed_count=index,
+                current_molecule_id=molecule.molecule_id,
+                extra={"external_tools_enabled": chemprop_available},
+            )
 
         if fallback_count:
             if chemprop_ids:
@@ -394,19 +658,52 @@ def run_project_admet(
                 summary.warnings.append("chemprop_model_unavailable_using_rdkit_surrogate")
     else:
         # RDKit surrogate fallback
-        summary.warnings.append("external_admet_tools_not_installed")
-        for molecule in molecules:
+        if allow_external_tools:
+            summary.warnings.append("external_admet_tools_not_installed")
+        else:
+            summary.warnings.append("external_admet_skipped_by_assessment_mode")
+        for index, molecule in enumerate(molecules, start=1):
+            _update_agent_run_progress(
+                db,
+                agent_run,
+                summary,
+                phase="running",
+                message=f"正在处理 ADMET {index}/{len(molecules)}。",
+                completed_count=index - 1,
+                current_molecule_id=molecule.molecule_id,
+                extra={"external_tools_enabled": False},
+            )
             descriptors = _descriptor_snapshot(molecule.smiles, db, molecule)
             if descriptors is None:
                 summary.failed_count += 1
                 summary.failed_molecule_ids.append(molecule.molecule_id)
+                _update_agent_run_progress(
+                    db,
+                    agent_run,
+                    summary,
+                    phase="running",
+                    message=f"ADMET {index}/{len(molecules)} 失败：缺少描述符。",
+                    completed_count=index,
+                    current_molecule_id=molecule.molecule_id,
+                    extra={"external_tools_enabled": False},
+                )
                 continue
 
             admet = _upsert_admet_result(db, molecule, descriptors, tool_status)
-            molecule.labels = merge_labels(molecule.labels, admet.labels)
+            molecule.labels = _replace_result_labels(molecule.labels, ADMET_RESULT_LABELS, admet.labels)
             summary.evaluated_count += 1
             summary.generated_count += 1
             summary.molecule_ids.append(molecule.molecule_id)
+            _update_agent_run_progress(
+                db,
+                agent_run,
+                summary,
+                phase="running",
+                message=f"已完成 ADMET {index}/{len(molecules)}。",
+                completed_count=index,
+                current_molecule_id=molecule.molecule_id,
+                extra={"external_tools_enabled": False},
+            )
 
     _finish_agent_run(agent_run, summary, tool_status)
     db.commit()
@@ -477,6 +774,7 @@ def run_project_synthesis(
     project: Project,
     molecules: list[Molecule],
     tool_status: dict[str, Any] | None = None,
+    allow_external_tools: bool = True,
     max_synthesis_steps: int = 5,
     prefer_buyable_building_blocks: bool = True,
 ) -> StageSummary:
@@ -498,31 +796,113 @@ def run_project_synthesis(
         adapter_mode="rdkit_surrogate_synthesis",
         requested_count=len(molecules),
         warnings=["external_retrosynthesis_tools_not_installed"]
-        if not _external_synthesis_available(tool_status)
+        if allow_external_tools and not _external_synthesis_available(tool_status)
         else [],
     )
+    if not allow_external_tools:
+        summary.warnings = ["external_retrosynthesis_skipped_by_assessment_mode"]
+    external_adapter_modes: set[str] = set()
+    fallback_count = 0
+    _update_agent_run_progress(
+        db,
+        agent_run,
+        summary,
+        phase="running",
+        message=(
+            "正在运行 AiZynthFinder 外部逆合成细筛。"
+            if allow_external_tools
+            else "正在运行 RDKit 替代合成可行性粗筛。"
+        ),
+        completed_count=0,
+        extra={"external_tools_enabled": allow_external_tools},
+    )
 
-    for molecule in molecules:
+    for index, molecule in enumerate(molecules, start=1):
+        _update_agent_run_progress(
+            db,
+            agent_run,
+            summary,
+            phase="running",
+            message=f"正在处理合成可行性 {index}/{len(molecules)}。",
+            completed_count=index - 1,
+            current_molecule_id=molecule.molecule_id,
+            extra={"external_tools_enabled": allow_external_tools},
+        )
         descriptors = _descriptor_snapshot(molecule.smiles, db, molecule)
         if descriptors is None:
             summary.failed_count += 1
             summary.failed_molecule_ids.append(molecule.molecule_id)
+            _update_agent_run_progress(
+                db,
+                agent_run,
+                summary,
+                phase="running",
+                message=f"合成可行性 {index}/{len(molecules)} 失败：缺少描述符。",
+                completed_count=index,
+                current_molecule_id=molecule.molecule_id,
+                extra={"external_tools_enabled": allow_external_tools},
+            )
             continue
 
-        route = _upsert_synthesis_route(
-            db,
-            molecule,
-            descriptors,
-            tool_status,
-            max_synthesis_steps=max_synthesis_steps,
-            prefer_buyable_building_blocks=prefer_buyable_building_blocks,
-        )
-        molecule.labels = merge_labels(molecule.labels, route.labels)
-        molecule.status = "candidate_assessed"
+        external_result = None
+        if allow_external_tools:
+            external_result = _attempt_external_retrosynthesis(
+                project,
+                molecule,
+                tool_status,
+                max_synthesis_steps=max_synthesis_steps,
+            )
+        if external_result is not None and external_result.success:
+            route = _upsert_external_synthesis_route(
+                db,
+                molecule,
+                descriptors,
+                tool_status,
+                external_result=external_result,
+                max_synthesis_steps=max_synthesis_steps,
+                prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+            )
+            external_adapter_modes.add(external_result.adapter_mode)
+            if external_result.warnings:
+                summary.warnings = _dedupe(summary.warnings + external_result.warnings)
+        else:
+            if external_result is not None and external_result.warnings:
+                summary.warnings = _dedupe(summary.warnings + external_result.warnings)
+            route = _upsert_synthesis_route(
+                db,
+                molecule,
+                descriptors,
+                tool_status,
+                max_synthesis_steps=max_synthesis_steps,
+                prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+            )
+            fallback_count += 1
+        molecule.labels = _replace_result_labels(molecule.labels, SYNTHESIS_RESULT_LABELS, route.labels)
+        failure_reasons = _assessment_failure_reasons(db, molecule, synthesis_route=route)
+        _apply_assessment_status(molecule, failure_reasons)
         _update_sa_score(db, molecule, route.route_json.get("SA_score"))
         summary.evaluated_count += 1
-        summary.generated_count += 1
-        summary.molecule_ids.append(molecule.molecule_id)
+        if failure_reasons:
+            summary.failed_count += 1
+            summary.failed_molecule_ids.append(molecule.molecule_id)
+        else:
+            summary.generated_count += 1
+            summary.molecule_ids.append(molecule.molecule_id)
+        _update_agent_run_progress(
+            db,
+            agent_run,
+            summary,
+            phase="running",
+            message=f"已完成合成可行性 {index}/{len(molecules)}。",
+            completed_count=index,
+            current_molecule_id=molecule.molecule_id,
+            extra={"external_tools_enabled": allow_external_tools},
+        )
+
+    if len(external_adapter_modes) == 1 and fallback_count == 0:
+        summary.adapter_mode = next(iter(external_adapter_modes))
+    elif external_adapter_modes:
+        summary.adapter_mode = "aizynthfinder_with_rdkit_surrogate_fallback"
 
     _finish_agent_run(agent_run, summary, tool_status)
     db.commit()
@@ -572,8 +952,8 @@ def list_project_synthesis_routes(db: Session, project: Project) -> list[Synthes
 def candidate_assessment_tool_status() -> dict[str, Any]:
     return {
         "rdkit": _package_status("rdkit"),
-        "gnina": _executable_status("gnina"),
-        "vina": _executable_status("vina"),
+        "gnina": check_gnina_available(),
+        "vina": check_vina_available(),
         "diffdock": check_diffdock_available(),
         "oddt": _package_status("oddt"),
         "admetlab": _package_status("admetlab"),
@@ -596,6 +976,200 @@ def _select_assessment_molecules(
     else:
         query = query.filter(Molecule.status.in_(ASSESSMENT_ELIGIBLE_STATUSES))
     return query.order_by(Molecule.id.asc()).limit(max_molecules).all()
+
+
+def _normalize_assessment_mode(mode: str) -> str:
+    normalized = (mode or "external").strip().lower()
+    if normalized not in ASSESSMENT_MODES:
+        raise ValueError(f"Unsupported candidate assessment mode: {mode}")
+    return normalized
+
+
+def _top_ranked_molecules_for_external_refinement(
+    molecules: list[Molecule],
+    ranking: Any,
+    external_top_n: int,
+) -> list[Molecule]:
+    molecule_by_id = {molecule.molecule_id: molecule for molecule in molecules}
+    limit = max(0, external_top_n)
+    selected_ids = [
+        molecule_id
+        for molecule_id in ranking.molecule_ids
+        if molecule_id in molecule_by_id
+    ][:limit]
+    if len(selected_ids) < limit:
+        selected_set = set(selected_ids)
+        for molecule in molecules:
+            if molecule.molecule_id in selected_set:
+                continue
+            selected_ids.append(molecule.molecule_id)
+            selected_set.add(molecule.molecule_id)
+            if len(selected_ids) >= limit:
+                break
+    return [molecule_by_id[molecule_id] for molecule_id in selected_ids if molecule_id in molecule_by_id]
+
+
+def _apply_coarse_screen_labels(db: Session, molecules: list[Molecule]) -> dict[str, Any]:
+    passed_ids: list[str] = []
+    failed_ids: list[str] = []
+    failure_reasons_by_id: dict[str, list[str]] = {}
+
+    for molecule in molecules:
+        failure_reasons = _assessment_failure_reasons(db, molecule)
+        failure_reasons_by_id[molecule.molecule_id] = failure_reasons
+        molecule.labels = [label for label in (molecule.labels or []) if label not in COARSE_SCREEN_LABELS]
+        if failure_reasons:
+            failed_ids.append(molecule.molecule_id)
+            molecule.labels = merge_labels(
+                molecule.labels,
+                ["coarse_screen_failed", "rejected_by_coarse_screen"],
+            )
+        else:
+            passed_ids.append(molecule.molecule_id)
+            molecule.labels = merge_labels(
+                molecule.labels,
+                ["coarse_screen_passed", "coarse_only_candidate"],
+            )
+
+    db.commit()
+    return {
+        "requested_count": len(molecules),
+        "passed_count": len(passed_ids),
+        "failed_count": len(failed_ids),
+        "passed_molecule_ids": passed_ids,
+        "failed_molecule_ids": failed_ids,
+        "failure_reasons_by_id": failure_reasons_by_id,
+    }
+
+
+def _mark_coarse_screen_summary(
+    summary: StageSummary,
+    coarse_screen: dict[str, Any],
+    assessment_mode: str,
+    refinement_count: int,
+) -> None:
+    failed_count = int(coarse_screen.get("failed_count") or 0)
+    passed_count = int(coarse_screen.get("passed_count") or 0)
+    summary.warnings = _dedupe(
+        summary.warnings
+        + [
+            f"assessment_mode={assessment_mode}",
+            f"coarse_screen_passed={passed_count}",
+            f"coarse_screen_failed_skip_external={failed_count}",
+            f"external_refinement_selected={refinement_count}",
+        ]
+    )
+
+
+def _apply_external_refinement_labels(
+    db: Session,
+    coarse_passed_molecules: list[Molecule],
+    refinement_molecules: list[Molecule],
+) -> None:
+    refinement_ids = {molecule.molecule_id for molecule in refinement_molecules}
+    for molecule in coarse_passed_molecules:
+        labels = [label for label in (molecule.labels or []) if label not in {"coarse_only_candidate", "externally_refined_candidate", "external_refinement_attempted"}]
+        if molecule.molecule_id not in refinement_ids:
+            molecule.labels = merge_labels(labels, ["coarse_only_candidate"])
+            continue
+        evidence_labels = _external_evidence_labels(db, molecule)
+        if evidence_labels:
+            molecule.labels = merge_labels(labels, ["external_refinement_attempted", "externally_refined_candidate"])
+        else:
+            molecule.labels = merge_labels(labels, ["external_refinement_attempted", "coarse_only_candidate"])
+    db.commit()
+
+
+def _external_evidence_labels(db: Session, molecule: Molecule) -> list[str]:
+    labels: list[str] = []
+    docking = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    if docking is not None:
+        docking_labels = docking.labels or []
+        if "external_docking_adapter_used" in docking_labels:
+            labels.append("external_docking_adapter_used")
+    synthesis = db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    if synthesis is not None:
+        synthesis_labels = synthesis.labels or []
+        if "external_retrosynthesis_adapter_used" in synthesis_labels:
+            labels.append("external_retrosynthesis_adapter_used")
+    return labels
+
+
+def _mark_external_refinement_summary(
+    base: StageSummary,
+    refinement: StageSummary,
+    refinement_scope: str = "top_n",
+) -> None:
+    refined_count = refinement.evaluated_count
+    if refined_count == 0:
+        base.warnings = _dedupe(base.warnings + refinement.warnings + ["external_refinement_no_candidates"])
+        return
+
+    if refinement.adapter_mode.startswith("rdkit_surrogate"):
+        base.warnings = _dedupe(
+            base.warnings
+            + refinement.warnings
+            + [
+                f"external_refinement_{refinement_scope}={refined_count}",
+                "external_refinement_no_external_results",
+            ]
+        )
+        return
+
+    base.adapter_mode = (
+        refinement.adapter_mode
+        if refinement_scope == "full"
+        else f"{refinement.adapter_mode}_{refinement_scope}_refinement"
+    )
+    base.warnings = _dedupe(
+        base.warnings
+        + refinement.warnings
+        + [
+            f"external_refinement_{refinement_scope}={refined_count}",
+            f"external_refinement_adapter_mode={refinement.adapter_mode}",
+        ]
+    )
+
+
+def _assessment_failure_reasons(
+    db: Session,
+    molecule: Molecule,
+    synthesis_route: SynthesisRoute | None = None,
+) -> list[str]:
+    reasons: list[str] = []
+    conformer = db.query(ConformerResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    if conformer is None or not conformer.conformer_generated:
+        reasons.append("assessment_conformer_failed")
+
+    docking = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    if docking is not None:
+        docking_labels = docking.labels or []
+        if "bad_pose" in docking_labels or (docking.clash_count or 0) >= 2:
+            reasons.append("assessment_bad_pose")
+        elif docking.cnn_score is not None and float(docking.cnn_score) < 0.35:
+            reasons.append("assessment_bad_pose")
+
+    admet = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    if admet is not None:
+        admet_labels = admet.labels or []
+        if "admet_blocker" in admet_labels or admet.hERG_risk == "high_risk" or admet.Ames_risk == "high_risk":
+            reasons.append("assessment_admet_blocker")
+
+    synthesis = synthesis_route or db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    if synthesis is not None and not synthesis.route_found:
+        reasons.append("assessment_route_not_found")
+
+    return _dedupe(reasons)
+
+
+def _apply_assessment_status(molecule: Molecule, failure_reasons: list[str]) -> None:
+    molecule.labels = [label for label in (molecule.labels or []) if label not in ASSESSMENT_STATUS_LABELS]
+    if failure_reasons:
+        molecule.status = "failed_assessment"
+        molecule.labels = merge_labels(molecule.labels, ["assessment_failed", *failure_reasons])
+    else:
+        molecule.status = "candidate_assessed"
+        molecule.labels = merge_labels(molecule.labels, ["assessment_passed"])
 
 
 def _calculate_conformer_result(smiles: str) -> dict[str, Any]:
@@ -731,6 +1305,7 @@ def _upsert_docking_result(
     conformer: ConformerResult,
     descriptors: DescriptorSnapshot,
     key_residues: list[str],
+    fallback_warnings: list[str] | None = None,
 ) -> DockingResult:
     key_hbond_count = min(
         len(key_residues) or 2,
@@ -759,6 +1334,7 @@ def _upsert_docking_result(
     ligand_efficiency = vina_score / max(descriptors.heavy_atom_count, 1)
 
     labels = ["external_docking_adapter_pending", "rdkit_surrogate_docking"]
+    labels.extend(_external_docking_fallback_labels(fallback_warnings or []))
     labels.append("docking_strong" if vina_score <= -8.0 else "docking_weak")
     labels.append("pose_confident" if cnn_score >= 0.6 else "pose_uncertain")
     labels.append("key_interaction_present" if key_hbond_count else "key_interaction_missing")
@@ -782,6 +1358,23 @@ def _upsert_docking_result(
     result.pose_file = f"db://conformer_results/{molecule.molecule_id}"
     result.labels = labels
     return result
+
+
+def _external_docking_fallback_labels(warnings: list[str]) -> list[str]:
+    labels: list[str] = []
+    warning_set = set(warnings or [])
+    if "external_docking_tools_not_installed" in warning_set:
+        labels.append("external_docking_tools_unavailable")
+    if {
+        "protein_file_required_for_external_docking",
+        "protein_file_not_found",
+    } & warning_set:
+        labels.extend(["external_docking_setup_incomplete", "external_docking_receptor_missing"])
+    if "grid_center_and_grid_size_required_for_external_docking" in warning_set:
+        labels.extend(["external_docking_setup_incomplete", "external_docking_grid_missing"])
+    if "external_docking_adapter_unavailable_for_inputs" in warning_set:
+        labels.append("external_docking_tools_unavailable")
+    return _dedupe(labels)
 
 
 def _upsert_external_docking_result(
@@ -910,6 +1503,111 @@ def _upsert_admet_result(
     return result
 
 
+def _attempt_external_retrosynthesis(
+    project: Project,
+    molecule: Molecule,
+    tool_status: dict[str, Any],
+    max_synthesis_steps: int,
+) -> AiZynthFinderResult | None:
+    aizynthfinder_status = tool_status.get("aizynthfinder", {})
+    if not aizynthfinder_status.get("available"):
+        return None
+
+    output_dir = (
+        ASSESSMENT_RUNTIME_ROOT
+        / _safe_path_part(project.project_id)
+        / "retrosynthesis"
+        / _safe_path_part(molecule.molecule_id)
+    )
+    return run_aizynthfinder_retrosynthesis(
+        AiZynthFinderRequest(
+            smiles=molecule.smiles,
+            output_dir=str(output_dir),
+            max_steps=max_synthesis_steps,
+            docker_image=aizynthfinder_status.get("docker_image") or "aizynthfinder:latest",
+        ),
+        aizynthfinder_status,
+    )
+
+
+def _upsert_external_synthesis_route(
+    db: Session,
+    molecule: Molecule,
+    descriptors: DescriptorSnapshot,
+    tool_status: dict[str, Any],
+    external_result: AiZynthFinderResult,
+    max_synthesis_steps: int,
+    prefer_buyable_building_blocks: bool,
+) -> SynthesisRoute:
+    sa_score = _sa_score(descriptors)
+    sc_score = round(_clamp(sa_score + descriptors.ring_count * 0.2, 1.0, 10.0), 3)
+    estimated_steps = max(1, min(12, int(math.ceil(sa_score))))
+    route_steps = external_result.num_steps or estimated_steps
+    route_found = bool(external_result.route_found)
+    buyable_blocks = max(
+        1,
+        min(6, descriptors.ring_count + descriptors.hba // 2 + int(prefer_buyable_building_blocks)),
+    )
+    route_confidence = _external_route_confidence(external_result, route_found)
+
+    labels = _synthesis_difficulty_labels(sa_score)
+    labels.append("route_found" if route_found else "route_not_found")
+    if buyable_blocks:
+        labels.append("buyable_blocks_available")
+    if route_steps > max_synthesis_steps:
+        labels.append("too_many_steps")
+    labels.extend(
+        [
+            "external_retrosynthesis_adapter_used",
+            f"{external_result.tool_name}_adapter",
+            *external_result.labels,
+        ]
+    )
+
+    result = db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    if result is None:
+        result = SynthesisRoute(molecule_id=molecule.molecule_id)
+        db.add(result)
+
+    result.route_found = route_found
+    result.route_steps = route_steps
+    result.route_confidence = route_confidence
+    result.buyable_building_blocks = buyable_blocks
+    result.labels = _dedupe(labels)
+    result.route_json = {
+        "adapter_mode": external_result.adapter_mode,
+        "tool_name": external_result.tool_name,
+        "tool_status": {
+            key: tool_status[key]
+            for key in ["aizynthfinder", "askcos", "rdkit"]
+            if key in tool_status
+        },
+        "SA_score": sa_score,
+        "SCScore": sc_score,
+        "route_score": external_result.route_score,
+        "route_summary": external_result.route_summary
+        or _external_route_summary(route_found, route_steps),
+        "route_plan": _route_plan(
+            descriptors=descriptors,
+            route_found=route_found,
+            route_steps=route_steps,
+            buyable_blocks=buyable_blocks,
+        ),
+        "starting_materials": _starting_materials(descriptors, buyable_blocks),
+        "route_risks": _external_route_risks(
+            route_found=route_found,
+            route_steps=route_steps,
+            max_synthesis_steps=max_synthesis_steps,
+            warnings=external_result.warnings,
+        ),
+        "external_warnings": external_result.warnings,
+        "exit_code": external_result.exit_code,
+        "runtime_seconds": round(external_result.runtime_seconds, 3),
+        "route_note": "Reaction-level retrosynthesis parsed from AiZynthFinder output.",
+    }
+    return result
+
+
 def _upsert_synthesis_route(
     db: Session,
     molecule: Molecule,
@@ -969,6 +1667,24 @@ def _upsert_synthesis_route(
         "hazardous_reaction_count": hazardous_reaction_count,
         "protecting_group_count": protecting_group_count,
         "route_summary": _route_summary(route_found, route_steps, buyable_blocks),
+        "route_plan": _route_plan(
+            descriptors=descriptors,
+            route_found=route_found,
+            route_steps=route_steps,
+            buyable_blocks=buyable_blocks,
+        ),
+        "starting_materials": _starting_materials(descriptors, buyable_blocks),
+        "route_risks": _route_risks(
+            route_found=route_found,
+            route_steps=route_steps,
+            max_synthesis_steps=max_synthesis_steps,
+            hazardous_reaction_count=hazardous_reaction_count,
+            protecting_group_count=protecting_group_count,
+        ),
+        "route_note": (
+            "Fallback route blueprint inferred from RDKit descriptors. "
+            "Provide AiZynthFinder model config for reaction-level retrosynthesis."
+        ),
     }
     return result
 
@@ -1059,6 +1775,32 @@ def _create_agent_run(
     return run
 
 
+def _update_agent_run_progress(
+    db: Session,
+    agent_run: AgentRun,
+    summary: StageSummary,
+    *,
+    phase: str,
+    message: str,
+    completed_count: int,
+    current_molecule_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    agent_run.output_json = {
+        **summary.as_dict(),
+        "progress": _progress_payload(
+            agent_run=agent_run,
+            summary=summary,
+            phase=phase,
+            message=message,
+            completed_count=completed_count,
+            current_molecule_id=current_molecule_id,
+            extra=extra,
+        ),
+    }
+    db.commit()
+
+
 def _finish_agent_run(
     agent_run: AgentRun,
     summary: StageSummary,
@@ -1067,8 +1809,66 @@ def _finish_agent_run(
     agent_run.status = "success"
     agent_run.output_json = {
         **summary.as_dict(),
+        "progress": _progress_payload(
+            agent_run=agent_run,
+            summary=summary,
+            phase="completed",
+            message="步骤已完成。",
+            completed_count=summary.requested_count,
+        ),
         "tool_status": tool_status,
     }
+
+
+def _progress_payload(
+    agent_run: AgentRun,
+    summary: StageSummary,
+    *,
+    phase: str,
+    message: str,
+    completed_count: int,
+    current_molecule_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    total = max(summary.requested_count, 0)
+    completed = max(0, min(completed_count, total)) if total else 0
+    percent = 100 if total == 0 else round(completed / total * 100, 1)
+    payload = {
+        "stage": _progress_stage_name(agent_run.agent_name),
+        "phase": phase,
+        "message": message,
+        "total_molecules": total,
+        "completed_molecules": completed,
+        "percent": percent,
+        "current_molecule_id": current_molecule_id,
+        "adapter_mode": summary.adapter_mode,
+        "evaluated_count": summary.evaluated_count,
+        "passed_count": summary.generated_count,
+        "failed_count": summary.failed_count,
+        "skipped_count": summary.skipped_count,
+        "warnings": summary.warnings,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _progress_stage_name(agent_name: str) -> str:
+    return {
+        CONFORMER_AGENT_NAME: "构象生成",
+        DOCKING_AGENT_NAME: "分子对接",
+        ADMET_AGENT_NAME: "ADMET 预测",
+        SYNTHESIS_AGENT_NAME: "逆合成分析",
+    }.get(agent_name, agent_name)
+
+
+def _replace_result_labels(
+    existing: list[str] | None,
+    stale_labels: set[str],
+    new_labels: list[str],
+) -> list[str]:
+    cleaned = [label for label in (existing or []) if label not in stale_labels]
+    return merge_labels(cleaned, new_labels)
 
 
 def _solubility_class(descriptors: DescriptorSnapshot) -> str:
@@ -1117,6 +1917,23 @@ def _sa_score(descriptors: DescriptorSnapshot) -> float:
     return round(_clamp(score, 1.0, 10.0), 3)
 
 
+def _synthesis_difficulty_labels(sa_score: float) -> list[str]:
+    if sa_score <= 4.5:
+        return ["easy_to_synthesize"]
+    if sa_score <= 6.5:
+        return ["moderate_synthesis"]
+    return ["hard_to_synthesize"]
+
+
+def _external_route_confidence(
+    external_result: AiZynthFinderResult,
+    route_found: bool,
+) -> float:
+    if external_result.route_score is not None:
+        return round(_clamp(float(external_result.route_score), 0.05, 0.99), 3)
+    return 0.72 if route_found else 0.28
+
+
 def _route_summary(route_found: bool, route_steps: int, buyable_blocks: int) -> str:
     if route_found:
         return f"Surrogate route found in {route_steps} steps with {buyable_blocks} buyable blocks."
@@ -1126,19 +1943,136 @@ def _route_summary(route_found: bool, route_steps: int, buyable_blocks: int) -> 
     )
 
 
+def _external_route_summary(route_found: bool, route_steps: int) -> str:
+    if route_found:
+        return f"AiZynthFinder found a retrosynthesis route in {route_steps} steps."
+    return "AiZynthFinder completed, but no solved route was found within constraints."
+
+
+def _route_plan(
+    descriptors: DescriptorSnapshot,
+    route_found: bool,
+    route_steps: int,
+    buyable_blocks: int,
+) -> list[dict[str, object]]:
+    plan = [
+        {
+            "step": 1,
+            "stage": "Commercial building-block selection",
+            "input": _starting_materials(descriptors, buyable_blocks),
+            "operation": "Select purchasable aromatic/heteroatom fragments matching the target scaffold.",
+            "output": "Buyable fragment set for analog synthesis.",
+            "rationale": "Keeps the proposed route anchored to available starting materials.",
+        },
+        {
+            "step": 2,
+            "stage": "Core assembly or scaffold elaboration",
+            "input": ["selected core fragment", "linker or cap fragment"],
+            "operation": _core_assembly_operation(descriptors),
+            "output": "Advanced scaffold intermediate.",
+            "rationale": "Approximates the main bond-forming step from ring count and heteroatom pattern.",
+        },
+        {
+            "step": 3,
+            "stage": "Late-stage substituent tuning",
+            "input": ["advanced scaffold intermediate", "R-group fragment"],
+            "operation": "Install polarity, solubility, or binding-pocket substituents.",
+            "output": "Target candidate analog.",
+            "rationale": "Leaves SAR-sensitive substituents late so optimization remains flexible.",
+        },
+    ]
+    if route_steps > 3:
+        plan.append(
+            {
+                "step": 4,
+                "stage": "Purification and salt/form screen",
+                "input": ["target candidate analog"],
+                "operation": "Purify and evaluate salt or form options for developability.",
+                "output": "Screening-ready compound batch.",
+                "rationale": "Additional steps are expected from higher SA/SCScore complexity.",
+            }
+        )
+    if not route_found:
+        plan.append(
+            {
+                "step": len(plan) + 1,
+                "stage": "Route redesign required",
+                "input": ["current candidate"],
+                "operation": "Reduce route length or replace difficult motifs before synthesis nomination.",
+                "output": "Simplified analog proposal.",
+                "rationale": "The surrogate route exceeded the configured confidence or step budget.",
+            }
+        )
+    return plan
+
+
+def _starting_materials(descriptors: DescriptorSnapshot, buyable_blocks: int) -> list[str]:
+    materials = ["commercial aryl/heteroaryl core"]
+    if descriptors.hba + descriptors.hbd > 2:
+        materials.append("polar linker or heteroatom-bearing fragment")
+    if descriptors.ring_count > 1:
+        materials.append("substituted aromatic cap fragment")
+    while len(materials) < buyable_blocks:
+        materials.append(f"diversity fragment {len(materials)}")
+    return materials[:buyable_blocks]
+
+
+def _core_assembly_operation(descriptors: DescriptorSnapshot) -> str:
+    if descriptors.ring_count >= 2 and descriptors.hba >= 2:
+        return "Couple heteroaryl core fragments, then tune hydrogen-bond acceptor placement."
+    if descriptors.ring_count >= 2:
+        return "Build the aromatic core through fragment coupling or cyclization."
+    if descriptors.hba + descriptors.hbd >= 3:
+        return "Assemble the polar linker through amide/urea-like bond formation."
+    return "Elaborate a compact core through one main C-C or C-N bond-forming step."
+
+
+def _route_risks(
+    route_found: bool,
+    route_steps: int,
+    max_synthesis_steps: int,
+    hazardous_reaction_count: int,
+    protecting_group_count: int,
+) -> list[str]:
+    risks: list[str] = []
+    if not route_found:
+        risks.append("No confident route within configured step budget.")
+    if route_steps > max_synthesis_steps:
+        risks.append(f"Estimated route length {route_steps} exceeds max step budget {max_synthesis_steps}.")
+    if hazardous_reaction_count:
+        risks.append("Halogen-heavy pattern may require hazardous or low-yield coupling conditions.")
+    if protecting_group_count:
+        risks.append("Multiple donors may require protecting-group strategy.")
+    if not risks:
+        risks.append("No major surrogate route risk detected.")
+    return risks
+
+
+def _external_route_risks(
+    route_found: bool,
+    route_steps: int,
+    max_synthesis_steps: int,
+    warnings: list[str],
+) -> list[str]:
+    risks: list[str] = []
+    if not route_found:
+        risks.append("AiZynthFinder did not provide a solved route within the configured constraints.")
+    if route_steps > max_synthesis_steps:
+        risks.append(f"AiZynthFinder route length {route_steps} exceeds max step budget {max_synthesis_steps}.")
+    for warning in warnings:
+        risks.append(f"AiZynthFinder warning: {warning}")
+    if not risks:
+        risks.append("No major AiZynthFinder route risk detected.")
+    return risks
+
+
 def _binding_site_docking_config(
     db: Session,
     project: Project,
     binding_site_id: str | None,
 ) -> dict[str, Any]:
-    if not binding_site_id:
-        return {}
-    site = db.query(BindingSite).filter_by(binding_site_id=binding_site_id).one_or_none()
+    site = _select_binding_site_for_docking(db, project, binding_site_id)
     if site is None:
-        return {}
-    if site.project_id and site.project_id != project.project_id:
-        return {}
-    if not site.project_id and site.target_id != project.target_id:
         return {}
 
     grid_box = site.grid_box or {}
@@ -1150,11 +2084,63 @@ def _binding_site_docking_config(
     )
     protein_file = resolve_receptor_path(receptor_reference)
     return {
+        "binding_site_id": site.binding_site_id,
         "protein_file": protein_file,
         "grid_center": grid_box.get("center") or grid_box.get("grid_center"),
         "grid_size": grid_box.get("size") or grid_box.get("grid_size"),
         "key_residues": site.key_residues or [],
     }
+
+
+def _select_binding_site_for_docking(
+    db: Session,
+    project: Project,
+    binding_site_id: str | None,
+) -> BindingSite | None:
+    if binding_site_id:
+        site = db.query(BindingSite).filter_by(binding_site_id=binding_site_id).one_or_none()
+        if site is None:
+            return None
+        if site.project_id and site.project_id != project.project_id:
+            return None
+        if not site.project_id and site.target_id != project.target_id:
+            return None
+        return site
+
+    project_sites = (
+        db.query(BindingSite)
+        .filter(BindingSite.project_id == project.project_id)
+        .order_by(BindingSite.updated_at.desc(), BindingSite.id.desc())
+        .all()
+    )
+    project_site = _first_site_with_docking_config(project_sites)
+    if project_site is not None:
+        return project_site
+
+    if not project.target_id:
+        return None
+    target_sites = (
+        db.query(BindingSite)
+        .filter(BindingSite.project_id.is_(None), BindingSite.target_id == project.target_id)
+        .order_by(BindingSite.id.asc())
+        .all()
+    )
+    return _first_site_with_docking_config(target_sites)
+
+
+def _first_site_with_docking_config(sites: list[BindingSite]) -> BindingSite | None:
+    fallback: BindingSite | None = None
+    for site in sites:
+        if fallback is None:
+            fallback = site
+        grid_box = site.grid_box or {}
+        has_receptor = bool(site.prepared_receptor_file or site.receptor_file)
+        has_grid = bool(grid_box.get("center") or grid_box.get("grid_center")) and bool(
+            grid_box.get("size") or grid_box.get("grid_size")
+        )
+        if has_receptor and has_grid:
+            return site
+    return fallback
 
 
 def _attempt_external_docking(

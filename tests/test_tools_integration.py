@@ -243,13 +243,20 @@ class TestDockingAdapters:
         selected = select_docking_tool(request, tool_status)
         assert selected == "gnina", "应优先选择GNINA"
 
-        # 只有Vina可用
+        # 只有Vina可用时需要 prepared PDBQT 输入
+        vina_request = DockingToolRequest(
+            receptor_file="test.pdbqt",
+            ligand_file="test.pdbqt",
+            output_dir="/tmp",
+            grid_center=[0, 0, 0],
+            grid_size=[20, 20, 20],
+        )
         tool_status = {
             "gnina": {"available": False},
             "vina": {"available": True},
             "diffdock": {"available": False},
         }
-        selected = select_docking_tool(request, tool_status)
+        selected = select_docking_tool(vina_request, tool_status)
         assert selected == "vina", "应选择Vina"
 
     def test_gnina_command_builder(self):

@@ -85,8 +85,9 @@ def test_prepare_receptor_creates_project_binding_site(tmp_path):
         assert body["preparation_status"] in {"prepared", "prepared_with_warnings"}
 
         sites = client.get(f"/projects/{project_id}/binding-sites").json()
-        assert len(sites) == 1
-        assert sites[0]["binding_site_id"] == body["binding_site_id"]
+        assert any(site["project_id"] == project_id for site in sites)
+        assert any(site["project_id"] is None for site in sites)
+        assert any(site["binding_site_id"] == body["binding_site_id"] for site in sites)
 
 
 def test_candidate_assessment_uses_binding_site_receptor_and_grid(tmp_path, monkeypatch):
@@ -97,6 +98,16 @@ def test_candidate_assessment_uses_binding_site_receptor_and_grid(tmp_path, monk
         status = original_tool_status()
         status["gnina"] = {"available": True, "path": "gnina"}
         status["vina"] = {"available": False, "path": None}
+        status["chemprop"] = {"available": False, "mode": None, "version": None}
+        status["aizynthfinder"] = {
+            "available": False,
+            "mode": None,
+            "version": None,
+            "path": None,
+            "docker_image": None,
+            "model_configured": False,
+        }
+        status["askcos"] = {"available": False, "version": None}
         return status
 
     def fake_external_docking(request, tool_status):
@@ -131,7 +142,12 @@ def test_candidate_assessment_uses_binding_site_receptor_and_grid(tmp_path, monk
 
         response = client.post(
             f"/projects/{project_id}/candidate-assessment/run",
-            json={"binding_site_id": site["binding_site_id"]},
+            json={
+                "assessment_mode": "full",
+                "binding_site_id": site["binding_site_id"],
+                "max_molecules": 2,
+                "top_n": 2,
+            },
         )
 
         assert response.status_code == 200
@@ -144,3 +160,146 @@ def test_candidate_assessment_uses_binding_site_receptor_and_grid(tmp_path, monk
             request.receptor_file.endswith(("egfr_receptor.pdb", "egfr_receptor.pdbqt"))
             for request, _ in docking_requests
         )
+
+
+def test_candidate_assessment_auto_uses_project_binding_site_when_omitted(tmp_path, monkeypatch):
+    original_tool_status = candidate_assessment.candidate_assessment_tool_status
+    docking_requests = []
+
+    def fake_tool_status():
+        status = original_tool_status()
+        status["gnina"] = {"available": True, "path": "gnina"}
+        status["vina"] = {"available": False, "path": None}
+        status["diffdock"] = {"available": False, "mode": None, "version": None}
+        status["chemprop"] = {"available": False, "mode": None, "version": None}
+        status["aizynthfinder"] = {
+            "available": False,
+            "mode": None,
+            "version": None,
+            "path": None,
+            "docker_image": None,
+            "model_configured": False,
+        }
+        status["askcos"] = {"available": False, "version": None}
+        return status
+
+    def fake_external_docking(request, tool_status):
+        docking_requests.append((request, tool_status))
+        return DockingToolResult(
+            adapter_mode="gnina_external_docking",
+            tool_name="gnina",
+            success=True,
+            vina_score=-8.1,
+            cnn_score=0.7,
+            cnn_affinity=-7.6,
+            pose_file=str(tmp_path / f"{request.molecule_id}.sdf"),
+            labels=["external_docking_adapter_used", "gnina_adapter"],
+        )
+
+    monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", fake_tool_status)
+    monkeypatch.setattr(candidate_assessment, "run_external_docking", fake_external_docking)
+
+    with make_client(tmp_path) as client:
+        project_id = create_project(client)
+        source_file_id = upload_receptor(client, project_id)
+        client.post(
+            f"/projects/{project_id}/receptors/prepare",
+            json={
+                "source_file_id": source_file_id,
+                "grid_center": [4.0, 5.0, 6.0],
+                "grid_size": [16.0, 17.0, 18.0],
+                "key_residues": ["Met793"],
+            },
+        ).raise_for_status()
+        create_filtered_molecules(client, project_id)
+
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "assessment_mode": "full",
+                "max_molecules": 2,
+                "top_n": 2,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["docking"]["adapter_mode"] == "gnina_external_docking"
+        assert len(docking_requests) == 2
+        assert all(request.grid_center == [4.0, 5.0, 6.0] for request, _ in docking_requests)
+        assert all(request.grid_size == [16.0, 17.0, 18.0] for request, _ in docking_requests)
+        assert all(
+            request.receptor_file.endswith(("egfr_receptor.pdb", "egfr_receptor.pdbqt"))
+            for request, _ in docking_requests
+        )
+
+
+def test_candidate_assessment_auto_uses_builtin_target_binding_site_when_omitted(
+    tmp_path, monkeypatch
+):
+    original_tool_status = candidate_assessment.candidate_assessment_tool_status
+    receptor_file = tmp_path / "builtin_egfr.pdb"
+    receptor_file.write_text("HEADER    BUILTIN EGFR\nATOM      1  N   MET A   1       0.0   0.0   0.0\nEND\n")
+    docking_requests = []
+
+    def fake_tool_status():
+        status = original_tool_status()
+        status["gnina"] = {"available": True, "path": "gnina"}
+        status["vina"] = {"available": False, "path": None}
+        status["diffdock"] = {"available": False, "mode": None, "version": None}
+        status["chemprop"] = {"available": False, "mode": None, "version": None}
+        status["aizynthfinder"] = {
+            "available": False,
+            "mode": None,
+            "version": None,
+            "path": None,
+            "docker_image": None,
+            "model_configured": False,
+        }
+        status["askcos"] = {"available": False, "version": None}
+        return status
+
+    def fake_resolve_receptor_path(receptor_reference):
+        if receptor_reference and "rcsb.org" in receptor_reference:
+            return str(receptor_file)
+        if receptor_reference and receptor_reference.startswith("local://"):
+            return receptor_reference.removeprefix("local://")
+        return receptor_reference
+
+    def fake_external_docking(request, tool_status):
+        docking_requests.append((request, tool_status))
+        return DockingToolResult(
+            adapter_mode="gnina_external_docking",
+            tool_name="gnina",
+            success=True,
+            vina_score=-8.1,
+            cnn_score=0.7,
+            cnn_affinity=-7.6,
+            pose_file=str(tmp_path / f"{request.molecule_id}.sdf"),
+            labels=["external_docking_adapter_used", "gnina_adapter"],
+        )
+
+    monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", fake_tool_status)
+    monkeypatch.setattr(candidate_assessment, "resolve_receptor_path", fake_resolve_receptor_path)
+    monkeypatch.setattr(candidate_assessment, "run_external_docking", fake_external_docking)
+
+    with make_client(tmp_path) as client:
+        project_id = create_project(client)
+        create_filtered_molecules(client, project_id)
+
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "assessment_mode": "full",
+                "max_molecules": 2,
+                "top_n": 2,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["docking"]["adapter_mode"] == "gnina_external_docking"
+        assert len(docking_requests) == 2
+        assert all(request.receptor_file == str(receptor_file) for request, _ in docking_requests)
+        assert all(len(request.grid_center or []) == 3 for request, _ in docking_requests)
+        assert all(len(request.grid_size or []) == 3 for request, _ in docking_requests)

@@ -27,6 +27,24 @@ from medagent.services.self_refutation import generate_project_critiques
 from medagent.services.rule_filtering import filter_project_molecules
 
 
+DEFAULT_PIPELINE_CONFIG = {
+    "strategy_counts": {"reinvent4": 5, "crem": 5, "autogrow4": 5},
+    "top_n": 10,
+    "max_assessment_molecules": 50,
+    "assessment_mode": "external",
+    "external_top_n": 10,
+    "generate_when_seeds_exist": True,
+}
+ASSESSMENT_MODES = {"fast", "external", "full"}
+DEFAULT_GENERATION_CONSTRAINTS = {
+    "max_mw": 500,
+    "max_logp": 5,
+    "max_tpsa": 140,
+    "max_hbd": 5,
+    "max_hba": 10,
+}
+
+
 class PipelineOrchestrator:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -52,7 +70,13 @@ class PipelineOrchestrator:
         db.commit()
         return runs
 
-    def run_full(self, db: Session, project: Project) -> list[AgentRun]:
+    def run_full(
+        self,
+        db: Session,
+        project: Project,
+        pipeline_config: dict[str, Any] | None = None,
+    ) -> list[AgentRun]:
+        config = _normalize_pipeline_config(project, pipeline_config)
         runs: list[AgentRun] = []
         project.status = PIPELINE_RUNNING
         db.commit()
@@ -100,10 +124,14 @@ class PipelineOrchestrator:
                 project,
                 "generator_agent",
                 "qwen3.7-max",
-                {"mode": "full", "minimum_candidate_count": 1},
+                {
+                    "mode": "full",
+                    "strategy_counts": config["strategy_counts"],
+                    "requested_generation_size": config["generation_size"],
+                },
                 lambda: record_output(
                     "generator_agent",
-                    self._run_generation_if_needed(db, project),
+                    self._run_generation_if_needed(db, project, config),
                 ),
             )
         )
@@ -141,12 +169,22 @@ class PipelineOrchestrator:
                 "tool-adapter",
                 {
                     "mode": "full",
-                    "max_molecules": 50,
+                    "max_molecules": config["max_assessment_molecules"],
+                    "top_n": config["top_n"],
+                    "assessment_mode": config["assessment_mode"],
+                    "external_top_n": config["external_top_n"],
                     "passed_filter_count": self._molecule_count(db, project, status="passed_filter"),
                 },
                 lambda: record_output(
                     "candidate_assessment_agent",
-                    run_project_candidate_assessment(db, project, max_molecules=50),
+                    run_project_candidate_assessment(
+                        db,
+                        project,
+                        max_molecules=config["max_assessment_molecules"],
+                        top_n=config["top_n"],
+                        assessment_mode=config["assessment_mode"],
+                        external_top_n=config["external_top_n"],
+                    ),
                 ),
             )
         )
@@ -156,14 +194,14 @@ class PipelineOrchestrator:
                 project,
                 "self_refutation_agent",
                 "deepseek-v4-pro",
-                {"mode": "full", "max_molecules": 50},
+                {"mode": "full", "max_molecules": config["max_assessment_molecules"]},
                 lambda: record_output(
                     "self_refutation_agent",
                     generate_project_critiques(
                         db,
                         project,
                         settings=self.settings,
-                        max_molecules=50,
+                        max_molecules=config["max_assessment_molecules"],
                     ),
                 ),
             )
@@ -176,13 +214,18 @@ class PipelineOrchestrator:
                 "qwen3.7-max",
                 {
                     "mode": "full",
-                    "max_molecules": 50,
-                    "top_n": 50,
+                    "max_molecules": config["max_assessment_molecules"],
+                    "top_n": config["top_n"],
                     "source": "self_refutation",
                 },
                 lambda: record_output(
                     "ranker_agent",
-                    generate_project_rankings(db, project, max_molecules=50, top_n=50).as_dict(),
+                    generate_project_rankings(
+                        db,
+                        project,
+                        max_molecules=config["max_assessment_molecules"],
+                        top_n=config["top_n"],
+                    ).as_dict(),
                 ),
             )
         )
@@ -292,22 +335,42 @@ class PipelineOrchestrator:
             "rag_index": rag_index,
         }
 
-    def _run_generation_if_needed(self, db: Session, project: Project) -> dict[str, Any]:
+    def _run_generation_if_needed(
+        self,
+        db: Session,
+        project: Project,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
         existing_count = self._molecule_count(db, project)
-        if existing_count > 0:
+        strategy_counts = config["strategy_counts"]
+        requested_size = config["generation_size"]
+        selected_strategies = [
+            strategy for strategy, count in strategy_counts.items() if count > 0
+        ]
+        if requested_size <= 0:
+            return {
+                "skipped": True,
+                "reason": "generation_size_is_zero",
+                "molecule_count": existing_count,
+                "strategy_counts": strategy_counts,
+            }
+        if existing_count > 0 and not config["generate_when_seeds_exist"]:
             return {
                 "skipped": True,
                 "reason": "existing_molecules_available",
                 "molecule_count": existing_count,
+                "strategy_counts": strategy_counts,
             }
         try:
             return generate_project_molecules(
                 db,
                 project,
-                generation_size=3,
-                strategies=["crem"],
-                constraints={},
+                generation_size=requested_size,
+                strategies=selected_strategies,
+                strategy_counts=strategy_counts,
+                constraints=config.get("generation_constraints") or dict(DEFAULT_GENERATION_CONSTRAINTS),
                 include_target_library_seeds=True,
+                agent_run_name="molecule_generation_tool_agent",
             )
         except ValueError as exc:
             if str(exc) != "generation_requires_at_least_one_seed_ligand":
@@ -324,3 +387,79 @@ class PipelineOrchestrator:
         if status is not None:
             query = query.filter_by(status=status)
         return query.count()
+
+
+def _normalize_pipeline_config(
+    project: Project,
+    override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    stored = (project.constraints_json or {}).get("pipeline_config", {})
+    raw = {
+        **DEFAULT_PIPELINE_CONFIG,
+        **(stored if isinstance(stored, dict) else {}),
+        **(override if isinstance(override, dict) else {}),
+    }
+    strategy_counts = _normalize_strategy_counts(raw.get("strategy_counts"))
+    top_n = _bounded_int(raw.get("top_n"), DEFAULT_PIPELINE_CONFIG["top_n"], 1, 500)
+    max_assessment_molecules = _bounded_int(
+        raw.get("max_assessment_molecules"),
+        max(top_n, DEFAULT_PIPELINE_CONFIG["max_assessment_molecules"]),
+        1,
+        500,
+    )
+    max_assessment_molecules = max(max_assessment_molecules, top_n)
+    generation_constraints = _normalize_generation_constraints(stored, raw)
+    assessment_mode = _normalize_assessment_mode(raw.get("assessment_mode"))
+    external_top_n = _bounded_int(
+        raw.get("external_top_n"),
+        DEFAULT_PIPELINE_CONFIG["external_top_n"],
+        1,
+        100,
+    )
+    return {
+        "strategy_counts": strategy_counts,
+        "generation_size": sum(strategy_counts.values()),
+        "top_n": top_n,
+        "max_assessment_molecules": max_assessment_molecules,
+        "assessment_mode": assessment_mode,
+        "external_top_n": external_top_n,
+        "generate_when_seeds_exist": bool(raw.get("generate_when_seeds_exist", True)),
+        "generation_constraints": generation_constraints,
+    }
+
+
+def _normalize_strategy_counts(raw: Any) -> dict[str, int]:
+    defaults = DEFAULT_PIPELINE_CONFIG["strategy_counts"]
+    if not isinstance(raw, dict):
+        raw = {}
+    counts: dict[str, int] = {}
+    for strategy, default_count in defaults.items():
+        counts[strategy] = _bounded_int(raw.get(strategy), default_count, 0, 500)
+    return counts
+
+
+def _normalize_generation_constraints(stored: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
+    constraints = dict(DEFAULT_GENERATION_CONSTRAINTS)
+    for source in (
+        stored.get("generation_constraints") if isinstance(stored, dict) else None,
+        raw.get("generation_constraints"),
+    ):
+        if isinstance(source, dict):
+            constraints.update({key: value for key, value in source.items() if value is not None})
+    return constraints
+
+
+def _normalize_assessment_mode(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ASSESSMENT_MODES:
+            return normalized
+    return DEFAULT_PIPELINE_CONFIG["assessment_mode"]
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))

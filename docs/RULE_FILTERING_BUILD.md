@@ -60,7 +60,7 @@ POST /projects/{project_id}/molecules/filter-rules
 
 ```json
 {
-  "rule_set": "basic_drug_likeness_v1",
+  "rule_set": "target_aware_drug_likeness_v2",
   "evaluated_count": 2,
   "passed_count": 1,
   "failed_count": 1,
@@ -93,7 +93,7 @@ GET /projects/{project_id}/molecules/{molecule_id}/rule-filter-results
 当前规则集名称：
 
 ```text
-basic_drug_likeness_v1
+target_aware_drug_likeness_v2
 ```
 
 规则来源分为两类。
@@ -133,10 +133,10 @@ BRENK
 命中的告警会写入失败规则：
 
 ```text
-rdkit_alert:<description>
+rdkit_alert:<catalog>:<description>
 ```
 
-不同 RDKit 版本可能缺少部分 catalog 枚举，所以适配器使用兼容式加载：存在就加入，不存在就跳过。RDKit 完全不可用时，过滤结果不会中断，而是加入：
+当前 `PAINS_A`、`PAINS_B`、`PAINS_C` 命中会直接失败。`BRENK` 命中默认失败；少数靶点特异、药效团相关的 BRENK 告警可以降级为 `target_allowed_*` warning。不同 RDKit 版本可能缺少部分 catalog 枚举，所以适配器使用兼容式加载：存在就加入，不存在就跳过。RDKit 完全不可用时，过滤结果不会中断，而是加入：
 
 ```text
 rdkit_filter_catalog_unavailable
@@ -197,7 +197,7 @@ labels += ["rule_filter_needs_properties"]
 | `filter_result_id` | 业务 id，前缀 `FILTER` |
 | `project_id` | 项目 id |
 | `molecule_id` | 分子 id |
-| `rule_set` | 当前为 `basic_drug_likeness_v1` |
+| `rule_set` | 当前为 `target_aware_drug_likeness_v2` |
 | `decision` | `passed` / `failed` / `skipped_invalid_structure` / `needs_properties` |
 | `failed_rules` | 命中的失败规则列表 |
 | `warnings` | 缺失字段、RDKit 不可用等提示 |

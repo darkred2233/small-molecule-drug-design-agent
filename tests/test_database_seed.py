@@ -17,8 +17,8 @@ def test_builtin_database_covers_mvp_targets(tmp_path):
 
     assert response.status_code == 200
     summary = response.json()
-    assert summary["target_count"] >= 10
-    assert summary["drug_count"] >= 30
+    assert summary["target_count"] >= 50
+    assert summary["drug_count"] >= 150
     assert set(summary["target_ids"]) >= {
         "TGT-EGFR",
         "TGT-ALK",
@@ -30,6 +30,11 @@ def test_builtin_database_covers_mvp_targets(tmp_path):
         "TGT-PARP1",
         "TGT-PI3K",
         "TGT-HDAC",
+        "TGT-HER2",
+        "TGT-MET",
+        "TGT-DPP4",
+        "TGT-HMGCR",
+        "TGT-HIV1-PROTEASE",
     }
 
 
@@ -59,6 +64,16 @@ def test_cli_creates_portable_sqlite_seed_database(tmp_path):
     with sqlite3.connect(output_db) as connection:
         target_count = connection.execute("select count(*) from targets").fetchone()[0]
         drug_count = connection.execute("select count(*) from target_drug_library").fetchone()[0]
+        binding_site_count = connection.execute("select count(*) from binding_sites").fetchone()[0]
+        target_pocket_count = connection.execute(
+            "select count(*) from targets where pocket_summary is not null and pocket_summary != ''"
+        ).fetchone()[0]
+        drug_smiles_count = connection.execute(
+            "select count(*) from target_drug_library where smiles is not null and smiles != ''"
+        ).fetchone()[0]
 
-    assert target_count >= 10
-    assert drug_count >= 30
+    assert target_count >= 50
+    assert drug_count >= 150
+    assert binding_site_count >= 45
+    assert target_pocket_count >= 50
+    assert drug_smiles_count == drug_count

@@ -1,9 +1,10 @@
 from collections.abc import Generator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from medagent.agents.conversation import ConversationAgent
@@ -27,6 +28,8 @@ from medagent.db.models import (
     UploadedFile as UploadedFileModel,
 )
 from medagent.db.session import build_session_factory
+from medagent.data.builtin_targets import get_builtin_target_ids
+from medagent.data.target_metadata import get_target_metadata
 from medagent.domain.schemas import (
     ADMETResultRead,
     AdvisorApplyResponse,
@@ -78,7 +81,11 @@ from medagent.services.advisor import (
     AdvisorSuggestionNotFoundError,
     apply_latest_advisor_suggestion,
 )
-from medagent.services.bootstrap import seed_builtin_targets
+from medagent.services.bootstrap import (
+    ensure_project_target,
+    seed_builtin_targets,
+    seed_project_target_ligands,
+)
 from medagent.services.candidate_assessment import (
     list_project_admet_results,
     list_project_conformer_results,
@@ -97,7 +104,10 @@ from medagent.services.file_ingestion import (
 from medagent.services.ids import new_id
 from medagent.services.molecule_generation import generate_project_molecules
 from medagent.services.molecule_import import import_seed_ligands_as_molecules
-from medagent.services.molecule_validation import validate_project_molecules
+from medagent.services.molecule_validation import (
+    molecule_property_metadata_for_read,
+    validate_project_molecules,
+)
 from medagent.pipeline.orchestrator import PipelineOrchestrator
 from medagent.reporting.project_report import build_project_report
 from medagent.services.rag import build_project_rag_index, crawl_project_urls, query_project_rag
@@ -146,6 +156,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {"name": "结果查询", "description": "查询候选分子、Advisor 建议和报告骨架。"},
         ],
     )
+
+    app.state.settings = app_settings
 
     def get_db() -> Generator[Session, None, None]:
         db = session_factory()
@@ -602,7 +614,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/builtin-targets", response_model=list[BuiltinTargetRead], tags=["内置靶点库"], summary="查看内置靶点列表")
     def list_builtin_targets(db: Session = Depends(get_db)):
-        targets = db.query(Target).order_by(Target.name).all()
+        builtin_ids = sorted(get_builtin_target_ids())
+        targets = (
+            db.query(Target)
+            .filter(Target.target_id.in_(builtin_ids))
+            .order_by(Target.name)
+            .all()
+        )
         return [_target_to_read(target) for target in targets]
 
     @app.get(
@@ -612,6 +630,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         summary="查看单个靶点详情",
     )
     def get_builtin_target(target_id: str, db: Session = Depends(get_db)):
+        if target_id not in get_builtin_target_ids():
+            raise HTTPException(status_code=404, detail="未找到该靶点")
         target = db.query(Target).filter_by(target_id=target_id).one_or_none()
         if target is None:
             raise HTTPException(status_code=404, detail="未找到该靶点")
@@ -619,14 +639,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/projects", response_model=ProjectRead, status_code=201, tags=["项目管理"], summary="创建项目")
     def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
+        ensure_project_target(db, payload.target_id, payload.target_name)
+        constraints_json = _merge_project_config(payload.constraints, payload.generation_config)
         project = Project(
             project_id=new_id("PROJ"),
             name=payload.name,
             target_id=payload.target_id,
             objective=payload.objective,
-            constraints_json=payload.constraints,
+            constraints_json=constraints_json,
         )
         db.add(project)
+        db.flush()
+        seed_project_target_ligands(db, project)
         db.commit()
         db.refresh(project)
         return _project_to_read(project)
@@ -955,7 +979,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         project = _get_project(db, project_id)
         requested = payload or RunPipelineRequest()
         if requested.mode == "full":
-            PipelineOrchestrator(app_settings).run_full(db, project)
+            PipelineOrchestrator(app_settings).run_full(
+                db,
+                project,
+                pipeline_config=requested.generation_config,
+            )
             db.refresh(project)
             return _project_status(db, project)
         if requested.mode != "dry_run":
@@ -1105,6 +1133,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 project=project,
                 generation_size=request.generation_size,
                 strategies=request.strategies,
+                strategy_counts=request.strategy_counts,
                 constraints=request.constraints,
                 include_target_library_seeds=request.include_target_library_seeds,
             )
@@ -1246,6 +1275,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             project=project,
             molecule_ids=request.molecule_ids,
             max_molecules=request.max_molecules,
+            top_n=request.top_n,
+            assessment_mode=request.assessment_mode,
+            external_top_n=request.external_top_n,
             binding_site_id=request.binding_site_id,
             protein_file=request.protein_file,
             prepared_ligand_files=request.prepared_ligand_files,
@@ -1396,7 +1428,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             hbd=properties.hbd,
             hba=properties.hba,
             sa_score=properties.sa_score,
-            tool_metadata=properties.tool_metadata or {},
+            tool_metadata=molecule_property_metadata_for_read(molecule, properties),
         )
 
     @app.get(
@@ -1494,6 +1526,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return report_run.output_json
         return build_project_report(db, project)
 
+    @app.get("/projects/{project_id}/report/download", tags=["结果查询"], summary="下载项目报告")
+    def download_report(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        report = build_project_report(db, project)
+        report_file = report.get("report_file")
+        if not report_file:
+            raise HTTPException(status_code=404, detail="报告文件尚未生成")
+        path = Path(report_file)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="报告文件不存在，请重新生成报告")
+        filename = f"{_safe_filename(project.name or project.project_id)}_{project.project_id}_report.json"
+        return FileResponse(path, media_type="application/json", filename=filename)
+
     @app.post(
         "/projects/{project_id}/rag/collect",
         response_model=RagCollectResponse,
@@ -1531,6 +1576,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(tools_router)
 
     return app
+
+
+def _merge_project_config(
+    constraints: dict[str, object] | None,
+    generation_config: dict[str, object] | None,
+) -> dict[str, object]:
+    merged: dict[str, object] = dict(constraints or {})
+    if generation_config:
+        merged["pipeline_config"] = generation_config
+    return merged
+
+
+def _safe_filename(value: str) -> str:
+    safe = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in value)
+    return safe.strip("_") or "project"
 
 
 def _rag_document_to_read(document: RagDocument) -> RagDocumentRead:
@@ -1724,6 +1784,7 @@ def _project_to_read(project: Project) -> ProjectRead:
 
 
 def _target_to_read(target: Target) -> BuiltinTargetRead:
+    metadata = get_target_metadata(target.target_id)
     return BuiltinTargetRead(
         target_id=target.target_id,
         name=target.name,
@@ -1732,6 +1793,15 @@ def _target_to_read(target: Target) -> BuiltinTargetRead:
         species=target.species,
         pdb_ids=target.pdb_ids,
         summary=target.summary,
+        pocket_summary=target.pocket_summary or metadata.get("pocket_summary"),
+        binding_sites=metadata.get("binding_sites", []),
+        sar_rules=metadata.get("sar_rules", []),
+        admet_risks=metadata.get("admet_risks", []),
+        seed_ligand_count=sum(
+            1
+            for drug in target.drugs
+            if drug.smiles or drug.canonical_smiles or drug.isomeric_smiles
+        ),
         drugs=[
             BuiltinDrugRead(
                 drug_name=drug.drug_name,

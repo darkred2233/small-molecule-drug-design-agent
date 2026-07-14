@@ -146,6 +146,7 @@ def upsert_molecule_property(db: Session, molecule: Molecule, descriptors: dict)
         "isomeric_smiles",
         "inchi_key",
         "rotatable_bond_count",
+        "qed",
         "ring_count",
         "aromatic_ring_count",
         "scaffold",
@@ -176,6 +177,33 @@ def upsert_molecule_property(db: Session, molecule: Molecule, descriptors: dict)
     existing.hbd = descriptors["hbd"]
     existing.hba = descriptors["hba"]
     existing.tool_metadata = metadata
+
+
+def molecule_property_metadata_for_read(molecule: Molecule, properties: MoleculeProperty) -> dict:
+    metadata = dict(properties.tool_metadata or {})
+    missing_keys = {"qed", "rotatable_bond_count"} - set(metadata)
+    if not missing_keys:
+        return metadata
+
+    rdkit_result = validate_smiles_with_rdkit(molecule.smiles)
+    if not rdkit_result.available or not rdkit_result.valid or not rdkit_result.descriptors:
+        return metadata
+
+    for key in [
+        "exact_mw",
+        "formula",
+        "canonical_smiles",
+        "isomeric_smiles",
+        "inchi_key",
+        "rotatable_bond_count",
+        "qed",
+        "ring_count",
+        "aromatic_ring_count",
+        "scaffold",
+    ]:
+        if key in rdkit_result.descriptors and key not in metadata:
+            metadata[key] = rdkit_result.descriptors[key]
+    return metadata
 
 
 def estimate_descriptors(smiles: str) -> dict:

@@ -1,4 +1,6 @@
+import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -55,9 +57,13 @@ def run_external_docking(
 
     selected_tool = select_docking_tool(request, tool_status)
     if selected_tool == "gnina":
+        if tool_status["gnina"].get("mode") == "docker":
+            return run_gnina_docker_docking(request, tool_status["gnina"])
         executable = str(tool_status["gnina"].get("path") or "gnina")
         return run_gnina_docking(executable, request)
     if selected_tool == "vina":
+        if tool_status["vina"].get("mode") == "docker":
+            return run_vina_docker_docking(request, tool_status["vina"])
         executable = str(tool_status["vina"].get("path") or "vina")
         return run_vina_docking(executable, request)
     if selected_tool == "diffdock":
@@ -71,7 +77,7 @@ def select_docking_tool(
 ) -> str | None:
     if tool_status.get("gnina", {}).get("available"):
         return "gnina"
-    if tool_status.get("vina", {}).get("available") and _has_receptor_ligand_pair(request):
+    if tool_status.get("vina", {}).get("available") and _has_vina_prepared_pair(request):
         return "vina"
     if tool_status.get("diffdock", {}).get("available"):
         return "diffdock"
@@ -111,6 +117,39 @@ def build_gnina_command(
     return command, pose_file
 
 
+def build_gnina_docker_command(
+    docker_image: str,
+    request: DockingToolRequest,
+) -> tuple[list[str], str]:
+    receptor_file = Path(request.receptor_file).resolve()
+    ligand_file = Path(request.ligand_file).resolve()
+    output_dir = Path(request.output_dir).resolve()
+    pose_file = output_dir / f"{_safe_pose_prefix(request.molecule_id)}_gnina_pose.sdf"
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{receptor_file.parent}:/data/receptor:ro",
+        "-v",
+        f"{ligand_file.parent}:/data/ligand:ro",
+        "-v",
+        f"{output_dir}:/data/output",
+        docker_image,
+        "gnina",
+        "-r",
+        f"/data/receptor/{receptor_file.name}",
+        "-l",
+        f"/data/ligand/{ligand_file.name}",
+        "-o",
+        f"/data/output/{pose_file.name}",
+        "--exhaustiveness",
+        str(request.exhaustiveness),
+    ]
+    command.extend(_grid_args(request))
+    return command, str(pose_file)
+
+
 def build_vina_command(
     executable: str,
     request: DockingToolRequest,
@@ -131,6 +170,37 @@ def build_vina_command(
     ]
     command.extend(_grid_args(request))
     return command, pose_file
+
+
+def build_vina_docker_command(
+    docker_image: str,
+    request: DockingToolRequest,
+) -> tuple[list[str], str]:
+    receptor_file = Path(request.receptor_file).resolve()
+    ligand_file = Path(request.ligand_file).resolve()
+    output_dir = Path(request.output_dir).resolve()
+    pose_file = output_dir / f"{_safe_pose_prefix(request.molecule_id)}_vina_pose.pdbqt"
+    script = _vina_docker_python_script(
+        receptor_path=f"/data/receptor/{receptor_file.name}",
+        ligand_path=f"/data/ligand/{ligand_file.name}",
+        pose_path=f"/data/output/{pose_file.name}",
+        request=request,
+    )
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{receptor_file.parent}:/data/receptor:ro",
+        "-v",
+        f"{ligand_file.parent}:/data/ligand:ro",
+        "-v",
+        f"{output_dir}:/data/output",
+        docker_image,
+        "-c",
+        script,
+    ]
+    return command, str(pose_file)
 
 
 def run_gnina_docking(executable: str, request: DockingToolRequest) -> DockingToolResult:
@@ -158,6 +228,35 @@ def run_gnina_docking(executable: str, request: DockingToolRequest) -> DockingTo
     )
 
 
+def run_gnina_docker_docking(
+    request: DockingToolRequest,
+    gnina_status: dict[str, Any],
+) -> DockingToolResult:
+    Path(request.output_dir).mkdir(parents=True, exist_ok=True)
+    docker_image = gnina_status.get("docker_image") or "gnina/gnina:latest"
+    command, pose_file = build_gnina_docker_command(docker_image, request)
+    exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
+    parsed = parse_gnina_output(stdout)
+    success = exit_code == 0 and parsed["vina_score"] is not None
+    warnings = _tool_warnings(exit_code, parsed["vina_score"], stderr)
+    return DockingToolResult(
+        adapter_mode="gnina_docker_docking",
+        tool_name="gnina",
+        success=success,
+        vina_score=parsed["vina_score"],
+        cnn_score=parsed["cnn_score"],
+        cnn_affinity=parsed["cnn_affinity"],
+        pose_file=pose_file if success else None,
+        labels=_result_labels("gnina", success),
+        warnings=warnings,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        runtime_seconds=runtime_seconds,
+        command=command,
+    )
+
+
 def run_vina_docking(executable: str, request: DockingToolRequest) -> DockingToolResult:
     Path(request.output_dir).mkdir(parents=True, exist_ok=True)
     command, pose_file = build_vina_command(executable, request)
@@ -167,6 +266,33 @@ def run_vina_docking(executable: str, request: DockingToolRequest) -> DockingToo
     warnings = _tool_warnings(exit_code, parsed["vina_score"], stderr)
     return DockingToolResult(
         adapter_mode="vina_external_docking",
+        tool_name="vina",
+        success=success,
+        vina_score=parsed["vina_score"],
+        pose_file=pose_file if success else None,
+        labels=_result_labels("vina", success),
+        warnings=warnings,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        runtime_seconds=runtime_seconds,
+        command=command,
+    )
+
+
+def run_vina_docker_docking(
+    request: DockingToolRequest,
+    vina_status: dict[str, Any],
+) -> DockingToolResult:
+    Path(request.output_dir).mkdir(parents=True, exist_ok=True)
+    docker_image = vina_status.get("docker_image") or "vina:latest"
+    command, pose_file = build_vina_docker_command(docker_image, request)
+    exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
+    parsed = parse_vina_output(stdout)
+    success = exit_code == 0 and parsed["vina_score"] is not None
+    warnings = _tool_warnings(exit_code, parsed["vina_score"], stderr)
+    return DockingToolResult(
+        adapter_mode="vina_docker_docking",
         tool_name="vina",
         success=success,
         vina_score=parsed["vina_score"],
@@ -276,8 +402,9 @@ def _run_diffdock_docker(
         command = [
             "docker", "run", "--rm",
             "-v", f"{tmp_path}:/data",
+            "--entrypoint", "python",
             docker_image,
-            "python", "-m", "diffdock",
+            "-m", "diffdock",
             "--protein_path", "/data/protein.pdb",
             "--ligand_path", "/data/ligand.sdf",
             "--output_dir", "/data/output",
@@ -397,10 +524,54 @@ def check_diffdock_available() -> dict[str, Any]:
     return result
 
 
+def check_gnina_available() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "available": False,
+        "mode": None,
+        "version": None,
+        "path": None,
+        "docker_image": None,
+    }
+    path = shutil.which("gnina")
+    if path is not None:
+        return {**result, "available": True, "mode": "local_cli", "path": path}
+
+    docker_image = _first_existing_docker_image(
+        [
+            os.environ.get("GNINA_IMAGE", "gnina/gnina:latest"),
+            "gnina/gnina:latest",
+            "gnina/gnina:1.0.3",
+            "gnina:latest",
+        ]
+    )
+    if docker_image is not None:
+        return {**result, "available": True, "mode": "docker", "docker_image": docker_image}
+    return result
+
+
+def check_vina_available() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "available": False,
+        "mode": None,
+        "version": None,
+        "path": None,
+        "docker_image": None,
+    }
+    for command in ["vina", "autodock_vina", "vina_1_1_2"]:
+        path = shutil.which(command)
+        if path is not None:
+            return {**result, "available": True, "mode": "local_cli", "path": path}
+
+    docker_image = _first_existing_docker_image(["vina:latest"])
+    if docker_image is not None:
+        return {**result, "available": True, "mode": "docker", "docker_image": docker_image}
+    return result
+
+
 def parse_gnina_output(stdout: str) -> dict[str, float | None]:
-    affinity = _find_named_float(stdout, "Affinity")
-    cnn_score = _find_named_float(stdout, "CNNscore")
-    cnn_affinity = _find_named_float(stdout, "CNNaffinity")
+    affinity = _valid_affinity(_find_named_float(stdout, "Affinity"))
+    cnn_score = _valid_cnn_score(_find_named_float(stdout, "CNNscore"))
+    cnn_affinity = _valid_affinity(_find_named_float(stdout, "CNNaffinity"))
     if affinity is None or cnn_score is None or cnn_affinity is None:
         table_values = _first_mode_values(stdout)
         if table_values:
@@ -419,7 +590,7 @@ def parse_gnina_output(stdout: str) -> dict[str, float | None]:
 def parse_vina_output(stdout: str) -> dict[str, float | None]:
     remark_score = _find_remark_vina_score(stdout)
     if remark_score is not None:
-        return {"vina_score": _rounded(remark_score)}
+        return {"vina_score": _rounded(_valid_affinity(remark_score))}
     table_values = _first_mode_values(stdout)
     return {"vina_score": _rounded(table_values.get("affinity")) if table_values else None}
 
@@ -444,6 +615,32 @@ def _run_command(command: list[str], timeout_seconds: int) -> tuple[int | None, 
     return completed.returncode, completed.stdout or "", completed.stderr or "", runtime_seconds
 
 
+def _vina_docker_python_script(
+    receptor_path: str,
+    ligand_path: str,
+    pose_path: str,
+    request: DockingToolRequest,
+) -> str:
+    assert request.grid_center is not None
+    assert request.grid_size is not None
+    center = [float(value) for value in request.grid_center]
+    box_size = [float(value) for value in request.grid_size]
+    return "\n".join(
+        [
+            "from vina import Vina",
+            "v = Vina(sf_name='vina')",
+            f"v.set_receptor({receptor_path!r})",
+            f"v.set_ligand_from_file({ligand_path!r})",
+            f"v.compute_vina_maps(center={center!r}, box_size={box_size!r})",
+            f"v.dock(exhaustiveness={int(request.exhaustiveness)}, n_poses=9)",
+            "energies = v.energies(n_poses=1)",
+            "score = float(energies[0][0])",
+            f"v.write_poses({pose_path!r}, n_poses=1, overwrite=True)",
+            "print(f'REMARK VINA RESULT: {score:.3f} 0.000 0.000')",
+        ]
+    )
+
+
 def _grid_args(request: DockingToolRequest) -> list[str]:
     if not _is_vector3(request.grid_center) or not _is_vector3(request.grid_size):
         return []
@@ -466,23 +663,40 @@ def _grid_args(request: DockingToolRequest) -> list[str]:
 
 
 def _first_mode_values(stdout: str) -> dict[str, float] | None:
+    row_pattern = re.compile(
+        rf"^\s*(\d{{1,3}})\s+\|?\s*({_FLOAT_PATTERN})"
+        rf"(?:\s+\|?\s*({_FLOAT_PATTERN}))?"
+        rf"(?:\s+\|?\s*({_FLOAT_PATTERN}))?"
+    )
     for line in stdout.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("-") or stripped.lower().startswith("mode"):
             continue
-        values = [float(value) for value in re.findall(_FLOAT_PATTERN, stripped)]
-        if len(values) >= 2 and int(values[0]) == values[0] and values[0] > 0:
-            result = {"affinity": values[1]}
-            if len(values) >= 3:
-                result["cnn_score"] = values[2]
-            if len(values) >= 4:
-                result["cnn_affinity"] = values[3]
-            return result
+        match = row_pattern.match(stripped)
+        if not match:
+            continue
+        mode = int(match.group(1))
+        affinity = _valid_affinity(float(match.group(2)))
+        if mode <= 0 or mode > 100 or affinity is None:
+            continue
+        result = {"affinity": affinity}
+        if match.group(3) is not None:
+            cnn_score = _valid_cnn_score(float(match.group(3)))
+            if cnn_score is not None:
+                result["cnn_score"] = cnn_score
+        if match.group(4) is not None:
+            cnn_affinity = _valid_affinity(float(match.group(4)))
+            if cnn_affinity is not None:
+                result["cnn_affinity"] = cnn_affinity
+        return result
     return None
 
 
 def _find_named_float(stdout: str, label: str) -> float | None:
-    pattern = re.compile(rf"{re.escape(label)}\s*[:=]\s*({_FLOAT_PATTERN})", re.IGNORECASE)
+    pattern = re.compile(
+        rf"(?<![A-Za-z]){re.escape(label)}(?![A-Za-z])\s*[:=]\s*({_FLOAT_PATTERN})",
+        re.IGNORECASE,
+    )
     match = pattern.search(stdout)
     return float(match.group(1)) if match else None
 
@@ -491,6 +705,18 @@ def _find_remark_vina_score(stdout: str) -> float | None:
     pattern = re.compile(rf"REMARK\s+VINA\s+RESULT:\s*({_FLOAT_PATTERN})", re.IGNORECASE)
     match = pattern.search(stdout)
     return float(match.group(1)) if match else None
+
+
+def _valid_affinity(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value if -50.0 <= value <= 50.0 else None
+
+
+def _valid_cnn_score(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value if 0.0 <= value <= 1.0 else None
 
 
 def _tool_warnings(
@@ -516,6 +742,30 @@ def _result_labels(tool_name: str, success: bool) -> list[str]:
 
 def _has_receptor_ligand_pair(request: DockingToolRequest) -> bool:
     return bool(request.receptor_file and request.ligand_file)
+
+
+def _has_vina_prepared_pair(request: DockingToolRequest) -> bool:
+    return bool(
+        _has_receptor_ligand_pair(request)
+        and request.receptor_file.lower().endswith(".pdbqt")
+        and request.ligand_file.lower().endswith(".pdbqt")
+    )
+
+
+def _first_existing_docker_image(images: list[str | None]) -> str | None:
+    for image in dict.fromkeys(image for image in images if image):
+        try:
+            proc = subprocess.run(
+                ["docker", "image", "inspect", image],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode == 0:
+            return image
+    return None
 
 
 def _is_vector3(values: list[float] | None) -> bool:

@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 from sqlalchemy.orm import Session
 
@@ -138,11 +140,15 @@ def receptor_preparation_tool_status() -> dict[str, Any]:
 
 def binding_site_to_payload(site: BindingSite) -> dict[str, Any]:
     preparation_json = site.preparation_json or {}
+    grid_box = site.grid_box or {}
     return {
         "binding_site_id": site.binding_site_id,
         "project_id": site.project_id,
         "target_id": site.target_id,
         "pdb_id": site.pdb_id,
+        "site_name": grid_box.get("site_name"),
+        "reference_ligand": grid_box.get("reference_ligand"),
+        "source_url": grid_box.get("source_url"),
         "source_file_id": site.source_file_id,
         "receptor_file": site.receptor_file,
         "prepared_receptor_file": site.prepared_receptor_file,
@@ -160,7 +166,46 @@ def resolve_receptor_path(receptor_reference: str | None) -> str | None:
         return None
     if receptor_reference.startswith("local://"):
         return receptor_reference.removeprefix("local://")
+    if receptor_reference.startswith(("http://", "https://")):
+        cached_path = _resolve_remote_receptor_path(receptor_reference)
+        return str(cached_path) if cached_path is not None else receptor_reference
     return receptor_reference
+
+
+def _resolve_remote_receptor_path(receptor_reference: str) -> Path | None:
+    pdb_id = _extract_rcsb_pdb_id(receptor_reference)
+    if not pdb_id:
+        return None
+    cache_dir = Path(".local") / "receptors" / "rcsb"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{pdb_id}.pdb"
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        return cache_path
+
+    download_url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+    try:
+        with urlopen(download_url, timeout=30) as response:
+            payload = response.read()
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return None
+    if not payload or b"ATOM" not in payload and b"HETATM" not in payload:
+        return None
+    cache_path.write_bytes(payload)
+    return cache_path
+
+
+def _extract_rcsb_pdb_id(receptor_reference: str) -> str | None:
+    cleaned = receptor_reference.strip().rstrip("/")
+    if "rcsb.org/structure/" in cleaned:
+        pdb_id = cleaned.rsplit("/", 1)[-1]
+    elif "files.rcsb.org/download/" in cleaned:
+        pdb_id = Path(cleaned.rsplit("/", 1)[-1]).stem
+    else:
+        return None
+    pdb_id = pdb_id.upper()
+    if len(pdb_id) == 4 and pdb_id.isalnum():
+        return pdb_id
+    return None
 
 
 def _resolve_source_receptor(

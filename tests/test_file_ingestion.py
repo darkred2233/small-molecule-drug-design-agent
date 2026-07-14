@@ -14,14 +14,22 @@ def make_client(tmp_path):
     return TestClient(app)
 
 
-def create_project(client: TestClient) -> str:
+def create_project(
+    client: TestClient,
+    target_id: str | None = None,
+    target_name: str | None = None,
+) -> str:
+    payload = {
+        "name": "EGFR upload parsing",
+        "target_id": target_id,
+        "objective": "parse uploaded seed ligands",
+    }
+    if target_name is not None:
+        payload["target_name"] = target_name
+
     response = client.post(
         "/projects",
-        json={
-            "name": "EGFR upload parsing",
-            "target_id": "TGT-EGFR",
-            "objective": "parse uploaded seed ligands",
-        },
+        json=payload,
     )
     assert response.status_code == 201
     return response.json()["project_id"]
@@ -85,7 +93,7 @@ def test_upload_pdb_file_records_structure_summary(tmp_path):
     pdb_payload = b"""HEADER    TEST PDB\nTITLE     EGFR TEST STRUCTURE\nATOM      1  N   MET A   1      11.104  13.207  14.099  1.00 10.00           N\nATOM      2  CA  MET A   1      12.560  13.211  14.099  1.00 10.00           C\nATOM      3  N   GLY B   2      15.104  16.207  12.099  1.00 10.00           N\nEND\n"""
 
     with make_client(tmp_path) as client:
-        project_id = create_project(client)
+        project_id = create_project(client, target_id="TGT-EGFR")
         upload_response = client.post(
             f"/projects/{project_id}/files",
             files={"file": ("target.pdb", pdb_payload, "chemical/x-pdb")},
@@ -100,6 +108,36 @@ def test_upload_pdb_file_records_structure_summary(tmp_path):
         assert result["metadata"]["pdb"]["atom_count"] == 3
         assert result["metadata"]["pdb"]["chain_ids"] == ["A", "B"]
         assert result["metadata"]["binding_site_created"] is True
+
+
+def test_custom_target_upload_pdb_creates_project_binding_site(tmp_path):
+    pdb_payload = b"""HEADER    TEST PDB\nTITLE     MYC TEST STRUCTURE\nATOM      1  N   MET A   1      11.104  13.207  14.099  1.00 10.00           N\nATOM      2  CA  MET A   1      12.560  13.211  14.099  1.00 10.00           C\nEND\n"""
+
+    with make_client(tmp_path) as client:
+        project_id = create_project(client, target_id="CUSTOM-MYC", target_name="MYC")
+
+        builtin_ids = {target["target_id"] for target in client.get("/builtin-targets").json()}
+        assert "CUSTOM-MYC" not in builtin_ids
+
+        upload_response = client.post(
+            f"/projects/{project_id}/files",
+            files={"file": ("myc.pdb", pdb_payload, "chemical/x-pdb")},
+        )
+        file_id = upload_response.json()["file_id"]
+
+        ingest_response = client.post(f"/projects/{project_id}/ingest")
+
+        assert ingest_response.status_code == 202
+        result = client.get(f"/projects/{project_id}/files/{file_id}/parse-result").json()
+        assert result["metadata"]["binding_site_created"] is True
+
+        sites_response = client.get(f"/projects/{project_id}/binding-sites")
+        assert sites_response.status_code == 200
+        sites = sites_response.json()
+        assert any(
+            site["project_id"] == project_id and site["target_id"] == "CUSTOM-MYC"
+            for site in sites
+        )
 
 
 def test_project_files_endpoint_lists_uploads(tmp_path):

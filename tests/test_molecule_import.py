@@ -19,7 +19,6 @@ def create_project_with_seed_file(client: TestClient) -> str:
         "/projects",
         json={
             "name": "Seed molecule import",
-            "target_id": "TGT-EGFR",
             "objective": "import parsed seed ligands into molecule table",
         },
     )

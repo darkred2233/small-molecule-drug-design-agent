@@ -10,7 +10,7 @@ from medagent.data.seed_catalog import TARGET_CATALOG
 
 PUBCHEM_PROPERTY_URL = (
     "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
-    "{name}/property/CanonicalSMILES,IsomericSMILES,InChIKey/JSON"
+    "{name}/property/SMILES,ConnectivitySMILES,CanonicalSMILES,IsomericSMILES,InChIKey/JSON"
 )
 
 
@@ -20,10 +20,16 @@ def fetch_pubchem_properties(drug_name: str) -> dict:
     with urllib.request.urlopen(url, timeout=20) as response:
         payload = json.loads(response.read().decode("utf-8"))
     properties = payload["PropertyTable"]["Properties"][0]
+    canonical_smiles = (
+        properties.get("CanonicalSMILES")
+        or properties.get("ConnectivitySMILES")
+        or properties.get("SMILES")
+    )
+    isomeric_smiles = properties.get("IsomericSMILES") or properties.get("SMILES") or canonical_smiles
     return {
         "pubchem_cid": properties.get("CID"),
-        "canonical_smiles": properties.get("CanonicalSMILES"),
-        "isomeric_smiles": properties.get("IsomericSMILES"),
+        "canonical_smiles": canonical_smiles,
+        "isomeric_smiles": isomeric_smiles,
         "inchi_key": properties.get("InChIKey"),
         "external_refs": {"pubchem": f"https://pubchem.ncbi.nlm.nih.gov/compound/{properties.get('CID')}"},
     }

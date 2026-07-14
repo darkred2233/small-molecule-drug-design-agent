@@ -7,8 +7,13 @@ from pydantic import BaseModel, Field
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200, title="项目名称")
     target_id: str | None = Field(default=None, title="靶点编号")
+    target_name: str | None = Field(default=None, title="自定义靶点名称")
     objective: str | None = Field(default=None, title="项目目标")
     constraints: dict[str, Any] = Field(default_factory=dict, title="初始约束")
+    generation_config: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Initial molecule generation and ranking configuration",
+    )
 
 
 class ProjectRead(BaseModel):
@@ -60,6 +65,11 @@ class BuiltinTargetRead(BaseModel):
     species: str | None = Field(title="物种")
     pdb_ids: list[str] = Field(title="代表 PDB")
     summary: str | None = Field(title="靶点摘要")
+    pocket_summary: str | None = Field(default=None, title="口袋摘要")
+    binding_sites: list[dict[str, Any]] = Field(default_factory=list, title="结构化口袋")
+    sar_rules: list[dict[str, Any]] = Field(default_factory=list, title="结构化 SAR 规则")
+    admet_risks: list[dict[str, Any]] = Field(default_factory=list, title="结构化 ADMET 风险")
+    seed_ligand_count: int = Field(default=0, title="种子配体数量")
     drugs: list[BuiltinDrugRead] = Field(default_factory=list, title="代表药物")
 
 
@@ -183,6 +193,9 @@ class BindingSiteRead(BaseModel):
     project_id: str | None = Field(title="Project id")
     target_id: str = Field(title="Target id")
     pdb_id: str | None = Field(title="PDB id")
+    site_name: str | None = Field(default=None, title="Site name")
+    reference_ligand: str | None = Field(default=None, title="Reference ligand")
+    source_url: str | None = Field(default=None, title="Source URL")
     source_file_id: str | None = Field(title="Source file id")
     receptor_file: str | None = Field(title="Stored receptor file")
     prepared_receptor_file: str | None = Field(title="Prepared receptor file")
@@ -219,6 +232,10 @@ class ProjectStatus(BaseModel):
 
 class RunPipelineRequest(BaseModel):
     mode: Literal["dry_run", "full"] = Field(default="dry_run", title="运行模式")
+    generation_config: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Optional molecule generation and ranking configuration override",
+    )
 
 
 class MoleculeRead(BaseModel):
@@ -243,6 +260,10 @@ class MoleculeGenerationRequest(BaseModel):
     strategies: list[Literal["reinvent4", "crem", "autogrow4"]] = Field(
         default_factory=lambda: ["reinvent4", "crem", "autogrow4"],
         title="Generation strategies",
+    )
+    strategy_counts: dict[str, int] = Field(
+        default_factory=dict,
+        title="Per-strategy requested molecule count",
     )
     constraints: dict[str, Any] = Field(default_factory=dict, title="Generation constraints")
     include_target_library_seeds: bool = Field(
@@ -310,10 +331,12 @@ class RuleFilterResponse(BaseModel):
     evaluated_count: int = Field(title="Evaluated molecule count")
     passed_count: int = Field(title="Passed molecule count")
     failed_count: int = Field(title="Failed molecule count")
+    warning_count: int = Field(default=0, title="Warning-pass molecule count")
     skipped_count: int = Field(title="Skipped molecule count")
     result_ids: list[str] = Field(title="Rule filter result ids")
     passed_molecule_ids: list[str] = Field(title="Passed molecule ids")
     failed_molecule_ids: list[str] = Field(title="Failed molecule ids")
+    warning_molecule_ids: list[str] = Field(default_factory=list, title="Warning-pass molecule ids")
     skipped_molecule_ids: list[str] = Field(title="Skipped molecule ids")
 
 
@@ -333,6 +356,17 @@ class RuleFilterResultRead(BaseModel):
 class CandidateAssessmentRunRequest(BaseModel):
     molecule_ids: list[str] | None = Field(default=None, title="Molecule ids to evaluate")
     max_molecules: int = Field(default=50, ge=1, le=500, title="Maximum molecules to evaluate")
+    top_n: int | None = Field(default=None, ge=1, le=500, title="Maximum rankings to store")
+    assessment_mode: Literal["fast", "external", "full"] = Field(
+        default="external",
+        title="Candidate assessment mode",
+    )
+    external_top_n: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        title="Top-ranked molecules to refine with external tools in external mode",
+    )
     binding_site_id: str | None = Field(default=None, title="Binding site id")
     protein_file: str | None = Field(default=None, title="Prepared receptor/protein file")
     prepared_ligand_files: dict[str, str] = Field(
@@ -376,13 +410,31 @@ class AssessmentStageSummary(BaseModel):
     warnings: list[str] = Field(default_factory=list, title="Warnings")
 
 
+class CoarseScreenSummary(BaseModel):
+    requested_count: int = Field(title="Coarse-screen requested molecule count")
+    passed_count: int = Field(title="Coarse-screen passed molecule count")
+    failed_count: int = Field(title="Coarse-screen failed molecule count")
+    passed_molecule_ids: list[str] = Field(title="Coarse-screen passed molecule ids")
+    failed_molecule_ids: list[str] = Field(title="Coarse-screen failed molecule ids")
+    failure_reasons_by_id: dict[str, list[str]] = Field(
+        default_factory=dict,
+        title="Coarse-screen failure reasons by molecule id",
+    )
+
+
 class CandidateAssessmentRunResponse(BaseModel):
     project_id: str = Field(title="Project id")
+    assessment_mode: Literal["fast", "external", "full"] = Field(
+        default="external",
+        title="Candidate assessment mode",
+    )
+    external_top_n: int = Field(default=10, title="External refinement top N")
     conformer: AssessmentStageSummary = Field(title="Conformer generation summary")
     docking: AssessmentStageSummary = Field(title="Docking summary")
     admet: AssessmentStageSummary = Field(title="ADMET summary")
     synthesis: AssessmentStageSummary = Field(title="Synthesis summary")
     ranking: AssessmentStageSummary = Field(title="Candidate ranking summary")
+    coarse_screen: CoarseScreenSummary = Field(title="Coarse-screen summary")
     tool_status: dict[str, Any] = Field(title="Candidate assessment tool status")
 
 
