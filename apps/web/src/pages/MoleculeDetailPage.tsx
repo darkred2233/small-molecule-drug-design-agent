@@ -7,13 +7,14 @@
 import { useParams, Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { assessmentApi, moleculesApi } from '@/api';
-import { ArrowLeft, Copy, Download, FlaskConical, Route } from 'lucide-react';
+import { API_BASE_URL } from '@/api/client';
+import { ArrowLeft, BookOpen, Copy, Crosshair, Download, FlaskConical, Route } from 'lucide-react';
 import { formatNumber, getStatusColor, copyToClipboard } from '@/utils/helpers';
 import MoleculeStructure from '@/components/MoleculeStructure';
 import DecisionCard from '@/components/DecisionCard';
 import ReasoningTracePanel from '@/components/ReasoningTracePanel';
 import { cn } from '@/utils/helpers';
-import type { SynthesisRoute } from '@/types/api';
+import type { DockingResult, EvidenceLink, SynthesisRoute } from '@/types/api';
 
 export default function MoleculeDetailPage() {
   const { projectId, moleculeId } = useParams();
@@ -41,6 +42,18 @@ export default function MoleculeDetailPage() {
     enabled: !!molecule,
   });
 
+  const { data: dockingResults } = useQuery({
+    queryKey: ['docking-results', projectId],
+    queryFn: () => assessmentApi.getDockingResults(projectId!),
+    enabled: !!molecule,
+  });
+
+  const { data: evidenceLinks } = useQuery({
+    queryKey: ['evidence-links', projectId],
+    queryFn: () => assessmentApi.getEvidenceLinks(projectId!),
+    enabled: !!molecule,
+  });
+
   if (!molecule) {
     return (
       <div className="app-shell flex h-screen items-center justify-center">
@@ -55,6 +68,8 @@ export default function MoleculeDetailPage() {
     properties?.tool_metadata?.RotB;
   const qed = properties?.tool_metadata?.qed ?? properties?.tool_metadata?.QED;
   const synthesisRoute = synthesisRoutes?.find((route) => route.molecule_id === molecule.molecule_id);
+  const dockingResult = dockingResults?.find((result) => result.molecule_id === molecule.molecule_id);
+  const moleculeEvidence = evidenceLinks?.filter((link) => link.molecule_id === molecule.molecule_id) ?? [];
 
   const handleCopySmiles = () => {
     copyToClipboard(molecule.smiles);
@@ -160,6 +175,12 @@ export default function MoleculeDetailPage() {
               </div>
             )}
 
+            {dockingResult && (
+              <BestPosePanel projectId={projectId!} moleculeId={molecule.molecule_id} result={dockingResult} />
+            )}
+
+            {moleculeEvidence.length > 0 && <EvidencePanel evidenceLinks={moleculeEvidence} />}
+
             {synthesisRoute && <SynthesisRoutePanel route={synthesisRoute} />}
           </div>
 
@@ -168,6 +189,105 @@ export default function MoleculeDetailPage() {
           </div>
         </div>
       </main>
+    </div>
+  );
+}
+
+function BestPosePanel({
+  projectId,
+  moleculeId,
+  result,
+}: {
+  projectId: string;
+  moleculeId: string;
+  result: DockingResult;
+}) {
+  const rawOutput = result.raw_output ?? {};
+  const poseUrl = `${API_BASE_URL}/projects/${encodeURIComponent(projectId)}/molecules/${encodeURIComponent(
+    moleculeId
+  )}/docking/pose`;
+
+  return (
+    <div className="science-card">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Crosshair className="h-4 w-4 text-cyan-700" />
+          <h2 className="text-sm font-semibold text-slate-950">最佳 Pose</h2>
+        </div>
+        {result.pose_file && (
+          <a
+            href={poseUrl}
+            className="inline-flex items-center gap-1 rounded-md border border-cyan-200 px-2.5 py-1 text-xs font-medium text-cyan-800 hover:bg-cyan-50"
+          >
+            <Download className="h-3.5 w-3.5" />
+            Pose
+          </a>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-3">
+        <Property label="Vina" value={formatNumber(result.vina_score ?? result.docking_score ?? null)} />
+        <Property label="CNN" value={formatNumber(result.cnn_score ?? null, 3)} />
+        <Property label="DiffDock" value={formatNumber(result.diffdock_confidence ?? null, 3)} />
+        <Property label="H-bonds" value={result.key_hbond_count ?? '-'} />
+        <Property label="Clashes" value={result.clash_count ?? '-'} />
+        <Property label="Pose Rank" value={rawOutput.selected_pose_rank ?? '-'} />
+      </div>
+
+      <div className="mt-3 grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
+        {rawOutput.pose_count !== undefined && <div>Pose 数量：{String(rawOutput.pose_count)}</div>}
+        {rawOutput.pose_selection_method && <div>选择方式：{String(rawOutput.pose_selection_method)}</div>}
+        {rawOutput.best_pose_confirmed !== undefined && (
+          <div>确认状态：{rawOutput.best_pose_confirmed ? '已确认' : '未确认'}</div>
+        )}
+        {result.labels && result.labels.length > 0 && <div>标签：{result.labels.join(', ')}</div>}
+      </div>
+    </div>
+  );
+}
+
+function EvidencePanel({ evidenceLinks }: { evidenceLinks: EvidenceLink[] }) {
+  return (
+    <div className="science-card">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <BookOpen className="h-4 w-4 text-cyan-700" />
+          <h2 className="text-sm font-semibold text-slate-950">文献证据</h2>
+        </div>
+        <span className="chem-badge">{evidenceLinks.length} 条</span>
+      </div>
+
+      <div className="space-y-3">
+        {evidenceLinks.slice(0, 6).map((evidence) => (
+          <div key={evidence.evidence_id} className="rounded-lg border border-cyan-100 bg-cyan-50/40 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-xs font-semibold text-cyan-900">
+                {evidence.document_title || evidence.claim_type}
+              </div>
+              {evidence.confidence != null && (
+                <span className="rounded-full bg-white px-2 py-0.5 text-[11px] text-slate-600">
+                  conf {formatNumber(evidence.confidence, 2)}
+                </span>
+              )}
+            </div>
+            {(evidence.source || evidence.section || evidence.page_number != null) && (
+              <div className="mt-1 text-[11px] text-slate-500">
+                {[evidence.source, evidence.section, evidence.page_number != null ? `p.${evidence.page_number}` : '']
+                  .filter(Boolean)
+                  .join(' · ')}
+              </div>
+            )}
+            {evidence.rationale && (
+              <p className="mt-2 text-xs leading-5 text-slate-700">{evidence.rationale}</p>
+            )}
+            {evidence.content && (
+              <p className="mt-2 max-h-28 overflow-y-auto rounded border border-white bg-white/80 p-2 text-xs leading-5 text-slate-600">
+                {evidence.content}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -7,6 +7,10 @@ ARG TORCH_WHEEL_FILENAME=torch-1.13.1+cu117-cp39-cp39-linux_x86_64.whl
 ARG CONDA_FORGE_CHANNEL=https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
+LABEL org.opencontainers.image.source="https://github.com/gcorso/DiffDock" \
+      org.opencontainers.image.version="${DIFFDOCK_REF}" \
+      org.opencontainers.image.revision="${DIFFDOCK_REF}"
+
 ENV DEBIAN_FRONTEND=noninteractive \
     MAMBA_ROOT_PREFIX=/opt/micromamba \
     PATH=/opt/micromamba/envs/diffdock/bin:/usr/local/bin:${PATH} \
@@ -131,6 +135,9 @@ RUN --mount=type=cache,target=/opt/micromamba/pkgs,sharing=locked \
         requests
 
 RUN micromamba run -n diffdock python utils/precompute_series.py
+# Model weights are intentionally not baked into the image. Production runs
+# mount the upstream score/confidence model directories read-only; availability
+# checks require both model_parameters.yml and the exact pinned checkpoint name.
 RUN mkdir -p /data/input /data/output
 
 ENTRYPOINT ["micromamba", "run", "-n", "diffdock", "python"]

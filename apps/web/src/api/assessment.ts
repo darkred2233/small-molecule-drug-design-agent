@@ -10,6 +10,8 @@ import type {
   ReasoningTrace,
   AdvisorSuggestion,
   OptimizationConstraint,
+  DockingResult,
+  EvidenceLink,
   SynthesisRoute,
 } from '@/types/api';
 
@@ -38,6 +40,14 @@ export const assessmentApi = {
   // Get synthesis route assessments
   getSynthesisRoutes: (projectId: string) =>
     apiClient.get<SynthesisRoute[]>(`/projects/${projectId}/synthesis-routes`),
+
+  // Get docking pose assessments
+  getDockingResults: (projectId: string) =>
+    apiClient.get<DockingResult[]>(`/projects/${projectId}/docking-results`),
+
+  // Get project evidence links
+  getEvidenceLinks: (projectId: string) =>
+    apiClient.get<EvidenceLink[]>(`/projects/${projectId}/evidence-links`),
 
   // Generate rankings
   generateRankings: (projectId: string, topN = 50) =>

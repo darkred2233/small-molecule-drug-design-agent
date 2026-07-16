@@ -1,6 +1,6 @@
 # AutoGrow4适配器开发文档
 
-日期：2026-07-09
+初始日期：2026-07-09；工具链加固：2026-07-16
 
 范围：接入AutoGrow4进行遗传算法引导的分子生成，支持docking引导的优化。
 
@@ -21,9 +21,11 @@
 实现后，系统可以：
 
 - 使用AutoGrow4进行遗传算法式分子优化
-- 支持MCTS和遗传算法两种优化模式
 - 使用docking score引导分子进化
 - 自动检测AutoGrow4可用性（本地/Docker）
+- 使用上游正式的 `-j config.json` 入口，不把配置字段误当成独立 CLI 参数
+- 当前只声明支持遗传算法模式；MCTS 不属于本适配器已经实现的能力
+- 只有成功退出、生成分子且解析到 ranked fitness/docking 数值时才向上层报告成功
 
 ## 2. AutoGrow4 vs RDKit代理
 
@@ -33,7 +35,7 @@
 | Docking引导 | 无 | 有 |
 | 优化能力 | 无 | 多代进化 |
 | 速度 | 快 | 较慢 |
-| 依赖 | RDKit | OpenBabel + RDKit |
+| 依赖 | RDKit | AutoGrow4 + Vina + Open Babel + RDKit |
 
 ## 3. 新增文件与修改文件
 
@@ -47,17 +49,14 @@
 
 ## 4. 优化模式
 
-### 4.1 MCTS模式
-蒙特卡洛树搜索，适合探索化学空间。
-
-### 4.2 Genetic模式
-遗传算法，适合优化已知活性分子。
+当前适配器只支持 AutoGrow4 的遗传算法流程。请求中的 `optimization_mode` 必须为 `genetic`；其他值会显式失败并触发既有 surrogate 回退，避免把未实现的模式标记为已经运行。
 
 ## 5. 输入输出
 
 ### 5.1 输入
 - 种子SMILES文件
 - 蛋白受体PDB文件
+- docking grid center 和 size
 - 优化参数
 
 ### 5.2 输出

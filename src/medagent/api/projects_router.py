@@ -6,9 +6,14 @@ from medagent.configs.settings import get_settings
 from medagent.db.models import Molecule, Project
 from medagent.db.session import get_db
 from medagent.domain.schemas import ProjectCreate, ProjectRead
-from medagent.services.bootstrap import ensure_project_target, seed_project_target_ligands
+from medagent.services.bootstrap import (
+    create_project_seed_ligands,
+    ensure_project_target,
+    seed_project_target_ligands,
+)
 from medagent.services.ids import new_id
 from medagent.services.project_deletion import cleanup_project_artifacts, delete_project_data
+from medagent.services.run_plan import ensure_project_run_plan
 
 router = APIRouter(prefix="/projects", tags=["项目管理"])
 
@@ -37,10 +42,14 @@ def create_project(
         constraints_json=constraints_json,
         status="created",
     )
+    ensure_project_run_plan(new_project)
 
     db.add(new_project)
     db.flush()
-    seed_project_target_ligands(db, new_project)
+    if payload.seed_ligands:
+        create_project_seed_ligands(db, new_project, payload.seed_ligands)
+    else:
+        seed_project_target_ligands(db, new_project)
     db.commit()
     db.refresh(new_project)
 

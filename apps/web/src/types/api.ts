@@ -10,7 +10,14 @@ export interface Project {
   name: string;
   target_id: string | null;
   objective: string | null;
-  status: 'created' | 'pipeline_queued' | 'pipeline_running' | 'pipeline_completed' | 'pipeline_failed';
+  status:
+    | 'created'
+    | 'pipeline_queued'
+    | 'pipeline_running'
+    | 'pipeline_completed'
+    | 'pipeline_failed'
+    | 'iterative_running'
+    | 'iterative_completed';
   created_at: string;
   updated_at?: string;
 }
@@ -21,7 +28,17 @@ export interface CreateProjectRequest {
   target_name?: string;
   objective?: string;
   constraints?: Record<string, any>;
+  seed_ligands?: SeedLigandInput[];
   generation_config?: GenerationConfig;
+}
+
+export interface SeedLigandInput {
+  name?: string | null;
+  smiles: string;
+  source?: string | null;
+  activity_value?: number | null;
+  activity_unit?: string | null;
+  activity_type?: string | null;
 }
 
 export interface GenerationConfig {
@@ -115,10 +132,78 @@ export interface ChatRequest {
   message: string;
 }
 
+export type AgentName = 'reinvent4' | 'crem' | 'autogrow4';
+export type AgentBudget = 'low' | 'medium' | 'high';
+export type AgentEnabled = boolean | 'conditional';
+export type RunPlanStatus = 'draft' | 'approved' | 'running' | 'completed' | 'failed';
+export type ExplorationLevel = 'low' | 'medium' | 'high';
+export type SynthesisRouteScope = 'disabled' | 'every_round_top_n' | 'final_round_top_n';
+
+export interface RunPlanAgentConfig {
+  enabled: AgentEnabled;
+  role: string;
+  budget: AgentBudget;
+  requested_count: number;
+  condition?: string | null;
+}
+
+export interface RunPlanEvaluation {
+  mode: 'fast' | 'external_top_n' | 'full';
+  top_n: number;
+  use_docking: boolean;
+  use_admet: boolean;
+  use_synthesis: boolean;
+  synthesis_route_scope: SynthesisRouteScope;
+  use_filters: boolean;
+}
+
+export interface RunPlanStopping {
+  min_score_improvement: number;
+  max_total_molecules: number;
+  max_tool_failures: number;
+}
+
+export interface RunPlan {
+  status: RunPlanStatus;
+  objective: string;
+  auto_run: boolean;
+  max_rounds: number;
+  next_round_seed_count: number;
+  seed_smiles: string[];
+  exploration_level: ExplorationLevel;
+  agents: Record<AgentName, RunPlanAgentConfig>;
+  constraints: Record<string, any>;
+  evaluation: RunPlanEvaluation;
+  stopping: RunPlanStopping;
+  decision_trace: Array<Record<string, any>>;
+  evidence_chain: Array<Record<string, any>>;
+  warnings: string[];
+}
+
+export interface RunPlanChange {
+  path: string;
+  old_value: any;
+  new_value: any;
+  affects_next_round: boolean;
+}
+
+export interface RunPlanPatch {
+  reason: string;
+  changes: RunPlanChange[];
+  requires_confirmation: boolean;
+  warnings: string[];
+}
+
 export interface ChatResponse {
   reply: string;
   intent: string;
   created_constraints: string[];
+  run_plan?: RunPlan | null;
+  plan_patch?: RunPlanPatch | null;
+  plan_diff: RunPlanChange[];
+  suggested_execution: boolean;
+  requires_confirmation: boolean;
+  warnings: string[];
 }
 
 // Constraint types
@@ -180,6 +265,11 @@ export interface EvidenceLink {
   claim_type: string;
   confidence: number | null;
   rationale: string | null;
+  document_title?: string | null;
+  source?: string | null;
+  page_number?: number | null;
+  section?: string | null;
+  content?: string | null;
 }
 
 export interface RagQueryRequest {
@@ -312,10 +402,16 @@ export interface CandidateAssessmentRunResponse {
 }
 
 export interface DockingResult {
-  docking_score?: number;
-  cnn_score?: number;
-  diffdock_confidence?: number;
-  pose_file?: string;
+  molecule_id: string;
+  vina_score?: number | null;
+  docking_score?: number | null;
+  cnn_score?: number | null;
+  diffdock_confidence?: number | null;
+  key_hbond_count?: number | null;
+  clash_count?: number | null;
+  pose_file?: string | null;
+  labels?: string[];
+  raw_output?: Record<string, any>;
   key_interactions?: string[];
 }
 
@@ -411,6 +507,7 @@ export interface AgentRun {
   model_name: string | null;
   status: string;
   iteration?: number | null;
+  input_json?: Record<string, any>;
   output_json?: Record<string, any>;
   started_at?: string;
   ended_at?: string;
@@ -453,6 +550,8 @@ export interface ProjectReport {
   admet_overview?: AdmetOverview;
   synthesis_overview?: SynthesisOverview;
   top_candidates: ReportCandidate[];
+  molecule_narratives?: MoleculeNarrative[];
+  final_report?: FinalChineseReport;
   self_refutation?: {
     critique_count: number;
     risk_counts?: Record<string, number>;
@@ -656,6 +755,52 @@ export interface ReportCandidate {
   synthesis?: SynthesisSummary | null;
   evidence_chain?: ReportEvidenceLink[];
   refutation_chain?: Record<string, any> | null;
+  narrative?: MoleculeNarrative;
+}
+
+export interface MoleculeNarrative {
+  molecule_id: string;
+  rank?: number | null;
+  summary: string;
+  why_it_matters?: string;
+  structure_change?: string;
+  strengths: string[];
+  risks: string[];
+  next_round_suggestions: string[];
+  evidence_refs: NarrativeEvidenceRef[];
+  provenance?: Record<string, any>;
+}
+
+export interface NarrativeEvidenceRef {
+  type: string;
+  source?: string | null;
+  molecule_id?: string | null;
+  summary?: string | null;
+  artifact_path?: string | null;
+  score?: number | string | null;
+  metadata?: Record<string, any>;
+}
+
+export interface FinalChineseReport {
+  title: string;
+  language?: string;
+  generation_mode?: string;
+  schema_version?: string;
+  generated_at?: string;
+  project_objective?: string | null;
+  executive_summary: string[];
+  run_plan_summary?: Record<string, any>;
+  round_summaries?: Array<Record<string, any>>;
+  top_molecules?: Array<Record<string, any>>;
+  sar_summary?: Record<string, any>;
+  docking_summary?: Record<string, any>;
+  admet_summary?: Record<string, any>;
+  synthesis_summary?: Record<string, any>;
+  rag_evidence_summary?: Record<string, any>;
+  failures_and_uncertainties?: string[];
+  next_steps?: string[];
+  citations?: Array<Record<string, any>>;
+  provenance?: Record<string, any>;
 }
 
 export interface ReportEvidenceLink {

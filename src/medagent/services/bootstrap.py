@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 
 from medagent.data.builtin_targets import load_builtin_targets
 from medagent.db.models import BindingSite, Project, SeedLigand, Target, TargetDrugLibrary
+from medagent.domain.schemas import SeedLigandInput
 from medagent.services.ids import new_id
 
 
@@ -88,6 +89,57 @@ def seed_project_target_ligands(db: Session, project: Project) -> dict:
             activity_unit=None,
             activity_type=None,
             source=_seed_source(drug),
+        )
+        db.add(seed)
+        db.flush()
+        created_ids.append(seed.ligand_id)
+
+    return {
+        "created_count": len(created_ids),
+        "skipped_count": skipped_count,
+        "seed_ligand_ids": created_ids,
+    }
+
+
+def create_project_seed_ligands(
+    db: Session,
+    project: Project,
+    seed_ligands: list[SeedLigandInput],
+) -> dict:
+    created_ids: list[str] = []
+    skipped_count = 0
+    seen_smiles: set[str] = set()
+
+    for index, payload in enumerate(seed_ligands, start=1):
+        smiles = payload.smiles.strip()
+        if not smiles:
+            skipped_count += 1
+            continue
+        normalized_name = (payload.name or f"seed-{index}").strip() or f"seed-{index}"
+        dedupe_key = smiles.lower()
+        if dedupe_key in seen_smiles:
+            skipped_count += 1
+            continue
+        seen_smiles.add(dedupe_key)
+        exists = (
+            db.query(SeedLigand)
+            .filter_by(project_id=project.project_id, smiles=smiles)
+            .one_or_none()
+        )
+        if exists is not None:
+            skipped_count += 1
+            continue
+
+        seed = SeedLigand(
+            ligand_id=new_id("LIG"),
+            project_id=project.project_id,
+            target_id=project.target_id,
+            name=normalized_name,
+            smiles=smiles,
+            activity_value=payload.activity_value,
+            activity_unit=payload.activity_unit,
+            activity_type=payload.activity_type,
+            source=payload.source or "project_setup",
         )
         db.add(seed)
         db.flush()

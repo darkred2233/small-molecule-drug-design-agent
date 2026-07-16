@@ -17,6 +17,14 @@ services:
       REINVENT4_PRIOR_FILE: ${REINVENT4_PRIOR_FILE:-/app/.local/models/reinvent4/reinvent_pubchem.prior}
       DIFFDOCK_MODEL_DIR: ${DIFFDOCK_MODEL_DIR:-/app/.local/models/diffdock/score_model}
       DIFFDOCK_CONFIDENCE_MODEL_DIR: ${DIFFDOCK_CONFIDENCE_MODEL_DIR:-/app/.local/models/diffdock/confidence_model}
+      MEDAGENT_TOOLS_CONFIG: /app/configs/tools.yaml
+      MEDAGENT_GNINA_IMAGE: ${GNINA_IMAGE:-gnina/gnina:latest}
+      MEDAGENT_DIFFDOCK_IMAGE: ${DIFFDOCK_IMAGE:-diffdock:latest}
+      MEDAGENT_REINVENT4_IMAGE: ${REINVENT4_IMAGE:-reinvent4:latest}
+      MEDAGENT_AUTOGROW4_IMAGE: ${AUTOGROW4_IMAGE:-autogrow4:latest}
+      MEDAGENT_DIFFDOCK_TIMEOUT_SECONDS: ${DIFFDOCK_TIMEOUT_SECONDS:-900}
+      MEDAGENT_REINVENT4_TIMEOUT_SECONDS: ${REINVENT4_TIMEOUT_SECONDS:-600}
+      MEDAGENT_AUTOGROW4_TIMEOUT_SECONDS: ${AUTOGROW4_TIMEOUT_SECONDS:-1200}
       MEDAGENT_DOCKER_WORK_ROOT: /app/.local/tool-runs
       AIZYNTHFINDER_CONFIG: ${AIZYNTHFINDER_CONFIG:-/app/data/aizynthfinder/config.yml}
       MEDAGENT_AIZYNTHFINDER_DATA_DIR: ${MEDAGENT_AIZYNTHFINDER_DATA_DIR:-/app/data/aizynthfinder}
@@ -137,7 +145,7 @@ services:
 
   # DiffDock pose prediction service
   diffdock:
-    image: diffdock:latest
+    image: ${DIFFDOCK_IMAGE:-diffdock:latest}
     build: docker/diffdock
     deploy:
       resources:
@@ -148,13 +156,13 @@ services:
               capabilities: [gpu]
     volumes:
       - ./data/poses:/data/output
-    command: ["--help"]
+    command: ["/app/diffdock/inference.py", "--help"]
     profiles:
       - tools
 
   # REINVENT4 molecule generation service
   reinvent4:
-    image: reinvent4:latest
+    image: ${REINVENT4_IMAGE:-reinvent4:latest}
     build: docker/reinvent4
     deploy:
       resources:
@@ -171,11 +179,14 @@ services:
 
   # AutoGrow4 molecule generation service
   autogrow4:
-    image: autogrow4:latest
-    build: docker/autogrow4
+    image: ${AUTOGROW4_IMAGE:-autogrow4:latest}
+    build:
+      context: docker/autogrow4
+      args:
+        AUTOGROW4_REF: ${AUTOGROW4_REF:-1b47b3fe2d9faa76a904533bea2312326a3f44c5}
     volumes:
       - ./data/generated:/data/output
-    command: ["--help"]
+    command: ["-m", "autogrow4", "--help"]
     profiles:
       - tools
 

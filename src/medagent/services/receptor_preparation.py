@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -105,15 +106,24 @@ def prepare_project_receptor(
 
 
 def list_project_binding_sites(db: Session, project: Project) -> list[BindingSite]:
-    return (
+    project_sites = (
         db.query(BindingSite)
-        .filter(
-            (BindingSite.project_id == project.project_id)
-            | ((BindingSite.project_id.is_(None)) & (BindingSite.target_id == project.target_id))
-        )
+        .filter_by(project_id=project.project_id)
         .order_by(BindingSite.created_at.asc(), BindingSite.id.asc())
         .all()
     )
+    target_sites = (
+        db.query(BindingSite)
+        .filter(BindingSite.project_id.is_(None), BindingSite.target_id == project.target_id)
+        .order_by(BindingSite.created_at.asc(), BindingSite.id.asc())
+        .all()
+        if project.target_id
+        else []
+    )
+    by_id: dict[str, BindingSite] = {}
+    for site in project_sites + target_sites:
+        by_id.setdefault(site.binding_site_id, site)
+    return list(by_id.values())
 
 
 def get_project_binding_site(
@@ -135,6 +145,7 @@ def project_docking_config(
     db: Session,
     project: Project,
     binding_site_id: str | None = None,
+    path_resolver: Callable[[str | None], str | None] | None = None,
 ) -> dict[str, Any]:
     if binding_site_id:
         site = get_project_binding_site(db, project, binding_site_id)
@@ -151,9 +162,10 @@ def project_docking_config(
         or grid_box.get("prepared_receptor_file")
         or grid_box.get("receptor_file")
     )
+    resolver = path_resolver or resolve_receptor_path
     return {
         "binding_site_id": site.binding_site_id,
-        "protein_file": resolve_receptor_path(receptor_reference),
+        "protein_file": resolver(receptor_reference),
         "grid_center": grid_box.get("center") or grid_box.get("grid_center"),
         "grid_size": grid_box.get("size") or grid_box.get("grid_size"),
         "key_residues": site.key_residues or [],

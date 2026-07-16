@@ -8,6 +8,10 @@ ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG REINVENT4_REPO=https://github.com/MolecularAI/REINVENT4.git
 ARG REINVENT4_REF=v4.8
 
+LABEL org.opencontainers.image.source="https://github.com/MolecularAI/REINVENT4" \
+      org.opencontainers.image.version="${REINVENT4_REF}" \
+      org.opencontainers.image.revision="${REINVENT4_REF}"
+
 ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_DEFAULT_TIMEOUT=120 \
     PIP_RETRIES=20 \

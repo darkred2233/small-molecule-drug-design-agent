@@ -9,6 +9,7 @@ import type {
   BuiltinTarget,
   BuiltinDrug,
   PipelineStatus,
+  RunPlan,
 } from '@/types/api';
 
 type RawBuiltinDrug = Partial<BuiltinDrug> | null | undefined;
@@ -95,16 +96,18 @@ export const projectsApi = {
   getStatus: (projectId: string) =>
     apiClient.get<PipelineStatus>(`/projects/${projectId}/status`),
 
-  // Run pipeline
-  run: (projectId: string, mode: 'dry_run' | 'full', generationConfig?: Record<string, any>) =>
+  // Get current RunPlan
+  getRunPlan: (projectId: string) =>
+    apiClient.get<RunPlan>(`/projects/${projectId}/run-plan`),
+
+  // Save current RunPlan draft
+  saveRunPlan: (projectId: string, runPlan: RunPlan) =>
+    apiClient.put<RunPlan>(`/projects/${projectId}/run-plan`, runPlan),
+
+  // Run current RunPlan
+  run: (projectId: string, mode: 'iterative', legacyGenerationConfig?: Record<string, any>) =>
     apiClient.post(`/projects/${projectId}/run`, {
       mode,
-      generation_config: generationConfig ?? {},
-    }),
-
-  // Create new round
-  createRound: (projectId: string, generationConfig?: Record<string, any>) =>
-    apiClient.post(`/projects/${projectId}/rounds`, {
-      generation_config: generationConfig ?? {},
+      generation_config: legacyGenerationConfig ?? {},
     }),
 };

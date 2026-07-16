@@ -1,3 +1,4 @@
+import json
 import tomllib
 
 from medagent.services import autogrow4_adapter
@@ -6,7 +7,7 @@ from medagent.services.autogrow4_adapter import AutoGrow4Request
 from medagent.services.reinvent4_adapter import Reinvent4Request
 
 
-def test_autogrow4_docker_command_uses_real_cli_arguments(tmp_path):
+def test_autogrow4_docker_command_uses_json_entrypoint(tmp_path):
     receptor = tmp_path / "protein.pdb"
     output = tmp_path / "output"
     request = AutoGrow4Request(
@@ -21,24 +22,29 @@ def test_autogrow4_docker_command_uses_real_cli_arguments(tmp_path):
         },
     )
 
-    command = autogrow4_adapter._build_autogrow4_command(
+    config_path = tmp_path / "config.json"
+    config = autogrow4_adapter._write_autogrow4_config(
+        config_path,
         request,
         receptor_file="/data/protein.pdb",
         seeds_file="/data/seeds.smi",
         output_dir="/data/output",
-        executable=["-m", "autogrow4"],
         docker=True,
     )
+    command = autogrow4_adapter._build_autogrow4_command(
+        config_file="/data/config.json",
+        executable=["-m", "autogrow4"],
+    )
 
-    assert command[:2] == ["-m", "autogrow4"]
-    assert "--filename_of_receptor" in command
-    assert "--source_compound_file" in command
-    assert "--root_output_folder" in command
-    assert "--receptor" not in command
-    assert command[command.index("--center_z") + 1] == "3.0"
-    assert command[command.index("--size_y") + 1] == "19.0"
-    assert "--number_of_mutants" in command
-    assert "--number_of_crossovers" in command
+    assert command == ["-m", "autogrow4", "-j", "/data/config.json"]
+    assert json.loads(config_path.read_text(encoding="utf-8")) == config
+    assert config["filename_of_receptor"] == "/data/protein.pdb"
+    assert config["source_compound_file"] == "/data/seeds.smi"
+    assert config["root_output_folder"] == "/data/output"
+    assert config["center_z"] == 3.0
+    assert config["size_y"] == 19.0
+    assert config["number_of_mutants"] > 0
+    assert config["number_of_crossovers"] > 0
 
 
 def test_autogrow4_parser_reads_nested_ranked_smi(tmp_path):
@@ -50,6 +56,31 @@ def test_autogrow4_parser_reads_nested_ranked_smi(tmp_path):
 
     assert smiles == ["CCO", "CCN"]
     assert scores == [-7.4, -6.8]
+
+
+def test_autogrow4_parser_uses_highest_numeric_generation(tmp_path):
+    generation_2 = tmp_path / "Run_0" / "generation_2" / "generation_2_ranked.smi"
+    generation_10 = tmp_path / "Run_0" / "generation_10" / "generation_10_ranked.smi"
+    generation_2.parent.mkdir(parents=True)
+    generation_10.parent.mkdir(parents=True)
+    generation_2.write_text("CCO\tligand_1\t-7.4\n", encoding="utf-8")
+    generation_10.write_text("CCN\tligand_2\t-8.1\n", encoding="utf-8")
+
+    smiles, scores = autogrow4_adapter._parse_autogrow4_output(tmp_path)
+
+    assert smiles == ["CCN"]
+    assert scores == [-8.1]
+
+
+def test_autogrow4_parser_keeps_missing_fitness_as_none(tmp_path):
+    ranked = tmp_path / "Run_0" / "generation_1" / "generation_1_ranked.smi"
+    ranked.parent.mkdir(parents=True)
+    ranked.write_text("CCO\tligand_1\n", encoding="utf-8")
+
+    smiles, scores = autogrow4_adapter._parse_autogrow4_output(tmp_path)
+
+    assert smiles == ["CCO"]
+    assert scores == [None]
 
 
 def test_reinvent4_config_uses_real_sampling_schema(tmp_path):
@@ -109,3 +140,13 @@ def test_reinvent4_resolves_prior_from_settings(tmp_path, monkeypatch):
     )
 
     assert reinvent4_adapter._resolve_prior_file() == prior.resolve()
+
+
+def test_reinvent4_parser_keeps_missing_sampling_score_as_none(tmp_path):
+    output = tmp_path / "sampling.csv"
+    output.write_text("SMILES\nCCO\n", encoding="utf-8")
+
+    smiles, scores = reinvent4_adapter._parse_reinvent4_output(output)
+
+    assert smiles == ["CCO"]
+    assert scores == [None]

@@ -7,7 +7,7 @@
 import { create } from 'zustand';
 import type { Project } from '@/types/api';
 
-type RightPanelTab = 'design' | 'overview' | 'molecules' | 'failed' | 'evidence' | 'advisor';
+type RightPanelTab = 'overview' | 'molecules' | 'failed' | 'evidence';
 
 interface WorkspaceState {
   // Current project
@@ -51,7 +51,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
 
   // Right panel
   rightPanelOpen: true,
-  rightPanelTab: 'design',
+  rightPanelTab: 'overview',
   setRightPanelOpen: (open) => set({ rightPanelOpen: open }),
   setRightPanelTab: (tab) => set({ rightPanelTab: tab }),
 

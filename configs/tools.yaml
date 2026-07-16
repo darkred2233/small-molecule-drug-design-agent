@@ -16,13 +16,26 @@ tools:
   diffdock:
     docker_image: diffdock:latest
     timeout_seconds: 900
+    gpu_recommended: true
+    model_env:
+      - DIFFDOCK_MODEL_DIR
+      - DIFFDOCK_CONFIDENCE_MODEL_DIR
   reinvent4:
     command: reinvent
     docker_image: reinvent4:latest
     timeout_seconds: 600
+    run_type: sampling
+    prior_env:
+      - REINVENT4_PRIOR_FILE
+      - MEDAGENT_REINVENT4_PRIOR_FILE
   autogrow4:
     docker_image: autogrow4:latest
     timeout_seconds: 1200
+    source_ref: 1b47b3fe2d9faa76a904533bea2312326a3f44c5
+    requires:
+      - receptor_file
+      - grid_center
+      - grid_size
   aizynthfinder:
     command: aizynthcli
     docker_image: aizynthfinder:latest

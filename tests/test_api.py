@@ -102,7 +102,7 @@ def test_create_project_and_parse_constraints(tmp_path):
         assert chat_response.status_code == 200
         body = chat_response.json()
         assert body["created_constraints"]
-        assert body["intent"] in {"avoid_risk", "keep_scaffold"}
+        assert body["intent"] in {"avoid_risk", "keep_scaffold", "update_run_plan"}
 
         constraints_response = client.get(f"/projects/{project_id}/constraints")
         constraints = constraints_response.json()
@@ -111,6 +111,67 @@ def test_create_project_and_parse_constraints(tmp_path):
             "penalty",
             "protected_motif",
             "editable_region",
+        }
+
+
+def test_chat_returns_run_plan_patch_for_herg_optimization(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post(
+            "/projects",
+            json={"name": "Chat RunPlan", "objective": "优化 EGFR seed"},
+        ).json()["project_id"]
+
+        response = client.post(
+            f"/projects/{project_id}/chat",
+            json={"message": "帮我围绕这个 seed 自动优化三轮，优先降低 hERG。"},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["intent"] == "update_run_plan"
+        assert body["run_plan"]["max_rounds"] == 3
+        assert body["run_plan"]["auto_run"] is True
+        assert body["run_plan"]["constraints"]["reduce_hERG"] is True
+        assert body["suggested_execution"] is True
+        assert body["requires_confirmation"] is True
+        assert {change["path"] for change in body["plan_diff"]} >= {
+            "auto_run",
+            "constraints.reduce_hERG",
+        }
+
+        persisted = client.get(f"/projects/{project_id}/run-plan").json()
+        assert persisted["auto_run"] is True
+        assert persisted["constraints"]["reduce_hERG"] is True
+
+
+def test_chat_returns_run_plan_patch_to_disable_autogrow4(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post(
+            "/projects",
+            json={"name": "Chat AutoGrow4 patch"},
+        ).json()["project_id"]
+
+        response = client.post(
+            f"/projects/{project_id}/chat",
+            json={"message": "下一轮不要跑 AutoGrow4，先用 CReM 做保守修改。"},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["intent"] == "update_run_plan"
+        assert body["plan_patch"] is not None
+        assert body["run_plan"]["agents"]["autogrow4"]["enabled"] is False
+        assert body["run_plan"]["agents"]["autogrow4"]["condition"] is None
+        assert body["run_plan"]["agents"]["crem"]["enabled"] is True
+        assert body["run_plan"]["agents"]["crem"]["budget"] == "high"
+        assert body["run_plan"]["auto_run"] is False
+        assert body["suggested_execution"] is False
+        assert {
+            (change["path"], change["new_value"])
+            for change in body["plan_diff"]
+        } >= {
+            ("agents.autogrow4.enabled", False),
+            ("agents.crem.budget", "high"),
         }
 
 
@@ -142,6 +203,70 @@ def test_project_router_uses_current_project_schema(tmp_path):
         detail_response = client.get(f"/projects/{project_id}")
         assert detail_response.status_code == 200
         assert detail_response.json()["objective"] == "verify project router schema"
+
+
+def test_create_project_exposes_default_run_plan(tmp_path):
+    with make_client(tmp_path) as client:
+        project_response = client.post(
+            "/projects",
+            json={
+                "name": "RunPlan project",
+                "objective": "降低 hERG 风险，同时保留核心骨架",
+                "generation_config": {
+                    "strategy_counts": {"reinvent4": 50, "crem": 25, "autogrow4": 10},
+                    "assessment_mode": "external",
+                    "external_top_n": 12,
+                    "generation_constraints": {"max_logp": 4.5, "max_sa_score": 5.0},
+                },
+            },
+        )
+        project_id = project_response.json()["project_id"]
+
+        response = client.get(f"/projects/{project_id}/run-plan")
+
+        assert response.status_code == 200
+        run_plan = response.json()
+        assert run_plan["status"] == "draft"
+        assert run_plan["objective"] == "降低 hERG 风险，同时保留核心骨架"
+        assert run_plan["agents"]["reinvent4"]["budget"] == "high"
+        assert run_plan["agents"]["reinvent4"]["requested_count"] == 50
+        assert run_plan["agents"]["crem"]["budget"] == "medium"
+        assert run_plan["agents"]["crem"]["requested_count"] == 25
+        assert run_plan["agents"]["autogrow4"]["enabled"] == "conditional"
+        assert run_plan["agents"]["autogrow4"]["requested_count"] == 10
+        assert run_plan["next_round_seed_count"] == 10
+        assert run_plan["evaluation"]["mode"] == "external_top_n"
+        assert run_plan["evaluation"]["top_n"] == 12
+        assert run_plan["constraints"]["max_logp"] == 4.5
+        assert run_plan["constraints"]["max_sa_score"] == 5.0
+
+
+def test_create_project_uses_selected_seed_ligands(tmp_path):
+    with make_client(tmp_path) as client:
+        response = client.post(
+            "/projects",
+            json={
+                "name": "Selected seeds",
+                "target_id": "TGT-BRAF",
+                "seed_ligands": [
+                    {
+                        "name": "vemurafenib",
+                        "smiles": "CCO",
+                        "source": "test-selection",
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 201
+        project_id = response.json()["project_id"]
+
+        with api_app.SessionLocal() as db:
+            seeds = db.query(SeedLigand).filter_by(project_id=project_id).all()
+
+        assert len(seeds) == 1
+        assert seeds[0].name == "vemurafenib"
+        assert seeds[0].source == "test-selection"
 
 
 def test_database_rule_filter_evidence_link_resolves_without_rag_chunk(tmp_path):
@@ -473,20 +598,61 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
             assert db.query(EvidenceLink).filter_by(evidence_id="EVD-DELETE").count() == 0
 
 
-def test_pipeline_dry_run_registers_agent_steps(tmp_path):
+def test_pipeline_dry_run_mode_is_retired(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post("/projects", json={"name": "KRAS program"}).json()["project_id"]
 
         response = client.post(f"/projects/{project_id}/run", json={"mode": "dry_run"})
 
+        assert response.status_code == 410
+        assert "iterative" in response.json()["detail"]
+
+
+def test_pipeline_iterative_mode_and_endpoint_call_orchestrator(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_iterative(self, db, project):
+        calls.append(project.project_id)
+        project.status = "iterative_completed"
+        db.add(project)
+        db.commit()
+        return []
+
+    monkeypatch.setattr(api_app.PipelineOrchestrator, "run_iterative", fake_run_iterative)
+
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Iterative API"}).json()["project_id"]
+
+        response = client.post(
+            f"/projects/{project_id}/run",
+            json={
+                "mode": "iterative",
+                "generation_config": {
+                    "strategy_counts": {"reinvent4": 0, "crem": 1, "autogrow4": 0},
+                    "assessment_mode": "fast",
+                    "max_rounds": 2,
+                },
+            },
+        )
+        endpoint_response = client.post(f"/projects/{project_id}/run-iterative")
+
         assert response.status_code == 202
-        body = response.json()
-        assert body["status"] == "pipeline_queued"
-        assert len(body["agent_runs"]) >= 10
-        assert any(run["agent_name"] == "self_refutation_agent" for run in body["agent_runs"])
+        assert response.json()["status"] == "iterative_completed"
+        assert endpoint_response.status_code == 202
+        assert calls == [project_id, project_id]
+
+        with api_app.SessionLocal() as db:
+            project = db.query(Project).filter_by(project_id=project_id).one()
+            run_plan = project.constraints_json["run_plan"]
+
+        assert run_plan["max_rounds"] == 2
+        assert run_plan["agents"]["crem"]["enabled"] is True
+        assert run_plan["agents"]["crem"]["requested_count"] == 1
+        assert run_plan["agents"]["reinvent4"]["enabled"] is False
+        assert run_plan["agents"]["reinvent4"]["requested_count"] == 0
 
 
-def test_create_round_accepts_generation_config_for_repeated_rounds(tmp_path):
+def test_create_round_endpoint_is_removed(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post("/projects", json={"name": "Repeated rounds"}).json()["project_id"]
         generation_config = {
@@ -506,18 +672,8 @@ def test_create_round_accepts_generation_config_for_repeated_rounds(tmp_path):
             json={"generation_config": generation_config},
         )
 
-        assert first_response.status_code == 202
-        assert second_response.status_code == 202
-        generator_runs = [
-            run
-            for run in second_response.json()["agent_runs"]
-            if run["agent_name"] == "generator_agent"
-        ]
-        assert generator_runs[-1]["output_json"]["generation_config"] == generation_config
-
-        with api_app.SessionLocal() as db:
-            project = db.query(Project).filter_by(project_id=project_id).one()
-            assert project.constraints_json["pipeline_config"] == generation_config
+        assert first_response.status_code == 404
+        assert second_response.status_code == 404
 
 
 def test_report_top_candidates_include_generation_method(tmp_path):
@@ -614,7 +770,8 @@ $$$$
         response = client.get(f"/projects/{project_id}/report")
 
         assert response.status_code == 200
-        candidate = response.json()["top_candidates"][0]
+        report = response.json()
+        candidate = report["top_candidates"][0]
         assert candidate["generation_source_agent"] == "generator_agent:crem"
         assert candidate["generation_method"] == "crem"
         assert candidate["pro_score"] == 80
@@ -650,6 +807,35 @@ $$$$
         assert evidence["content"] == "The compound showed an EGFR-relevant computational signal."
         assert evidence["evidence_confidence"] is None
         assert evidence["evidence_confidence_semantics"] == "not_calibrated"
+        assert candidate["narrative"]["molecule_id"] == "MOL-REPORT-PROVENANCE"
+        assert "综合评分" in candidate["narrative"]["summary"]
+        assert any(
+            ref["type"] == "ranking_score"
+            for ref in candidate["narrative"]["evidence_refs"]
+        )
+        assert report["molecule_narratives"][0]["molecule_id"] == "MOL-REPORT-PROVENANCE"
+        assert report["final_report"]["executive_summary"]
+
+        narrative_response = client.get(
+            f"/projects/{project_id}/molecules/MOL-REPORT-PROVENANCE/narrative"
+        )
+        assert narrative_response.status_code == 200
+        assert narrative_response.json()["molecule_id"] == "MOL-REPORT-PROVENANCE"
+
+        generated_report = client.post(f"/projects/{project_id}/report")
+        assert generated_report.status_code == 200
+        generated_payload = generated_report.json()
+        assert generated_payload["final_report"]["executive_summary"]
+        assert generated_payload["top_candidates"][0]["narrative"]["molecule_id"] == (
+            "MOL-REPORT-PROVENANCE"
+        )
+        with api_app.SessionLocal() as db:
+            agent_names = {
+                run.agent_name
+                for run in db.query(AgentRun).filter_by(project_id=project_id).all()
+            }
+            assert "molecule_narrative_agent" in agent_names
+            assert "final_report_agent" in agent_names
 
         pose_response = client.get(
             f"/projects/{project_id}/molecules/MOL-REPORT-PROVENANCE/docking/pose"
@@ -661,7 +847,7 @@ $$$$
         ]
 
 
-def test_pipeline_full_runs_end_to_end(tmp_path):
+def test_pipeline_full_mode_is_retired(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post(
             "/projects",
@@ -693,126 +879,8 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
 
         response = client.post(f"/projects/{project_id}/run", json={"mode": "full"})
 
-        assert response.status_code == 202
-        body = response.json()
-        assert body["status"] == "pipeline_completed"
-        agent_names = [run["agent_name"] for run in body["agent_runs"]]
-        assert "knowledge_ingestion_agent" in agent_names
-        assert "target_agent" in agent_names
-        assert "sar_agent" in agent_names
-        assert "filter_agent" in agent_names
-        assert "candidate_assessment_agent" in agent_names
-        assert "ranker_agent" in agent_names
-        assert "self_refutation_agent" in agent_names
-        assert "advisor_agent" in agent_names
-        assert "decision_card_agent" in agent_names
-        assert "report_agent" in agent_names
-        pipeline_run_names = {
-            "knowledge_ingestion_agent",
-            "molecule_import_agent",
-            "target_agent",
-            "sar_agent",
-            "generator_agent",
-            "validation_agent",
-            "filter_agent",
-            "candidate_assessment_agent",
-            "ranker_agent",
-            "self_refutation_agent",
-            "advisor_agent",
-            "decision_card_agent",
-            "report_agent",
-        }
-        pipeline_runs = [
-            run for run in body["agent_runs"] if run["agent_name"] in pipeline_run_names
-        ]
-        assert len(pipeline_runs) == 13
-        assert all(run["status"] == "completed" for run in pipeline_runs)
-        self_refutation_run = next(
-            run for run in pipeline_runs if run["agent_name"] == "self_refutation_agent"
-        )
-        assert self_refutation_run["model_name"] == "heuristic_self_refutation"
-
-        with api_app.SessionLocal() as db:
-            critiques = db.query(Critique).all()
-            assert critiques
-            assert all(
-                critique.analysis_method == "heuristic_self_refutation"
-                for critique in critiques
-            )
-            assert all(critique.llm_provider is None for critique in critiques)
-
-        molecules = client.get(f"/projects/{project_id}/molecules").json()
-        assert len(molecules) >= 2
-
-        rankings = client.get(f"/projects/{project_id}/rankings").json()
-        assert len(rankings) == 2
-        assert rankings[0]["overall_score"] >= rankings[-1]["overall_score"]
-
-        decision_cards = client.get(f"/projects/{project_id}/decision-cards").json()
-        assert len(decision_cards) >= 2
-        assert all(card["trace_id"] for card in decision_cards)
-
-        advice = client.get(f"/projects/{project_id}/advice").json()
-        assert len(advice) == 1
-        assert len(advice[0]["suggestions"]) >= 3
-        assert advice[0]["next_round_constraints"]
-        assert advice[0]["suggested_generation_config"]["rerank_after_generation"] is True
-
-        constraints_before_apply = client.get(f"/projects/{project_id}/constraints").json()
-        assert not advisor_constraints(constraints_before_apply)
-
-        apply_response = client.post(f"/projects/{project_id}/advisor/apply")
-        assert apply_response.status_code == 202
-        applied = apply_response.json()
-        assert applied["status"] == "applied"
-        assert applied["suggestion_id"] == advice[0]["suggestion_id"]
-        assert applied["applied_constraint_count"] == len(advice[0]["next_round_constraints"])
-        assert applied["created_constraint_count"] == applied["applied_constraint_count"]
-        assert applied["updated_constraint_count"] == 0
-        assert applied["unchanged_constraint_count"] == 0
-        assert applied["generation_payload"]["generation_request"]["generation_size"] == 50
-        assert applied["generation_payload"]["generation_request"]["strategies"] == ["crem"]
-        assert applied["generation_payload"]["rerank_after_generation"] is True
-
-        constraints = client.get(f"/projects/{project_id}/constraints").json()
-        assert len(advisor_constraints(constraints)) == applied["applied_constraint_count"]
-
-        second_apply = client.post(f"/projects/{project_id}/advisor/apply").json()
-        assert second_apply["created_constraint_count"] == 0
-        assert second_apply["updated_constraint_count"] == 0
-        assert second_apply["unchanged_constraint_count"] == applied["applied_constraint_count"]
-        constraints_after_second_apply = client.get(f"/projects/{project_id}/constraints").json()
-        assert (
-            len(advisor_constraints(constraints_after_second_apply))
-            == applied["applied_constraint_count"]
-        )
-
-        report = client.get(f"/projects/{project_id}/report").json()
-        assert report["project_summary"]["project_id"] == project_id
-        assert report["project_summary"]["status"] == "pipeline_completed"
-        assert len(report["top_candidates"]) >= 2
-        assert report["self_refutation"]["critique_count"] >= 2
-        assert report["candidate_summary"]["top_molecule_count"] >= 2
-        assert report["candidate_summary"]["seed_ligand_count"] > 0
-        assert report["candidate_summary"]["binding_site_count"] > 0
-        assert report["target_and_pocket_analysis"]["target"]["pocket_summary"]
-        assert report["target_and_pocket_analysis"]["binding_sites"]
-        assert report["target_and_pocket_analysis"]["seed_ligands"]
-        assert report["sar_overview"]["target_sar_rules"]
-        assert report["admet_overview"]["target_admet_risks"]
-        assert report["synthesis_overview"]["result_count"] >= 2
-        assert report["synthesis_overview"]["routes"]
-        assert report["top_candidates"][0]["rule_filter"]
-        assert report["top_candidates"][0]["admet"]
-        assert report["top_candidates"][0]["synthesis"]
-        assert report["top_candidates"][0]["refutation_chain"]
-        assert Path(report["report_file"]).exists()
-
-        download = client.get(f"/projects/{project_id}/report/download")
-        assert download.status_code == 200
-        assert download.headers["content-type"].startswith("application/json")
-        assert "attachment" in download.headers["content-disposition"]
-        assert download.json()["project_summary"]["project_id"] == project_id
+        assert response.status_code == 410
+        assert "iterative" in response.json()["detail"]
 
 
 def test_advisor_apply_requires_existing_advice(tmp_path):
@@ -898,12 +966,4 @@ def test_advisor_apply_accepts_document_shaped_advice(tmp_path):
         )["operator"] == "target_range"
 
         round_response = client.post(f"/projects/{project_id}/rounds")
-        assert round_response.status_code == 202
-        generator_runs = [
-            run
-            for run in round_response.json()["agent_runs"]
-            if run["agent_name"] == "generator_agent"
-        ]
-        assert generator_runs[-1]["output_json"]["generation_payload"]["source_suggestion_id"] == (
-            "ADV-DOC-SHAPE"
-        )
+        assert round_response.status_code == 404

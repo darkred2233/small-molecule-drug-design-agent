@@ -1,8 +1,8 @@
 # REINVENT4适配器开发文档
 
-日期：2026-07-09
+初始日期：2026-07-09；工具链加固：2026-07-16
 
-范围：接入REINVENT4进行基于强化学习的分子生成，替代当前的RDKit库枚举代理。
+范围：接入REINVENT4 prior sampling，并如实区分真实采样、项目约束过滤和RDKit surrogate 回退。
 
 ## 1. 本阶段目标
 
@@ -12,26 +12,28 @@
 种子分子 → RDKit库枚举 → Tanimoto打分 → 候选分子
 ```
 
-本阶段接入真实REINVENT4：
+当前接入的真实REINVENT4链路：
 
 ```text
-种子分子 → REINVENT4强化学习 → 多目标优化 → 候选分子
+prior模型 → REINVENT4 sampling → SMILES/性质/相似度复核 → 候选分子
 ```
 
 实现后，系统可以：
 
-- 使用REINVENT4进行强化学习式分子优化
-- 支持多种打分策略（simple, multi_parameter, scaffold_hop）
+- 使用配置的非空 prior 文件执行真实REINVENT4 sampling
+- 记录命令、prior路径与大小、设备、超时和Docker镜像
+- prior sampling没有项目目标函数分数；缺失值保存为`null`，不伪造`0.0`
+- 明确标记当前结果不是靶点导向强化学习或多目标优化
 - 自动检测REINVENT4可用性（本地/Docker）
-- 当REINVENT4不可用时回退到RDKit代理
+- 当REINVENT4不可用、执行失败或真实输出不满足项目约束时回退到RDKit/Datamol代理
 
 ## 2. REINVENT4 vs RDKit代理
 
 | 特性 | RDKit代理 | REINVENT4 |
 |------|----------|-----------|
-| 方法 | 库枚举 | 强化学习 |
+| 方法 | 库枚举 | prior sampling |
 | 多样性 | 受限于预定义库 | 高多样性 |
-| 优化能力 | 无 | 多目标优化 |
+| 靶点优化 | 无 | 当前未实现 |
 | 速度 | 快 | 较慢 |
 | GPU需求 | 无 | 推荐 |
 
@@ -45,39 +47,25 @@
 | `docker-compose.yml` | 修改 | 添加reinvent4服务 |
 | `docs/REINVENT4_ADAPTER_BUILD.md` | 新增 | 本文档 |
 
-## 4. 打分策略
+## 4. 当前模式边界
 
-### 4.1 Simple Strategy
-单目标优化，适合快速筛选。
-
-### 4.2 Multi-Parameter Strategy
-多目标优化，同时考虑：
-- 类药性 (QED)
-- 合成可及性 (SA Score)
-- 分子量 (MW)
-- LogP
-
-### 4.3 Scaffold Hop Strategy
-保留核心骨架，优化侧链。
+`scoring_strategy` 字段为后续RL/打分配置保留。当前 sampling 配置不会应用 `simple`、`multi_parameter` 或 `scaffold_hop` 打分策略，也不会使用 seed SMILES 作为条件输入；请求这些能力时会写入 warning，而不会假装已经完成优化。
 
 ## 5. 配置文件格式
 
 REINVENT4使用TOML配置文件：
 
 ```toml
-[run_type]
-name = "sampling"
+run_type = "sampling"
+device = "cuda:0"
+json_out_config = "/data/sampling.json"
 
 [parameters]
-summary_csv_file = "output.csv"
+model_file = "/data/model.prior"
+output_file = "/data/output.csv"
 num_smiles = 100
 unique_molecules = true
-
-[scoring]
-type = "simple"
-[[scoring.component]]
-[scoring.component.custom_sum]
-name = "custom_sum"
+randomize_smiles = true
 ```
 
 ## 6. 标签系统
@@ -91,8 +79,8 @@ name = "custom_sum"
 
 ## 7. 后续改进
 
-1. 支持自定义打分函数
+1. 增加靶点相关打分组件和正式RL配置模板
 2. 支持迁移学习
-3. 添加GPU加速
+3. 保存可复现的小规模GPU运行记录
 4. 批量生成优化
 5. 添加生成多样性控制

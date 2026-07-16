@@ -5,7 +5,7 @@ import copy
 import hashlib
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import metadata, util
 from pathlib import Path
 from typing import Any
@@ -55,7 +55,7 @@ from medagent.services.pdbqt_validation import (
     is_valid_vina_receptor_pdbqt,
 )
 from medagent.services.rdkit_adapter import find_rdkit_filter_matches
-from medagent.services.receptor_preparation import project_docking_config
+from medagent.services.receptor_preparation import project_docking_config, resolve_receptor_path
 
 
 CONFORMER_AGENT_NAME = "conformer_agent"
@@ -211,6 +211,7 @@ def run_project_candidate_assessment(
     admet_properties: list[str] | None = None,
     max_synthesis_steps: int = 5,
     prefer_buyable_building_blocks: bool = True,
+    enable_external_synthesis_routes: bool = True,
 ) -> dict[str, Any]:
     assessment_mode = _normalize_assessment_mode(assessment_mode)
     molecules = _select_assessment_molecules(db, project, molecule_ids, max_molecules)
@@ -293,20 +294,32 @@ def run_project_candidate_assessment(
                 allow_external_tools=True,
                 admet_properties=admet_properties or [],
             )
-            synthesis_refinement = run_project_synthesis(
-                db,
-                project,
-                refinement_molecules,
-                tool_status,
-                allow_external_tools=True,
-                max_synthesis_steps=max_synthesis_steps,
-                prefer_buyable_building_blocks=prefer_buyable_building_blocks,
-            )
+            synthesis_refinement = None
+            if enable_external_synthesis_routes:
+                synthesis_refinement = run_project_synthesis(
+                    db,
+                    project,
+                    refinement_molecules,
+                    tool_status,
+                    allow_external_tools=True,
+                    max_synthesis_steps=max_synthesis_steps,
+                    prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+                )
+            else:
+                synthesis.warnings = _dedupe(
+                    synthesis.warnings
+                    + ["external_retrosynthesis_skipped_by_synthesis_route_scope"]
+                )
             _apply_external_refinement_labels(db, coarse_passed_molecules, refinement_molecules)
             refinement_scope = "top_n" if assessment_mode == "external" else "full"
             _mark_external_refinement_summary(docking, docking_refinement, refinement_scope=refinement_scope)
             _mark_external_refinement_summary(admet, admet_refinement, refinement_scope=refinement_scope)
-            _mark_external_refinement_summary(synthesis, synthesis_refinement, refinement_scope=refinement_scope)
+            if synthesis_refinement is not None:
+                _mark_external_refinement_summary(
+                    synthesis,
+                    synthesis_refinement,
+                    refinement_scope=refinement_scope,
+                )
             ranking = generate_project_rankings(
                 db,
                 project,
@@ -321,6 +334,7 @@ def run_project_candidate_assessment(
         "project_id": project.project_id,
         "assessment_mode": assessment_mode,
         "external_top_n": external_top_n,
+        "external_synthesis_routes_enabled": enable_external_synthesis_routes,
         "conformer": conformer.as_dict(),
         "docking": docking.as_dict(),
         "admet": admet.as_dict(),
@@ -1522,6 +1536,8 @@ def _upsert_external_docking_result(
         "runtime_seconds": round(external_result.runtime_seconds, 3),
         "exit_code": external_result.exit_code,
         "warnings": external_result.warnings,
+        "command": external_result.command,
+        "provenance": external_result.provenance,
         "pose_interactions_computed": False,
     }
     return result
@@ -2126,7 +2142,12 @@ def _binding_site_docking_config(
     project: Project,
     binding_site_id: str | None,
 ) -> dict[str, Any]:
-    return project_docking_config(db, project, binding_site_id)
+    return project_docking_config(
+        db,
+        project,
+        binding_site_id,
+        path_resolver=resolve_receptor_path,
+    )
 
 
 def _attempt_external_docking(
@@ -2150,8 +2171,17 @@ def _attempt_external_docking(
             labels=["external_docking_adapter_failed"],
             warnings=["prepared_ligand_file_not_found"],
         )
+    original_protein_file = protein_file
+    original_ligand_file = ligand_file
     preparation_warnings: list[str] = []
-    if _should_prepare_vina_inputs(tool_status, protein_file, ligand_file):
+    attempted_vina_preparation = _should_prepare_vina_inputs(
+        tool_status,
+        protein_file,
+        ligand_file,
+        grid_center,
+        grid_size,
+    )
+    if attempted_vina_preparation:
         protein_file, ligand_file, preparation_warnings = _prepare_vina_docking_inputs(
             project,
             molecule,
@@ -2177,6 +2207,34 @@ def _attempt_external_docking(
         timeout_seconds=_docking_timeout_seconds(),
         molecule_id=molecule.molecule_id,
     )
+    selected_tool = select_docking_tool(request, tool_status)
+    if selected_tool == "diffdock":
+        diffdock_input = original_ligand_file if attempted_vina_preparation else ligand_file
+        ligand_file = _diffdock_ligand_file(project, molecule, diffdock_input)
+        if ligand_file is None:
+            return DockingToolResult(
+                adapter_mode="external_docking_unavailable",
+                tool_name="diffdock",
+                success=False,
+                labels=["external_docking_adapter_failed", "diffdock_adapter"],
+                warnings=_dedupe(
+                    preparation_warnings + ["diffdock_ligand_sdf_generation_failed"]
+                ),
+            )
+        request = replace(
+            request,
+            receptor_file=original_protein_file,
+            ligand_file=ligand_file,
+        )
+        if attempted_vina_preparation:
+            preparation_warnings.append("vina_preparation_failed_diffdock_used")
+    if selected_tool:
+        request = replace(
+            request,
+            timeout_seconds=_docking_timeout_seconds(
+                tool_status.get(selected_tool, {}).get("configured_timeout_seconds")
+            ),
+        )
     external_result = run_external_docking(request, tool_status)
     if external_result is None:
         selected_tool = select_docking_tool(request, tool_status)
@@ -2194,6 +2252,11 @@ def _attempt_external_docking(
             labels=["external_docking_adapter_failed"],
             warnings=_dedupe(preparation_warnings + [warning]),
         )
+    if preparation_warnings:
+        external_result = replace(
+            external_result,
+            warnings=_dedupe(preparation_warnings + external_result.warnings),
+        )
     return external_result
 
 
@@ -2201,10 +2264,16 @@ def _should_prepare_vina_inputs(
     tool_status: dict[str, Any],
     receptor_file: str,
     ligand_file: str | None,
+    grid_center: list[float] | None,
+    grid_size: list[float] | None,
 ) -> bool:
     if not tool_status.get("vina", {}).get("available"):
         return False
     if tool_status.get("gnina", {}).get("available"):
+        return False
+    if tool_status.get("diffdock", {}).get("available") and (
+        not _is_vector3(grid_center) or not _is_vector3(grid_size)
+    ):
         return False
     receptor_ready = is_valid_vina_receptor_pdbqt(Path(receptor_file))
     ligand_ready = bool(ligand_file) and is_valid_vina_ligand_pdbqt(Path(ligand_file))
@@ -2394,11 +2463,13 @@ def _is_valid_vina_receptor_path(file_path: str | None) -> bool:
     return bool(file_path) and is_valid_vina_receptor_pdbqt(Path(file_path))
 
 
-def _docking_timeout_seconds() -> int:
-    raw_value = os.environ.get("MEDAGENT_DOCKING_TIMEOUT_SECONDS", "900")
+def _docking_timeout_seconds(configured_timeout: Any = None) -> int:
+    raw_value = os.environ.get("MEDAGENT_DOCKING_TIMEOUT_SECONDS")
+    if raw_value is None:
+        raw_value = configured_timeout if configured_timeout is not None else 900
     try:
         return max(30, int(raw_value))
-    except ValueError:
+    except (TypeError, ValueError):
         return 900
 
 
@@ -2423,7 +2494,10 @@ def _external_docking_setup_warnings(
         warnings.append("protein_file_required_for_external_docking")
     elif not Path(protein_file).exists():
         warnings.append("protein_file_not_found")
-    if not _is_vector3(grid_center) or not _is_vector3(grid_size):
+    if (
+        not tool_status.get("diffdock", {}).get("available")
+        and (not _is_vector3(grid_center) or not _is_vector3(grid_size))
+    ):
         warnings.append("grid_center_and_grid_size_required_for_external_docking")
     return warnings
 
@@ -2438,8 +2512,10 @@ def _external_docking_ready(
         _external_docking_available(tool_status)
         and protein_file
         and Path(protein_file).exists()
-        and _is_vector3(grid_center)
-        and _is_vector3(grid_size)
+        and (
+            tool_status.get("diffdock", {}).get("available")
+            or (_is_vector3(grid_center) and _is_vector3(grid_size))
+        )
     )
 
 
@@ -2475,6 +2551,16 @@ def _write_ligand_sdf(project: Project, molecule: Molecule) -> str | None:
         return str(ligand_file)
     except Exception:
         return None
+
+
+def _diffdock_ligand_file(
+    project: Project,
+    molecule: Molecule,
+    ligand_file: str | None,
+) -> str | None:
+    if ligand_file and Path(ligand_file).suffix.lower() == ".sdf":
+        return ligand_file
+    return _write_ligand_sdf(project, molecule)
 
 
 def _is_vector3(values: list[float] | None) -> bool:

@@ -10,9 +10,19 @@ from typing import Any
 
 from medagent.core.config import get_settings
 from medagent.services.docker_runtime import DockerMountBuilder, docker_temporary_directory
+from medagent.services.tool_config import get_tool_runtime_config
 
 
 _FLOAT_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
+_DIFFDOCK_MODEL_PARAMETERS = "model_parameters.yml"
+_DIFFDOCK_SCORE_CHECKPOINT = "best_ema_inference_epoch_model.pt"
+_DIFFDOCK_CONFIDENCE_CHECKPOINT = "best_model_epoch75.pt"
+_DIFFDOCK_IMAGE_SCORE_DIR = PurePosixPath(
+    "/app/diffdock/workdir/paper_score_model"
+)
+_DIFFDOCK_IMAGE_CONFIDENCE_DIR = PurePosixPath(
+    "/app/diffdock/workdir/paper_confidence_model"
+)
 
 
 @dataclass(frozen=True)
@@ -48,13 +58,15 @@ class DockingToolResult:
     exit_code: int | None = None
     runtime_seconds: float = 0.0
     command: list[str] = field(default_factory=list)
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 
 def run_external_docking(
     request: DockingToolRequest,
     tool_status: dict[str, Any],
 ) -> DockingToolResult | None:
-    validation_warnings = validate_docking_request(request)
+    selected_tool = select_docking_tool(request, tool_status)
+    validation_warnings = validate_docking_request(request, selected_tool)
     if validation_warnings:
         return DockingToolResult(
             adapter_mode="external_docking_unavailable",
@@ -64,7 +76,6 @@ def run_external_docking(
             warnings=validation_warnings,
         )
 
-    selected_tool = select_docking_tool(request, tool_status)
     if selected_tool == "gnina":
         if tool_status["gnina"].get("mode") == "docker":
             return run_gnina_docker_docking(request, tool_status["gnina"])
@@ -84,23 +95,38 @@ def select_docking_tool(
     request: DockingToolRequest,
     tool_status: dict[str, Any],
 ) -> str | None:
-    if tool_status.get("gnina", {}).get("available"):
+    has_grid = _is_vector3(request.grid_center) and _is_vector3(request.grid_size)
+    if tool_status.get("gnina", {}).get("available") and has_grid:
         return "gnina"
-    if tool_status.get("vina", {}).get("available") and _has_vina_prepared_pair(request):
+    if (
+        tool_status.get("vina", {}).get("available")
+        and has_grid
+        and _has_vina_prepared_pair(request)
+    ):
         return "vina"
     if tool_status.get("diffdock", {}).get("available"):
         return "diffdock"
     return None
 
 
-def validate_docking_request(request: DockingToolRequest) -> list[str]:
+def validate_docking_request(
+    request: DockingToolRequest,
+    selected_tool: str | None = None,
+) -> list[str]:
     warnings: list[str] = []
     if not Path(request.receptor_file).exists():
         warnings.append("receptor_file_not_found")
     if not Path(request.ligand_file).exists():
         warnings.append("ligand_file_not_found")
-    if not _is_vector3(request.grid_center) or not _is_vector3(request.grid_size):
+    if selected_tool in {None, "gnina", "vina"} and (
+        not _is_vector3(request.grid_center) or not _is_vector3(request.grid_size)
+    ):
         warnings.append("grid_center_and_grid_size_required_for_external_docking")
+    if selected_tool == "diffdock":
+        if Path(request.receptor_file).suffix.lower() != ".pdb":
+            warnings.append("diffdock_receptor_pdb_required")
+        if Path(request.ligand_file).suffix.lower() != ".sdf":
+            warnings.append("diffdock_ligand_sdf_required")
     return warnings
 
 
@@ -267,6 +293,12 @@ def run_gnina_docking(executable: str, request: DockingToolRequest) -> DockingTo
         exit_code=exit_code,
         runtime_seconds=runtime_seconds,
         command=command,
+        provenance=_docking_provenance(
+            request,
+            execution_mode="local_cli",
+            command=command,
+            executable=executable,
+        ),
     )
 
 
@@ -318,6 +350,14 @@ def run_gnina_docker_docking(
         exit_code=exit_code,
         runtime_seconds=runtime_seconds,
         command=command,
+        provenance=_docking_provenance(
+            request,
+            execution_mode="docker",
+            command=command,
+            status=gnina_status,
+            docker_image=docker_image,
+            gpu_used=has_gpu,
+        ),
     )
 
 
@@ -348,6 +388,12 @@ def run_vina_docking(executable: str, request: DockingToolRequest) -> DockingToo
         exit_code=exit_code,
         runtime_seconds=runtime_seconds,
         command=command,
+        provenance=_docking_provenance(
+            request,
+            execution_mode="local_cli",
+            command=command,
+            executable=executable,
+        ),
     )
 
 
@@ -382,6 +428,14 @@ def run_vina_docker_docking(
         exit_code=exit_code,
         runtime_seconds=runtime_seconds,
         command=command,
+        provenance=_docking_provenance(
+            request,
+            execution_mode="docker",
+            command=command,
+            status=vina_status,
+            docker_image=docker_image,
+            gpu_used=False,
+        ),
     )
 
 
@@ -412,11 +466,12 @@ def _run_diffdock_local(
     diffdock_status: dict[str, Any],
 ) -> DockingToolResult:
     """Run DiffDock via local Python package."""
-    output_dir = Path(request.output_dir)
+    output_dir = _new_diffdock_output_dir(request)
+    output_dir.mkdir(parents=True, exist_ok=False)
 
     # Build DiffDock command
     command = [
-        "python", "-m", "diffdock",
+        sys.executable, "-m", "diffdock",
         "--protein_path", request.receptor_file,
         "--ligand_description", request.ligand_file,
         "--out_dir", str(output_dir),
@@ -425,25 +480,39 @@ def _run_diffdock_local(
     model_dir = _configured_directory("DIFFDOCK_MODEL_DIR")
     confidence_dir = _configured_directory("DIFFDOCK_CONFIDENCE_MODEL_DIR")
     if model_dir:
-        command.extend(["--model_dir", str(model_dir)])
+        command.extend(
+            ["--model_dir", str(model_dir), "--ckpt", _DIFFDOCK_SCORE_CHECKPOINT]
+        )
     if confidence_dir:
-        command.extend(["--confidence_model_dir", str(confidence_dir)])
+        command.extend(
+            [
+                "--confidence_model_dir",
+                str(confidence_dir),
+                "--confidence_ckpt",
+                _DIFFDOCK_CONFIDENCE_CHECKPOINT,
+            ]
+        )
 
-    # Add complex_id if molecule_id provided
+    # Match the upstream v1.1.3 inference.py argument name.
     if request.molecule_id:
-        command.extend(["--complex_id", request.molecule_id])
+        command.extend(["--complex_name", request.molecule_id])
 
     exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
 
     # Parse DiffDock output
-    parsed = parse_diffdock_output(stdout, output_dir, request.molecule_id)
-    success = exit_code == 0 and parsed.get("confidence_score") is not None
+    parsed = parse_diffdock_output(
+        _combined_output(stdout, stderr), output_dir, request.molecule_id
+    )
+    pose_exists = pose_artifact_available(parsed.get("pose_file"))
+    success = exit_code == 0 and parsed.get("confidence_score") is not None and pose_exists
 
     warnings = []
     if exit_code != 0:
         warnings.append("diffdock_execution_failed")
-    if not parsed.get("confidence_score"):
+    if parsed.get("confidence_score") is None:
         warnings.append("diffdock_confidence_not_found")
+    if parsed.get("confidence_score") is not None and not pose_exists:
+        warnings.append("external_docking_pose_file_missing")
 
     return DockingToolResult(
         adapter_mode="diffdock_external_docking",
@@ -455,7 +524,7 @@ def _run_diffdock_local(
         selected_pose_rank=parsed.get("selected_pose_rank"),
         pose_count=parsed.get("pose_count"),
         pose_selection_method=parsed.get("pose_selection_method"),
-        best_pose_confirmed=bool(parsed.get("best_pose_confirmed")),
+        best_pose_confirmed=bool(parsed.get("best_pose_confirmed") and pose_exists),
         labels=_result_labels("diffdock", success),
         warnings=warnings,
         stdout=stdout,
@@ -463,6 +532,15 @@ def _run_diffdock_local(
         exit_code=exit_code,
         runtime_seconds=runtime_seconds,
         command=command,
+        provenance=_docking_provenance(
+            request,
+            execution_mode="python_package",
+            command=command,
+            status=diffdock_status,
+            executable=command[0],
+            gpu_used=None,
+            output_dir=output_dir,
+        ),
     )
 
 
@@ -471,9 +549,10 @@ def _run_diffdock_docker(
     diffdock_status: dict[str, Any],
 ) -> DockingToolResult:
     """Run DiffDock via Docker container."""
-    output_dir = Path(request.output_dir)
-    docker_image = diffdock_status.get("docker_image", "diffdock:latest")
+    output_root = Path(request.output_dir)
+    docker_image = diffdock_status.get("docker_image") or "diffdock:latest"
     container_name = f"diffdock_{_safe_pose_prefix(request.molecule_id)}_{int(time.time() * 1000)}"
+    output_dir = output_root / container_name
 
     # Keep Docker inputs on a shared API volume when running inside the API container.
     with docker_temporary_directory(prefix="diffdock_") as tmp_dir:
@@ -506,14 +585,19 @@ def _run_diffdock_docker(
         if out_dir.exists():
             shutil.copytree(out_dir, output_dir, dirs_exist_ok=True)
 
-        parsed = parse_diffdock_output(stdout, output_dir, request.molecule_id)
-        success = exit_code == 0 and parsed.get("confidence_score") is not None
+        parsed = parse_diffdock_output(
+            _combined_output(stdout, stderr), output_dir, request.molecule_id
+        )
+        pose_exists = pose_artifact_available(parsed.get("pose_file"))
+        success = exit_code == 0 and parsed.get("confidence_score") is not None and pose_exists
 
         warnings = []
         if exit_code != 0:
             warnings.append("diffdock_docker_failed")
-        if not parsed.get("confidence_score"):
+        if parsed.get("confidence_score") is None:
             warnings.append("diffdock_confidence_not_found")
+        if parsed.get("confidence_score") is not None and not pose_exists:
+            warnings.append("external_docking_pose_file_missing")
         if not has_gpu:
             warnings.append("diffdock_running_without_gpu")
 
@@ -527,7 +611,7 @@ def _run_diffdock_docker(
             selected_pose_rank=parsed.get("selected_pose_rank"),
             pose_count=parsed.get("pose_count"),
             pose_selection_method=parsed.get("pose_selection_method"),
-            best_pose_confirmed=bool(parsed.get("best_pose_confirmed")),
+            best_pose_confirmed=bool(parsed.get("best_pose_confirmed") and pose_exists),
             labels=_result_labels("diffdock", success),
             warnings=warnings,
             stdout=stdout,
@@ -535,6 +619,15 @@ def _run_diffdock_docker(
             exit_code=exit_code,
             runtime_seconds=runtime_seconds,
             command=command,
+            provenance=_docking_provenance(
+                request,
+                execution_mode="docker",
+                command=command,
+                status=diffdock_status,
+                docker_image=docker_image,
+                gpu_used=has_gpu,
+                output_dir=output_dir,
+            ),
         )
 
 
@@ -560,13 +653,19 @@ def parse_diffdock_output(
     }
 
     # Parse confidence score from stdout
-    confidence_pattern = re.compile(r"confidence[_\s]*score\s*[:=]\s*({_FLOAT_PATTERN})", re.IGNORECASE)
+    confidence_pattern = re.compile(
+        rf"confidence[_\s]*score\s*[:=]\s*({_FLOAT_PATTERN})",
+        re.IGNORECASE,
+    )
     match = confidence_pattern.search(stdout)
     if match:
         result["confidence_score"] = _rounded(float(match.group(1)))
 
     # Also try to find rank confidence
-    rank_pattern = re.compile(r"rank[_\s]*\d+\s*[:=]\s*({_FLOAT_PATTERN})", re.IGNORECASE)
+    rank_pattern = re.compile(
+        rf"rank[_\s]*\d+\s*[:=]\s*({_FLOAT_PATTERN})",
+        re.IGNORECASE,
+    )
     match = rank_pattern.search(stdout)
     if match and result["confidence_score"] is None:
         result["confidence_score"] = _rounded(float(match.group(1)))
@@ -665,14 +764,16 @@ def build_diffdock_docker_command(
     if request.molecule_id:
         command.extend(["--complex_name", request.molecule_id])
     if model_path:
-        command.extend(["--model_dir", model_path])
+        command.extend(
+            ["--model_dir", model_path, "--ckpt", _DIFFDOCK_SCORE_CHECKPOINT]
+        )
     if confidence_path:
         command.extend(
             [
                 "--confidence_model_dir",
                 confidence_path,
                 "--confidence_ckpt",
-                "best_model_epoch75.pt",
+                _DIFFDOCK_CONFIDENCE_CHECKPOINT,
             ]
         )
     return command
@@ -698,23 +799,82 @@ def _diffdock_models_configured() -> bool:
     confidence_dir = _configured_directory("DIFFDOCK_CONFIDENCE_MODEL_DIR")
     return bool(
         model_dir
-        and (model_dir / "best_ema_inference_epoch_model.pt").is_file()
+        and _nonempty_file(model_dir / _DIFFDOCK_MODEL_PARAMETERS)
+        and _nonempty_file(model_dir / _DIFFDOCK_SCORE_CHECKPOINT)
         and confidence_dir
-        and (confidence_dir / "best_model_epoch75.pt").is_file()
+        and _nonempty_file(confidence_dir / _DIFFDOCK_MODEL_PARAMETERS)
+        and _nonempty_file(confidence_dir / _DIFFDOCK_CONFIDENCE_CHECKPOINT)
     )
+
+
+def _diffdock_configured_model_artifacts() -> dict[str, Any] | None:
+    model_dir = _configured_directory("DIFFDOCK_MODEL_DIR")
+    confidence_dir = _configured_directory("DIFFDOCK_CONFIDENCE_MODEL_DIR")
+    if not model_dir or not confidence_dir or not _diffdock_models_configured():
+        return None
+    return {
+        "score_model_dir": str(model_dir),
+        "score_checkpoint": _file_artifact(model_dir / _DIFFDOCK_SCORE_CHECKPOINT),
+        "score_parameters": _file_artifact(model_dir / _DIFFDOCK_MODEL_PARAMETERS),
+        "confidence_model_dir": str(confidence_dir),
+        "confidence_checkpoint": _file_artifact(
+            confidence_dir / _DIFFDOCK_CONFIDENCE_CHECKPOINT
+        ),
+        "confidence_parameters": _file_artifact(
+            confidence_dir / _DIFFDOCK_MODEL_PARAMETERS
+        ),
+    }
+
+
+def _diffdock_image_has_default_models(image: str) -> bool:
+    required_files = [
+        _DIFFDOCK_IMAGE_SCORE_DIR / _DIFFDOCK_MODEL_PARAMETERS,
+        _DIFFDOCK_IMAGE_SCORE_DIR / _DIFFDOCK_SCORE_CHECKPOINT,
+        _DIFFDOCK_IMAGE_CONFIDENCE_DIR / _DIFFDOCK_MODEL_PARAMETERS,
+        _DIFFDOCK_IMAGE_CONFIDENCE_DIR / _DIFFDOCK_CONFIDENCE_CHECKPOINT,
+    ]
+    paths_literal = repr([str(path) for path in required_files])
+    probe = _run_probe(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "python",
+            image,
+            "-c",
+            (
+                "from pathlib import Path; "
+                f"files=[Path(value) for value in {paths_literal}]; "
+                "raise SystemExit(0 if all(path.is_file() and path.stat().st_size > 0 "
+                "for path in files) else 2)"
+            ),
+        ],
+        timeout=20,
+    )
+    return bool(probe and probe.returncode == 0)
 
 
 def check_diffdock_available() -> dict[str, Any]:
     """Check if DiffDock is available via CLI or Docker."""
+    runtime_config = get_tool_runtime_config(
+        "diffdock",
+        default_images=("diffdock:latest",),
+        default_timeout_seconds=900,
+    )
+    configured_artifacts = _diffdock_configured_model_artifacts()
     result: dict[str, Any] = {
         "available": False,
         "mode": None,
         "version": None,
         "docker_image": None,
         "runtime_available": False,
-        "model_configured": _diffdock_models_configured(),
+        "model_configured": configured_artifacts is not None,
+        "model_source": "configured_directories" if configured_artifacts else None,
+        "model_artifacts": configured_artifacts,
         "gpu_available": False,
         "warning": None,
+        **runtime_config.as_status(),
     }
 
     local_probe = _run_probe([sys.executable, "-m", "diffdock", "--help"])
@@ -722,15 +882,18 @@ def check_diffdock_available() -> dict[str, Any]:
         result["runtime_available"] = True
         result["mode"] = "python_package"
         result["version"] = "source"
-        result["model_configured"] = _diffdock_models_configured()
+        configured_artifacts = _diffdock_configured_model_artifacts()
+        result["model_configured"] = configured_artifacts is not None
+        result["model_source"] = (
+            "configured_directories" if configured_artifacts else None
+        )
+        result["model_artifacts"] = configured_artifacts
         result["available"] = result["model_configured"]
         if not result["model_configured"]:
             result["warning"] = "diffdock_model_not_configured"
         return result
 
-    image = _first_existing_docker_image(
-        [os.environ.get("DIFFDOCK_IMAGE", "diffdock:latest"), "diffdock:latest"]
-    )
+    image = _first_existing_docker_image(list(runtime_config.docker_images))
     if image is None:
         return result
 
@@ -754,27 +917,22 @@ def check_diffdock_available() -> dict[str, Any]:
         result["warning"] = "diffdock_runtime_probe_failed"
         return result
 
-    model_probe = _run_probe(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "python",
-            image,
-            "-c",
-            (
-                "from pathlib import Path; "
-                "root=Path('/app/diffdock'); "
-                "files=[*root.rglob('*.pt'),*root.rglob('*.ckpt'),*root.rglob('*.pth')]; "
-                "raise SystemExit(0 if files else 2)"
-            ),
-        ],
-        timeout=20,
-    )
-    result["model_configured"] = _diffdock_models_configured() or bool(
-        model_probe and model_probe.returncode == 0
-    )
+    configured_artifacts = _diffdock_configured_model_artifacts()
+    if configured_artifacts is not None:
+        result["model_configured"] = True
+        result["model_source"] = "configured_directories"
+        result["model_artifacts"] = configured_artifacts
+    elif _diffdock_image_has_default_models(image):
+        result["model_configured"] = True
+        result["model_source"] = "docker_image_defaults"
+        result["model_artifacts"] = {
+            "score_model_dir": str(_DIFFDOCK_IMAGE_SCORE_DIR),
+            "score_checkpoint": _DIFFDOCK_SCORE_CHECKPOINT,
+            "score_parameters": _DIFFDOCK_MODEL_PARAMETERS,
+            "confidence_model_dir": str(_DIFFDOCK_IMAGE_CONFIDENCE_DIR),
+            "confidence_checkpoint": _DIFFDOCK_CONFIDENCE_CHECKPOINT,
+            "confidence_parameters": _DIFFDOCK_MODEL_PARAMETERS,
+        }
     result["gpu_available"] = _check_gpu_available(image)
     result["available"] = result["runtime_available"] and result["model_configured"]
     if not result["model_configured"]:
@@ -784,6 +942,12 @@ def check_diffdock_available() -> dict[str, Any]:
 
 
 def check_gnina_available() -> dict[str, Any]:
+    runtime_config = get_tool_runtime_config(
+        "gnina",
+        default_command="gnina",
+        default_images=("gnina/gnina:latest", "gnina/gnina:1.0.3", "gnina:latest"),
+        default_timeout_seconds=300,
+    )
     result: dict[str, Any] = {
         "available": False,
         "mode": None,
@@ -793,8 +957,9 @@ def check_gnina_available() -> dict[str, Any]:
         "runtime_available": False,
         "gpu_available": False,
         "warning": None,
+        **runtime_config.as_status(),
     }
-    path = shutil.which("gnina")
+    path = shutil.which(runtime_config.command or "gnina")
     if path is not None:
         probe = _run_probe([path, "--version"])
         if probe is not None and probe.returncode == 0:
@@ -807,14 +972,7 @@ def check_gnina_available() -> dict[str, Any]:
                 "version": _probe_version(probe),
             }
 
-    docker_image = _first_existing_docker_image(
-        [
-            os.environ.get("GNINA_IMAGE", "gnina/gnina:latest"),
-            "gnina/gnina:latest",
-            "gnina/gnina:1.0.3",
-            "gnina:latest",
-        ]
-    )
+    docker_image = _first_existing_docker_image(list(runtime_config.docker_images))
     if docker_image is not None:
         probe = _run_probe(
             ["docker", "run", "--rm", docker_image, "gnina", "--version"],
@@ -840,6 +998,12 @@ def check_gnina_available() -> dict[str, Any]:
 
 
 def check_vina_available() -> dict[str, Any]:
+    runtime_config = get_tool_runtime_config(
+        "vina",
+        default_command="vina",
+        default_images=("vina:latest",),
+        default_timeout_seconds=300,
+    )
     result: dict[str, Any] = {
         "available": False,
         "mode": None,
@@ -848,8 +1012,11 @@ def check_vina_available() -> dict[str, Any]:
         "docker_image": None,
         "runtime_available": False,
         "warning": None,
+        **runtime_config.as_status(),
     }
-    for command in ["vina", "autodock_vina", "vina_1_1_2"]:
+    for command in dict.fromkeys(
+        [runtime_config.command or "vina", "vina", "autodock_vina", "vina_1_1_2"]
+    ):
         path = shutil.which(command)
         if path is not None:
             probe = _run_probe([path, "--version"])
@@ -863,7 +1030,7 @@ def check_vina_available() -> dict[str, Any]:
                     "version": _probe_version(probe),
                 }
 
-    docker_image = _first_existing_docker_image(["vina:latest"])
+    docker_image = _first_existing_docker_image(list(runtime_config.docker_images))
     if docker_image is not None:
         probe = _run_probe(
             [
@@ -1253,6 +1420,55 @@ def _result_labels(tool_name: str, success: bool) -> list[str]:
     return ["external_docking_adapter_failed", f"{tool_name}_adapter"]
 
 
+def _docking_provenance(
+    request: DockingToolRequest,
+    *,
+    execution_mode: str,
+    command: list[str],
+    status: dict[str, Any] | None = None,
+    executable: str | None = None,
+    docker_image: str | None = None,
+    gpu_used: bool | None = None,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    status = status or {}
+    return {
+        "execution_mode": execution_mode,
+        "executable": executable,
+        "docker_image": docker_image,
+        "gpu_used": gpu_used,
+        "output_dir": str(output_dir) if output_dir else None,
+        "command": command,
+        "timeout_seconds": request.timeout_seconds,
+        "config_source": status.get("config_source"),
+        "configured_timeout_seconds": status.get("configured_timeout_seconds"),
+        "model_configured": status.get("model_configured"),
+        "model_source": status.get("model_source"),
+        "model_artifacts": status.get("model_artifacts"),
+        "runtime_available": status.get("runtime_available"),
+    }
+
+
+def _new_diffdock_output_dir(request: DockingToolRequest) -> Path:
+    run_name = f"diffdock_{_safe_pose_prefix(request.molecule_id)}_{time.time_ns()}"
+    return Path(request.output_dir) / run_name
+
+
+def _nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _file_artifact(path: Path) -> dict[str, Any]:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = None
+    return {"path": str(path), "size_bytes": size}
+
+
 def _has_receptor_ligand_pair(request: DockingToolRequest) -> bool:
     return bool(request.receptor_file and request.ligand_file)
 
@@ -1278,7 +1494,7 @@ def _first_existing_docker_image(images: list[str | None]) -> str | None:
                 return image
         except subprocess.TimeoutExpired:
             continue
-        except FileNotFoundError:
+        except OSError:
             # Docker not found, bail out
             return None
     return None

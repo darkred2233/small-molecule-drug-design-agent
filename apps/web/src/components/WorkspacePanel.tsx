@@ -4,15 +4,13 @@
 
 import { useWorkspaceStore } from '@/state/workspaceStore';
 import { useParams } from 'react-router-dom';
-import { FileText, Beaker, BookOpen, Lightbulb, SlidersHorizontal, ShieldX } from 'lucide-react';
+import { FileText, Beaker, BookOpen, ShieldX } from 'lucide-react';
 import { cn } from '@/utils/helpers';
 import { useQuery } from '@tanstack/react-query';
 import { projectsApi } from '@/api';
 import AgentTimeline from './AgentTimeline';
 import MoleculeTable from './MoleculeTable';
 import FileDropzone from './FileDropzone';
-import AdvisorPanel from './AdvisorPanel';
-import DesignGuidancePanel from './DesignGuidancePanel';
 import FailedMoleculeLibrary from './FailedMoleculeLibrary';
 
 export default function WorkspacePanel() {
@@ -20,12 +18,10 @@ export default function WorkspacePanel() {
   const { rightPanelTab, setRightPanelTab } = useWorkspaceStore();
 
   const tabs = [
-    { id: 'design', label: '设计', icon: SlidersHorizontal },
     { id: 'overview', label: '概览', icon: FileText },
     { id: 'molecules', label: '分子', icon: Beaker },
     { id: 'failed', label: '失败库', icon: ShieldX },
     { id: 'evidence', label: '证据', icon: BookOpen },
-    { id: 'advisor', label: 'Advisor', icon: Lightbulb },
   ] as const;
 
   if (!projectId) {
@@ -64,24 +60,13 @@ export default function WorkspacePanel() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-6">
-        {rightPanelTab === 'design' && <DesignTab projectId={projectId} />}
         {rightPanelTab === 'overview' && <OverviewTab projectId={projectId} />}
         {rightPanelTab === 'molecules' && <MoleculesTab />}
         {rightPanelTab === 'failed' && <FailedTab />}
         {rightPanelTab === 'evidence' && <EvidenceTab />}
-        {rightPanelTab === 'advisor' && <AdvisorPanel />}
       </div>
     </div>
   );
-}
-
-function DesignTab({ projectId }: { projectId: string }) {
-  const { data: project } = useQuery({
-    queryKey: ['project', projectId],
-    queryFn: () => projectsApi.get(projectId),
-  });
-
-  return <DesignGuidancePanel project={project ?? null} />;
 }
 
 function OverviewTab({ projectId }: { projectId: string }) {

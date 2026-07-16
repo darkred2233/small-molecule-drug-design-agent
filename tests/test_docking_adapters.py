@@ -328,8 +328,49 @@ def test_diffdock_command_uses_model_directories_from_settings(tmp_path, monkeyp
     assert f"{score_dir.resolve()}:/models/score:ro" in command
     assert f"{confidence_dir.resolve()}:/models/confidence:ro" in command
     assert command[command.index("--model_dir") + 1] == "/models/score"
+    assert command[command.index("--ckpt") + 1] == "best_ema_inference_epoch_model.pt"
     assert command[command.index("--confidence_model_dir") + 1] == "/models/confidence"
     assert command[command.index("--confidence_ckpt") + 1] == "best_model_epoch75.pt"
+
+
+def test_diffdock_model_configuration_requires_parameters_and_checkpoints(
+    tmp_path, monkeypatch
+):
+    score_dir = tmp_path / "score_model"
+    confidence_dir = tmp_path / "confidence_model"
+    score_dir.mkdir()
+    confidence_dir.mkdir()
+    (score_dir / "best_ema_inference_epoch_model.pt").write_bytes(b"score")
+    (confidence_dir / "best_model_epoch75.pt").write_bytes(b"confidence")
+
+    monkeypatch.setenv("DIFFDOCK_MODEL_DIR", str(score_dir))
+    monkeypatch.setenv("DIFFDOCK_CONFIDENCE_MODEL_DIR", str(confidence_dir))
+
+    assert docking_adapters._diffdock_models_configured() is False
+
+    (score_dir / "model_parameters.yml").write_text("model: score\n", encoding="utf-8")
+    (confidence_dir / "model_parameters.yml").write_text(
+        "model: confidence\n", encoding="utf-8"
+    )
+
+    assert docking_adapters._diffdock_models_configured() is True
+
+
+def test_diffdock_image_probe_checks_only_upstream_default_model_files(monkeypatch):
+    commands = []
+
+    def fake_probe(command, timeout=10):
+        commands.append(command)
+        return type("CompletedProcess", (), {"returncode": 2})()
+
+    monkeypatch.setattr(docking_adapters, "_run_probe", fake_probe)
+
+    assert docking_adapters._diffdock_image_has_default_models("diffdock:latest") is False
+    probe_script = commands[0][commands[0].index("-c") + 1]
+    assert "paper_score_model" in probe_script
+    assert "paper_confidence_model" in probe_script
+    assert "model_parameters.yml" in probe_script
+    assert "rglob" not in probe_script
 
 
 def test_diffdock_status_keeps_model_configuration_when_runtime_is_missing(monkeypatch):
@@ -341,8 +382,8 @@ def test_diffdock_status_keeps_model_configuration_when_runtime_is_missing(monke
     )
     monkeypatch.setattr(
         docking_adapters,
-        "_diffdock_models_configured",
-        lambda: True,
+        "_diffdock_configured_model_artifacts",
+        lambda: {"score_checkpoint": {"path": "score.pt", "size_bytes": 1}},
     )
 
     status = docking_adapters.check_diffdock_available()
@@ -563,6 +604,7 @@ def test_diffdock_docker_command_uses_upstream_inference_arguments(tmp_path):
     assert "--out_dir" in command
     assert "--ligand_path" not in command
     assert "--output_dir" not in command
+    assert command[command.index("--complex_name") + 1] == "MOL-DIFFDOCK"
     assert command[command.index("--gpus") + 1] == "all"
 
 
@@ -604,13 +646,16 @@ def test_parse_diffdock_output_does_not_claim_rank_two_is_best(tmp_path):
 def test_diffdock_result_keeps_confidence_separate_from_gnina_cnn_score(tmp_path, monkeypatch):
     output_dir = tmp_path / "poses"
     output_dir.mkdir()
-    pose = output_dir / "MOL-DIFFDOCK_rank1_confidence-1.234.sdf"
-    pose.write_text("pose\n$$$$\n", encoding="utf-8")
-    monkeypatch.setattr(
-        docking_adapters,
-        "_run_command",
-        lambda command, timeout: (0, "", "", 0.1),
-    )
+
+    def fake_run(command, timeout):
+        assert command[command.index("--complex_name") + 1] == "MOL-DIFFDOCK"
+        assert "--complex_id" not in command
+        run_output_dir = Path(command[command.index("--out_dir") + 1])
+        pose = run_output_dir / "MOL-DIFFDOCK_rank1_confidence-1.234.sdf"
+        pose.write_text("pose\n$$$$\n", encoding="utf-8")
+        return 0, "", "", 0.1
+
+    monkeypatch.setattr(docking_adapters, "_run_command", fake_run)
 
     result = docking_adapters.run_diffdock_docking(
         DockingToolRequest(
@@ -628,3 +673,5 @@ def test_diffdock_result_keeps_confidence_separate_from_gnina_cnn_score(tmp_path
     assert result.tool_name == "diffdock"
     assert result.cnn_score is None
     assert result.diffdock_confidence == -1.234
+    assert result.pose_file is not None
+    assert Path(result.pose_file).parent != output_dir

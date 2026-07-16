@@ -48,6 +48,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python -m pip install -e ".[chem,rag]"
 
 COPY src ./src
+COPY configs ./configs
 COPY docs ./docs
 COPY database/README.md ./database/README.md
 

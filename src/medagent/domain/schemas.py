@@ -4,12 +4,22 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+class SeedLigandInput(BaseModel):
+    name: str | None = Field(default=None, max_length=160, title="种子/样例分子名称")
+    smiles: str = Field(min_length=1, title="种子/样例分子 SMILES")
+    source: str | None = Field(default=None, max_length=240, title="来源")
+    activity_value: float | None = Field(default=None, title="活性数值")
+    activity_unit: str | None = Field(default=None, max_length=40, title="活性单位")
+    activity_type: str | None = Field(default=None, max_length=40, title="活性类型")
+
+
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200, title="项目名称")
     target_id: str | None = Field(default=None, title="靶点编号")
     target_name: str | None = Field(default=None, title="自定义靶点名称")
     objective: str | None = Field(default=None, title="项目目标")
     constraints: dict[str, Any] = Field(default_factory=dict, title="初始约束")
+    seed_ligands: list[SeedLigandInput] = Field(default_factory=list, title="项目样例/种子分子")
     generation_config: dict[str, Any] = Field(
         default_factory=dict,
         title="Initial molecule generation and ranking configuration",
@@ -38,10 +48,148 @@ class ConstraintRead(BaseModel):
     priority: int = Field(title="优先级")
 
 
+AgentName = Literal["reinvent4", "crem", "autogrow4"]
+AgentBudget = Literal["low", "medium", "high"]
+AgentEnabled = bool | Literal["conditional"]
+RunPlanStatus = Literal["draft", "approved", "running", "completed", "failed"]
+ExplorationLevel = Literal["low", "medium", "high"]
+SynthesisRouteScope = Literal["disabled", "every_round_top_n", "final_round_top_n"]
+EvidenceType = Literal[
+    "admet_prediction",
+    "advisor_rule",
+    "docking_pose",
+    "pose_image",
+    "rag_reference",
+    "sar_observation",
+    "synthesis_score",
+    "tool_log",
+]
+
+
+class RunPlanAgentConfig(BaseModel):
+    enabled: AgentEnabled = Field(title="Agent 是否启用")
+    role: str = Field(title="Agent 在本计划中的角色")
+    budget: AgentBudget = Field(default="medium", title="Agent 预算等级")
+    requested_count: int = Field(default=0, ge=0, le=500, title="每轮请求生成数量")
+    condition: str | None = Field(default=None, title="条件启用说明")
+
+
+class RunPlanEvaluation(BaseModel):
+    mode: Literal["fast", "external_top_n", "full"] = Field(
+        default="external_top_n",
+        title="评估模式",
+    )
+    top_n: int = Field(default=30, ge=1, le=500, title="进入外部评估或重点解读的候选数量")
+    use_docking: bool = Field(default=True, title="是否使用 docking/pose 证据")
+    use_admet: bool = Field(default=True, title="是否使用 ADMET 预测")
+    use_synthesis: bool = Field(default=True, title="是否使用合成可行性评估")
+    synthesis_route_scope: SynthesisRouteScope = Field(
+        default="final_round_top_n",
+        title="合成路线预测范围",
+        description=(
+            "use_synthesis controls every-round feasibility/SA checks; this field controls "
+            "retrosynthesis route prediction, which defaults to the final round Top N only."
+        ),
+    )
+    use_filters: bool = Field(default=True, title="是否使用规则过滤")
+
+
+class RunPlanStopping(BaseModel):
+    min_score_improvement: float = Field(
+        default=0.0,
+        ge=0,
+        title="最低综合分提升阈值",
+        description="Set to 0 to disable score-improvement early stopping.",
+    )
+    max_total_molecules: int = Field(default=300, ge=1, le=5000, title="项目总候选分子上限")
+    max_tool_failures: int = Field(default=3, ge=1, title="连续工具失败停止阈值")
+
+
+class RunPlan(BaseModel):
+    status: RunPlanStatus = Field(default="draft", title="计划状态")
+    objective: str = Field(title="自然语言优化目标")
+    auto_run: bool = Field(default=False, title="确认后是否自动运行")
+    max_rounds: int = Field(default=3, ge=1, le=20, title="最大自动优化轮数")
+    next_round_seed_count: int = Field(default=10, ge=1, le=100, title="下一轮自动继承 Top 种子数")
+    seed_smiles: list[str] = Field(default_factory=list, title="额外手动种子 SMILES")
+    exploration_level: ExplorationLevel = Field(default="medium", title="探索强度")
+    agents: dict[AgentName, RunPlanAgentConfig] = Field(title="生成 Agent 配置")
+    constraints: dict[str, Any] = Field(default_factory=dict, title="执行约束")
+    evaluation: RunPlanEvaluation = Field(default_factory=RunPlanEvaluation, title="评估配置")
+    stopping: RunPlanStopping = Field(default_factory=RunPlanStopping, title="停止条件")
+    decision_trace: list[dict[str, Any]] = Field(
+        default_factory=list,
+        title="可审计决策记录",
+    )
+    evidence_chain: list[dict[str, Any]] = Field(
+        default_factory=list,
+        title="计划级证据链",
+    )
+    warnings: list[str] = Field(default_factory=list, title="计划警告")
+
+
+class RunPlanChange(BaseModel):
+    path: str = Field(title="被修改的 RunPlan 字段路径")
+    old_value: Any = Field(default=None, title="旧值")
+    new_value: Any = Field(default=None, title="新值")
+    affects_next_round: bool = Field(default=True, title="是否影响下一轮执行")
+
+
+class RunPlanPatch(BaseModel):
+    reason: str = Field(title="生成此 patch 的原因")
+    changes: list[RunPlanChange] = Field(default_factory=list, title="字段变更")
+    requires_confirmation: bool = Field(default=True, title="是否需要用户确认")
+    warnings: list[str] = Field(default_factory=list, title="patch 警告")
+
+
+class AgentTask(BaseModel):
+    round: int = Field(ge=1, title="优化轮次")
+    agent: AgentName = Field(title="目标生成 Agent")
+    seed_molecules: list[str] = Field(default_factory=list, title="本轮种子分子")
+    constraints: dict[str, Any] = Field(default_factory=dict, title="生成约束")
+    budget: AgentBudget = Field(default="medium", title="预算等级")
+    sar_context: list[str] = Field(default_factory=list, title="SAR 上下文")
+    evaluation_context: dict[str, Any] = Field(default_factory=dict, title="评估上下文")
+
+
+class AgentMoleculeCandidate(BaseModel):
+    smiles: str = Field(title="候选分子 SMILES")
+    rationale: str | None = Field(default=None, title="Agent 生成理由")
+    provenance: dict[str, Any] = Field(default_factory=dict, title="生成来源与工具信息")
+    metadata: dict[str, Any] = Field(default_factory=dict, title="候选分子补充信息")
+
+
+class AgentResult(BaseModel):
+    agent: AgentName = Field(title="生成 Agent")
+    round: int = Field(ge=1, title="优化轮次")
+    success: bool = Field(title="是否成功产出结果")
+    status: Literal["completed", "failed", "skipped"] = Field(title="Agent 执行状态")
+    molecules: list[AgentMoleculeCandidate] = Field(default_factory=list, title="候选分子")
+    warnings: list[str] = Field(default_factory=list, title="警告")
+    failure_reason: str | None = Field(default=None, title="失败或跳过原因")
+
+
+class EvidenceRef(BaseModel):
+    type: EvidenceType = Field(title="证据类型")
+    source: str = Field(title="证据来源工具或模块")
+    molecule_id: str | None = Field(default=None, title="关联分子编号")
+    round: int | None = Field(default=None, ge=1, title="关联优化轮次")
+    summary: str = Field(title="证据摘要")
+    artifact_path: str | None = Field(default=None, title="证据文件路径")
+    score: float | None = Field(default=None, title="证据分数")
+    metadata: dict[str, Any] = Field(default_factory=dict, title="证据补充数据")
+
+
 class ChatResponse(BaseModel):
     reply: str = Field(title="Agent 回复")
     intent: str = Field(title="识别意图")
     created_constraints: list[str] = Field(default_factory=list, title="新建约束编号")
+    run_plan: RunPlan | None = Field(default=None, title="当前 RunPlan")
+    plan_patch: RunPlanPatch | None = Field(default=None, title="计划修改 patch")
+    plan_diff: list[RunPlanChange] = Field(default_factory=list, title="计划差异")
+    suggested_execution: bool = Field(default=False, title="是否建议执行")
+    requires_confirmation: bool = Field(default=False, title="是否需要用户确认")
+    warnings: list[str] = Field(default_factory=list, title="计划 Agent 警告")
 
 
 class BuiltinDrugRead(BaseModel):
@@ -128,6 +276,11 @@ class EvidenceLinkRead(BaseModel):
     claim_type: str = Field(title="Claim type")
     confidence: float | None = Field(default=None, title="Evidence confidence")
     rationale: str | None = Field(default=None, title="Evidence rationale")
+    document_title: str | None = Field(default=None, title="Evidence document title")
+    source: str | None = Field(default=None, title="Evidence source")
+    page_number: int | None = Field(default=None, title="Evidence page number")
+    section: str | None = Field(default=None, title="Evidence section")
+    content: str | None = Field(default=None, title="Evidence chunk content")
 
 
 class RagRetrievedChunkRead(BaseModel):
@@ -235,6 +388,7 @@ class AgentRunRead(BaseModel):
     agent_name: str = Field(title="Agent 名称")
     model_name: str | None = Field(title="模型名称")
     status: str = Field(title="运行状态")
+    input_json: dict[str, Any] = Field(default_factory=dict, title="输入 JSON")
     output_json: dict[str, Any] = Field(title="输出 JSON")
 
 
@@ -245,17 +399,10 @@ class ProjectStatus(BaseModel):
 
 
 class RunPipelineRequest(BaseModel):
-    mode: Literal["dry_run", "full"] = Field(default="dry_run", title="运行模式")
+    mode: str = Field(default="iterative", title="运行模式")
     generation_config: dict[str, Any] = Field(
         default_factory=dict,
-        title="Optional molecule generation and ranking configuration override",
-    )
-
-
-class RoundCreateRequest(BaseModel):
-    generation_config: dict[str, Any] = Field(
-        default_factory=dict,
-        title="Optional next-round molecule generation and ranking configuration",
+        title="Legacy generation config override converted into RunPlan",
     )
 
 
@@ -307,6 +454,10 @@ class MoleculeGenerationStrategySummary(BaseModel):
     candidate_source_counts: dict[str, int] = Field(
         default_factory=dict,
         title="Candidate source counts",
+    )
+    provenance: dict[str, Any] = Field(
+        default_factory=dict,
+        title="External tool or fallback provenance",
     )
 
 
@@ -414,6 +565,14 @@ class CandidateAssessmentRunRequest(BaseModel):
     prefer_buyable_building_blocks: bool = Field(
         default=True,
         title="Prefer buyable building blocks",
+    )
+    enable_external_synthesis_routes: bool = Field(
+        default=True,
+        title="Whether external retrosynthesis route prediction is allowed",
+        description=(
+            "SA/synthesis feasibility still runs in every assessment; this flag only controls "
+            "external retrosynthesis route prediction."
+        ),
     )
 
 

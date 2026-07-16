@@ -41,6 +41,7 @@ class GenerationBatch:
     tool_status: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
     candidate_source_counts: dict[str, int] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -56,6 +57,7 @@ class StrategyGenerationSummary:
     tool_status: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     candidate_source_counts: dict[str, int] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +72,7 @@ class StrategyGenerationSummary:
             "tool_status": self.tool_status,
             "warnings": self.warnings,
             "candidate_source_counts": self.candidate_source_counts,
+            "provenance": self.provenance,
         }
 
 
@@ -121,12 +124,12 @@ class RdkitScoredReinvent4Strategy:
     ) -> GenerationBatch:
         from medagent.services.reinvent4_adapter import (
             Reinvent4Request,
-            reinvent4_tool_status,
             run_reinvent4_generation,
         )
 
         tool_status = generation_tool_status()
-        reinvent4_status = reinvent4_tool_status()
+        reinvent4_status = tool_status["reinvent4"]
+        fallback_warnings: list[str] = []
 
         # Try real REINVENT4 if available
         if reinvent4_status.get("available"):
@@ -137,31 +140,52 @@ class RdkitScoredReinvent4Strategy:
                         seed_smiles=seeds[:5],
                         output_dir=tmp_dir,
                         num_molecules=requested_count,
+                        timeout_seconds=int(
+                            reinvent4_status.get("configured_timeout_seconds") or 600
+                        ),
                     )
                     result = run_reinvent4_generation(request, reinvent4_status)
+                    fallback_warnings.extend(result.warnings)
 
                     if result.success and result.generated_smiles:
-                        candidates = [
-                            GenerationCandidate(
-                                smiles=smi,
-                                strategy=self.name,
-                                seed_smiles=seeds[0] if seeds else "",
-                                rationale="REINVENT4 reinforcement learning optimization",
-                                labels=tuple(result.labels),
-                                score=score,
-                                metadata={"adapter_mode": result.adapter_mode},
-                            )
-                            for smi, score in zip(result.generated_smiles, result.scores)
-                        ]
-                        return GenerationBatch(
-                            candidates=candidates[:requested_count],
+                        candidates = _external_generation_candidates(
+                            strategy=self.name,
+                            source="reinvent4_external_prior_sampling",
+                            generated_smiles=result.generated_smiles,
+                            scores=result.scores,
+                            seeds=seeds,
+                            constraints=constraints,
+                            rationale="REINVENT4 prior-model sampling",
+                            labels=result.labels,
                             adapter_mode=result.adapter_mode,
-                            tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "reinvent4"]),
-                            warnings=result.warnings,
-                            candidate_source_counts=_candidate_source_counts(candidates),
+                            provenance=result.provenance,
                         )
-            except Exception:
-                pass  # Fall through to surrogate
+                        if candidates:
+                            return GenerationBatch(
+                                candidates=candidates[:requested_count],
+                                adapter_mode=result.adapter_mode,
+                                tool_status=_strategy_tool_status(
+                                    tool_status, ["rdkit", "datamol", "reinvent4"]
+                                ),
+                                warnings=list(dict.fromkeys(result.warnings)),
+                                candidate_source_counts=_candidate_source_counts(candidates),
+                                provenance=result.provenance,
+                            )
+                        fallback_warnings.append(
+                            "reinvent4_external_candidates_rejected_by_generation_constraints"
+                        )
+                    else:
+                        fallback_warnings.append(
+                            f"reinvent4_external_adapter_failed:{result.adapter_mode}"
+                        )
+            except Exception as exc:
+                fallback_warnings.append(
+                    f"reinvent4_external_adapter_exception:{type(exc).__name__}"
+                )
+        else:
+            fallback_warnings.append(
+                str(reinvent4_status.get("warning") or "reinvent4_external_adapter_not_installed")
+            )
 
         # RDKit surrogate fallback
         labels = _candidate_tool_labels(
@@ -183,10 +207,22 @@ class RdkitScoredReinvent4Strategy:
             candidates=candidates,
             adapter_mode="rdkit_datamol_scored_reinvent4_surrogate",
             tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "reinvent4"]),
-            warnings=["reinvent4_external_adapter_not_installed"]
-            if not tool_status["reinvent4"]["available"]
-            else ["reinvent4_detected_but_rdkit_surrogate_adapter_used"],
+            warnings=list(
+                dict.fromkeys(
+                    fallback_warnings
+                    + (
+                        ["reinvent4_detected_but_rdkit_surrogate_adapter_used"]
+                        if tool_status["reinvent4"]["available"]
+                        else []
+                    )
+                )
+            ),
             candidate_source_counts=_candidate_source_counts(candidates),
+            provenance={
+                "execution_mode": "surrogate_fallback",
+                "external_tool_status": reinvent4_status,
+                "fallback_toolchain": ["rdkit", "datamol"],
+            },
         )
 
 
@@ -266,12 +302,12 @@ class RdkitGrowLinkAutoGrow4Strategy:
     ) -> GenerationBatch:
         from medagent.services.autogrow4_adapter import (
             AutoGrow4Request,
-            autogrow4_tool_status,
             run_autogrow4_generation,
         )
 
         tool_status = generation_tool_status()
-        autogrow4_status = autogrow4_tool_status()
+        autogrow4_status = tool_status["autogrow4"]
+        fallback_warnings: list[str] = []
 
         # Try real AutoGrow4 if available
         if autogrow4_status.get("available"):
@@ -290,31 +326,56 @@ class RdkitGrowLinkAutoGrow4Strategy:
                             num_generations=5,
                             population_size=requested_count,
                             constraints=constraints,
+                            timeout_seconds=int(
+                                autogrow4_status.get("configured_timeout_seconds") or 1200
+                            ),
                         )
                         result = run_autogrow4_generation(request, autogrow4_status)
+                        fallback_warnings.extend(result.warnings)
 
                         if result.success and result.generated_smiles:
-                            candidates = [
-                                GenerationCandidate(
-                                    smiles=smi,
-                                    strategy=self.name,
-                                    seed_smiles=seeds[0] if seeds else "",
-                                    rationale="AutoGrow4 genetic algorithm optimization",
-                                    labels=tuple(result.labels),
-                                    score=score,
-                                    metadata={"adapter_mode": result.adapter_mode},
-                                )
-                                for smi, score in zip(result.generated_smiles, result.scores)
-                            ]
-                            return GenerationBatch(
-                                candidates=candidates[:requested_count],
+                            candidates = _external_generation_candidates(
+                                strategy=self.name,
+                                source="autogrow4_external_docking_guided",
+                                generated_smiles=result.generated_smiles,
+                                scores=result.scores,
+                                seeds=seeds,
+                                constraints=constraints,
+                                rationale="AutoGrow4 docking-guided genetic optimization",
+                                labels=result.labels,
                                 adapter_mode=result.adapter_mode,
-                                tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "autogrow4"]),
-                                warnings=result.warnings,
-                                candidate_source_counts=_candidate_source_counts(candidates),
+                                provenance=result.provenance,
                             )
-            except Exception:
-                pass  # Fall through to surrogate
+                            if candidates:
+                                return GenerationBatch(
+                                    candidates=candidates[:requested_count],
+                                    adapter_mode=result.adapter_mode,
+                                    tool_status=_strategy_tool_status(
+                                        tool_status, ["rdkit", "datamol", "autogrow4"]
+                                    ),
+                                    warnings=list(dict.fromkeys(result.warnings)),
+                                    candidate_source_counts=_candidate_source_counts(candidates),
+                                    provenance=result.provenance,
+                                )
+                            fallback_warnings.append(
+                                "autogrow4_external_candidates_rejected_by_generation_constraints"
+                            )
+                        else:
+                            fallback_warnings.append(
+                                f"autogrow4_external_adapter_failed:{result.adapter_mode}"
+                            )
+                elif receptor_file:
+                    fallback_warnings.append("autogrow4_receptor_file_not_found")
+                else:
+                    fallback_warnings.append("autogrow4_receptor_file_not_configured")
+            except Exception as exc:
+                fallback_warnings.append(
+                    f"autogrow4_external_adapter_exception:{type(exc).__name__}"
+                )
+        else:
+            fallback_warnings.append(
+                str(autogrow4_status.get("warning") or "autogrow4_external_adapter_not_installed")
+            )
 
         # RDKit surrogate fallback
         labels = _candidate_tool_labels(
@@ -336,10 +397,22 @@ class RdkitGrowLinkAutoGrow4Strategy:
             candidates=candidates,
             adapter_mode="rdkit_datamol_grow_link_autogrow4_surrogate",
             tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "autogrow4"]),
-            warnings=["autogrow4_external_adapter_not_installed"]
-            if not tool_status["autogrow4"]["available"]
-            else ["autogrow4_detected_but_rdkit_surrogate_adapter_used"],
+            warnings=list(
+                dict.fromkeys(
+                    fallback_warnings
+                    + (
+                        ["autogrow4_detected_but_rdkit_surrogate_adapter_used"]
+                        if tool_status["autogrow4"]["available"]
+                        else []
+                    )
+                )
+            ),
             candidate_source_counts=_candidate_source_counts(candidates),
+            provenance={
+                "execution_mode": "surrogate_fallback",
+                "external_tool_status": autogrow4_status,
+                "fallback_toolchain": ["rdkit", "datamol"],
+            },
         )
 
 
@@ -431,6 +504,7 @@ def generate_project_molecules(
         strategy_summary.tool_status = batch.tool_status
         strategy_summary.warnings = batch.warnings
         strategy_summary.candidate_source_counts = batch.candidate_source_counts
+        strategy_summary.provenance = batch.provenance
         strategy_summary.proposed_count = len(batch.candidates)
         summary.generated_count += len(batch.candidates)
         summary.warnings.extend(
@@ -951,7 +1025,11 @@ def _candidate_tool_labels(
     tool_status: dict[str, Any],
     external_pending_label: str,
 ) -> tuple[str, ...]:
-    labels = ["external_generation_adapter_pending", external_pending_label]
+    labels = [
+        "external_generation_adapter_pending",
+        "external_generation_fallback_used",
+        external_pending_label,
+    ]
     if tool_status["rdkit"]["available"]:
         labels.append("rdkit_generated")
         labels.append("rdkit_scored")
@@ -966,6 +1044,47 @@ def _candidate_source_counts(candidates: list[GenerationCandidate]) -> dict[str,
         source = str(candidate.metadata.get("candidate_source", "unknown"))
         counts[source] = counts.get(source, 0) + 1
     return counts
+
+
+def _external_generation_candidates(
+    *,
+    strategy: str,
+    source: str,
+    generated_smiles: list[str],
+    scores: list[float | None],
+    seeds: list[str],
+    constraints: dict[str, Any],
+    rationale: str,
+    labels: list[str],
+    adapter_mode: str,
+    provenance: dict[str, Any],
+) -> list[GenerationCandidate]:
+    candidates: list[GenerationCandidate] = []
+    for index, smiles in enumerate(generated_smiles):
+        normalized = _standardize_or_normalize_smiles(smiles)
+        rdkit_validated = _canonicalize_with_rdkit(normalized)
+        if not rdkit_validated:
+            continue
+        normalized = rdkit_validated
+        if not _satisfies_generation_constraints(normalized, seeds, constraints):
+            continue
+        candidates.append(
+            GenerationCandidate(
+                smiles=normalized,
+                strategy=strategy,
+                seed_smiles=seeds[0] if seeds else "",
+                rationale=rationale,
+                labels=tuple(labels),
+                score=scores[index] if index < len(scores) else None,
+                metadata={
+                    "adapter_mode": adapter_mode,
+                    "candidate_source": source,
+                    "tool_score_semantics": provenance.get("score_semantics"),
+                    "tool_provenance": provenance,
+                },
+            )
+        )
+    return candidates
 
 
 def _strategy_tool_status(tool_status: dict[str, Any], keys: list[str]) -> dict[str, Any]:

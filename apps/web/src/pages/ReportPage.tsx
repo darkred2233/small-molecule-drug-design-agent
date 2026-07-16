@@ -137,6 +137,17 @@ export default function ReportPage() {
             <Metric label="口袋数" value={candidateSummary.binding_site_count ?? 0} tone="sky" />
             <Metric label="合成路线" value={candidateSummary.synthesis_route_count ?? 0} tone="amber" />
           </div>
+
+          {report.final_report?.executive_summary?.length ? (
+            <div className="mt-5 rounded-lg border border-cyan-100 bg-cyan-50/40 p-4">
+              <div className="text-sm font-semibold text-cyan-900">最终中文摘要</div>
+              <ul className="mt-2 space-y-2 text-sm leading-6 text-slate-700">
+                {report.final_report.executive_summary.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
         </section>
 
         <section className="grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(0,0.65fr)]">
@@ -361,8 +372,19 @@ export default function ReportPage() {
                   ]}
                 />
                 <div className="rounded-lg border border-cyan-100 bg-cyan-50/50 p-3 text-sm text-slate-600">
-                  这个报告已经把靶点、口袋、SAR、ADMET 和合成路线聚合到同一个视图里，适合继续往前端的交互层扩展。
+                  {report.final_report?.title ??
+                    '这个报告已经把靶点、口袋、SAR、ADMET 和合成路线聚合到同一个视图里。'}
                 </div>
+                {report.final_report?.next_steps?.length ? (
+                  <div className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3">
+                    <div className="text-sm font-semibold text-emerald-900">下一步建议</div>
+                    <ul className="mt-2 space-y-1 text-xs leading-5 text-slate-700">
+                      {report.final_report.next_steps.slice(0, 4).map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
               </div>
             </Panel>
 
@@ -384,6 +406,11 @@ export default function ReportPage() {
                     <div className="mt-3 rounded bg-white px-2 py-1 font-mono text-xs text-slate-700">
                       {shortSmiles(topCandidate.smiles)}
                     </div>
+                    {topCandidate.narrative?.summary && (
+                      <p className="mt-3 text-sm leading-6 text-emerald-950">
+                        {topCandidate.narrative.summary}
+                      </p>
+                    )}
                   </div>
                   <div className="space-y-2 text-sm">
                     <MiniLine label="正向证据分" value={formatNumber(topCandidate.pro_score, 2)} />
@@ -760,8 +787,72 @@ function TopCandidateDetailCard({
         <Datum label="合成" value={synthesis?.detail ?? '未评估'} />
       </div>
 
+      <MoleculeNarrativeBlock candidate={candidate} />
       <CandidateEvidenceBlock projectId={projectId} candidate={candidate} />
     </article>
+  );
+}
+
+function MoleculeNarrativeBlock({ candidate }: { candidate: ReportCandidate }) {
+  const narrative = candidate.narrative;
+  if (!narrative) {
+    return null;
+  }
+
+  return (
+    <section className="mt-4 rounded-lg border border-emerald-100 bg-emerald-50/40 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-xs font-semibold text-emerald-900">中文解读</div>
+        <StatusChip tone="emerald">
+          {narrative.evidence_refs.length} 条证据
+        </StatusChip>
+      </div>
+      <p className="mt-2 text-sm leading-6 text-slate-700">{narrative.summary}</p>
+      {narrative.why_it_matters && (
+        <p className="mt-2 text-xs leading-5 text-slate-600">{narrative.why_it_matters}</p>
+      )}
+      <div className="mt-3 grid gap-3 md:grid-cols-3">
+        <NarrativeList title="优势" items={narrative.strengths} tone="emerald" />
+        <NarrativeList title="风险" items={narrative.risks} tone="amber" />
+        <NarrativeList title="下一轮" items={narrative.next_round_suggestions} tone="cyan" />
+      </div>
+      {narrative.evidence_refs.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {narrative.evidence_refs.slice(0, 5).map((item, index) => (
+            <Badge key={`${item.type}-${item.source ?? index}`} tone="slate">
+              {formatNarrativeEvidenceType(item.type)}
+            </Badge>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function NarrativeList({
+  title,
+  items,
+  tone,
+}: {
+  title: string;
+  items: string[];
+  tone: 'cyan' | 'emerald' | 'amber';
+}) {
+  return (
+    <div>
+      <div className="mb-1">
+        <Badge tone={tone}>{title}</Badge>
+      </div>
+      {items.length ? (
+        <ul className="space-y-1 text-xs leading-5 text-slate-600">
+          {items.slice(0, 3).map((item) => (
+            <li key={item}>{item}</li>
+          ))}
+        </ul>
+      ) : (
+        <div className="text-xs text-slate-500">暂无</div>
+      )}
+    </div>
   );
 }
 
@@ -1124,6 +1215,17 @@ function formatAdmetRuntime(admet?: AdmetSummary | null) {
   const model = admet.model_name ?? admet.tool_name ?? admet.adapter_mode ?? '模型未记录';
   const device = admet.compute_device ? admet.compute_device.toUpperCase() : '设备未记录';
   return `${model} / ${device}`;
+}
+
+function formatNarrativeEvidenceType(type: string) {
+  const labels: Record<string, string> = {
+    ranking_score: '排序',
+    docking_pose: 'Pose',
+    admet_prediction: 'ADMET',
+    synthesis_score: '合成',
+    rag_reference: '文献',
+  };
+  return labels[type] ?? type;
 }
 
 function Badge({ children, tone }: { children: ReactNode; tone: 'cyan' | 'emerald' | 'slate' | 'amber' | 'rose' }) {

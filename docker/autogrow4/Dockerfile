@@ -6,7 +6,11 @@ WORKDIR /app
 ARG DEBIAN_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
 ARG DEBIAN_SECURITY_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian-security
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ARG AUTOGROW4_REPO=https://github.com/durrantlab/autogrow4.git
+ARG AUTOGROW4_REF=1b47b3fe2d9faa76a904533bea2312326a3f44c5
+
+LABEL org.opencontainers.image.source="https://github.com/durrantlab/autogrow4" \
+      org.opencontainers.image.version="v4.0.3" \
+      org.opencontainers.image.revision="${AUTOGROW4_REF}"
 
 ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_DEFAULT_TIMEOUT=120 \
@@ -33,6 +37,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    curl \
     git \
     openbabel \
     autodock-vina \
@@ -42,8 +47,22 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install rdkit-pypi numpy scipy
 
-# Install AutoGrow4
-RUN git clone --depth 1 --filter=blob:none ${AUTOGROW4_REPO} /app/autogrow4
+# Install the reviewed AutoGrow4 v4.0.3 source revision. AUTOGROW4_REF remains
+# a build argument so upgrades are explicit and visible in image metadata.
+RUN set -eux; \
+    curl -fL \
+        --retry 20 \
+        --retry-all-errors \
+        --retry-delay 5 \
+        --connect-timeout 60 \
+        --max-time 600 \
+        -o /tmp/autogrow4.tar.gz \
+        "https://codeload.github.com/durrantlab/autogrow4/tar.gz/${AUTOGROW4_REF}"; \
+    tar -tzf /tmp/autogrow4.tar.gz >/dev/null; \
+    mkdir -p /app/autogrow4; \
+    tar -xzf /tmp/autogrow4.tar.gz -C /app/autogrow4 --strip-components=1; \
+    rm -f /tmp/autogrow4.tar.gz; \
+    test -f /app/autogrow4/RunAutogrow.py -o -f /app/autogrow4/run_autogrow.py
 
 # AutoGrow4 is a script-style source tree, not a pip-installable package.
 # Keep the upstream source and expose a module shim for `python -m autogrow4`.

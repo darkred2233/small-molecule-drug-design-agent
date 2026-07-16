@@ -1,456 +1,426 @@
-from collections.abc import Callable
-from dataclasses import asdict
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from medagent.agents.generation import run_generation_agent
 from medagent.configs.settings import Settings
-from medagent.agents.sar import SARAgent
-from medagent.agents.target import TargetAgent
-from medagent.db.models import AgentRun, Molecule, Project
-from medagent.pipeline.graph import PIPELINE_AGENTS
-from medagent.pipeline.state import (
-    PIPELINE_COMPLETED,
-    PIPELINE_FAILED,
-    PIPELINE_QUEUED,
-    PIPELINE_RUNNING,
-)
+from medagent.db.models import AgentRun, Molecule, Project, Ranking
+from medagent.domain.schemas import AgentResult, AgentTask, RunPlan
+from medagent.pipeline.state import PIPELINE_FAILED
 from medagent.services.advisor import generate_project_advice
-from medagent.services.candidate_assessment import run_project_candidate_assessment
+from medagent.services.candidate_assessment import (
+    candidate_assessment_tool_status,
+    run_project_candidate_assessment,
+    run_project_synthesis,
+)
 from medagent.services.candidate_ranking import generate_project_rankings
-from medagent.services.decision_cards import generate_project_decision_cards
-from medagent.services.file_ingestion import parse_pending_project_files
 from medagent.services.ids import new_id
-from medagent.services.molecule_generation import generate_project_molecules
-from medagent.services.molecule_import import import_seed_ligands_as_molecules
-from medagent.services.molecule_validation import validate_project_molecules
-from medagent.services.rag import build_project_rag_index
+from medagent.services.molecule_generation import (
+    _standardize_or_normalize_smiles,
+    collect_generation_seed_smiles,
+)
+from medagent.services.molecule_import import is_lightly_valid_smiles
+from medagent.services.molecule_validation import merge_labels, validate_project_molecules
+from medagent.services.narrative import (
+    persist_project_final_report,
+    persist_project_molecule_narratives,
+)
 from medagent.reporting.project_report import build_project_report
 from medagent.services.receptor_preparation import project_docking_config
-from medagent.services.self_refutation import generate_project_critiques
+from medagent.services.run_plan import DEFAULT_GENERATION_CONSTRAINTS
 from medagent.services.rule_filtering import filter_project_molecules
-
-
-DEFAULT_PIPELINE_CONFIG = {
-    "strategy_counts": {"reinvent4": 10, "crem": 10, "autogrow4": 10},
-    "top_n": 20,
-    "max_assessment_molecules": 50,
-    "assessment_mode": "external",
-    "external_top_n": 10,
-    "generate_when_seeds_exist": True,
-}
-ASSESSMENT_MODES = {"fast", "external", "full"}
-DEFAULT_GENERATION_CONSTRAINTS = {
-    "max_mw": 500,
-    "max_logp": 5,
-    "max_tpsa": 140,
-    "max_hbd": 5,
-    "max_hba": 10,
-}
 
 
 class PipelineOrchestrator:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def create_dry_run(self, db: Session, project: Project) -> list[AgentRun]:
-        runs: list[AgentRun] = []
-        for agent_name, default_model in PIPELINE_AGENTS:
-            model_name = self._resolve_model(default_model)
-            run = AgentRun(
-                agent_run_id=new_id("RUN"),
-                project_id=project.project_id,
-                agent_name=agent_name,
-                model_name=model_name,
-                status="queued",
-                input_json={"project_id": project.project_id, "mode": "dry_run"},
-                output_json={
-                    "message": "Registered pipeline step. Real execution adapter is not connected yet."
-                },
-            )
-            db.add(run)
-            runs.append(run)
-        project.status = PIPELINE_QUEUED
-        db.commit()
-        return runs
-
-    def run_full(
+    def run_iterative(
         self,
         db: Session,
         project: Project,
-        pipeline_config: dict[str, Any] | None = None,
+        run_plan: RunPlan | dict[str, Any] | None = None,
     ) -> list[AgentRun]:
-        config = _normalize_pipeline_config(project, pipeline_config)
-        runs: list[AgentRun] = []
-        project.status = PIPELINE_RUNNING
-        db.commit()
+        from medagent.services.run_plan import ensure_project_run_plan, save_project_run_plan
 
-        step_outputs: dict[str, dict[str, Any]] = {}
+        plan = _coerce_run_plan(run_plan) if run_plan is not None else ensure_project_run_plan(project)
+        plan.status = "running"
+        save_project_run_plan(project, plan)
+        project.status = "iterative_running"
 
-        def record_output(agent_name: str, output: dict[str, Any]) -> dict[str, Any]:
-            step_outputs[agent_name] = output
-            return output
-
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "knowledge_ingestion_agent",
-                "qwen3.7-plus",
-                {"mode": "full"},
-                lambda: record_output(
-                    "knowledge_ingestion_agent",
-                    self._run_knowledge_ingestion(db, project),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "molecule_import_agent",
-                "tool-adapter",
-                {
-                    "mode": "full",
-                    "seed_ligands_created": step_outputs["knowledge_ingestion_agent"].get(
-                        "file_ingestion", {}
-                    ).get("seed_ligands_created", 0),
-                },
-                lambda: record_output(
-                    "molecule_import_agent",
-                    import_seed_ligands_as_molecules(db, project),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "target_agent",
-                "qwen3.7-plus",
-                {"mode": "full", "target_id": project.target_id},
-                lambda: record_output(
-                    "target_agent",
-                    self._run_target_analysis(db, project),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "sar_agent",
-                "qwen3.7-plus",
-                {
-                    "mode": "full",
-                    "seed_molecule_count": self._molecule_count(db, project),
-                },
-                lambda: record_output(
-                    "sar_agent",
-                    self._run_sar_analysis(db, project),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "generator_agent",
-                "qwen3.7-max",
-                {
-                    "mode": "full",
-                    "strategy_counts": config["strategy_counts"],
-                    "requested_generation_size": config["generation_size"],
-                },
-                lambda: record_output(
-                    "generator_agent",
-                    self._run_generation_if_needed(db, project, config),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "validation_agent",
-                "tool-adapter",
-                {"mode": "full", "molecule_count": self._molecule_count(db, project)},
-                lambda: record_output(
-                    "validation_agent",
-                    validate_project_molecules(db, project),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "filter_agent",
-                "tool-adapter",
-                {"mode": "full", "molecule_count": self._molecule_count(db, project)},
-                lambda: record_output(
-                    "filter_agent",
-                    filter_project_molecules(db, project),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "candidate_assessment_agent",
-                "tool-adapter",
-                {
-                    "mode": "full",
-                    "max_molecules": config["max_assessment_molecules"],
-                    "top_n": config["top_n"],
-                    "assessment_mode": config["assessment_mode"],
-                    "external_top_n": config["external_top_n"],
-                    "passed_filter_count": self._molecule_count(db, project, status="passed_filter"),
-                },
-                lambda: record_output(
-                    "candidate_assessment_agent",
-                    run_project_candidate_assessment(
-                        db,
-                        project,
-                        max_molecules=config["max_assessment_molecules"],
-                        top_n=config["top_n"],
-                        assessment_mode=config["assessment_mode"],
-                        external_top_n=config["external_top_n"],
-                    ),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "self_refutation_agent",
-                "deepseek-v4-pro",
-                {"mode": "full", "max_molecules": config["max_assessment_molecules"]},
-                lambda: record_output(
-                    "self_refutation_agent",
-                    generate_project_critiques(
-                        db,
-                        project,
-                        settings=self.settings,
-                        max_molecules=config["max_assessment_molecules"],
-                    ),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "ranker_agent",
-                "qwen3.7-max",
-                {
-                    "mode": "full",
-                    "max_molecules": config["max_assessment_molecules"],
-                    "top_n": config["top_n"],
-                    "source": "self_refutation",
-                },
-                lambda: record_output(
-                    "ranker_agent",
-                    generate_project_rankings(
-                        db,
-                        project,
-                        max_molecules=config["max_assessment_molecules"],
-                        top_n=config["top_n"],
-                    ).as_dict(),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "advisor_agent",
-                "qwen3.7-plus",
-                {"mode": "full"},
-                lambda: record_output(
-                    "advisor_agent",
-                    generate_project_advice(db, project),
-                ),
-            )
-        )
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "decision_card_agent",
-                "qwen3.7-plus",
-                {"mode": "full", "molecule_count": self._molecule_count(db, project)},
-                lambda: record_output(
-                    "decision_card_agent",
-                    generate_project_decision_cards(db, project),
-                ),
-            )
-        )
-        project.status = PIPELINE_COMPLETED
-        db.commit()
-        runs.append(
-            self._run_step(
-                db,
-                project,
-                "report_agent",
-                "qwen3.7-plus",
-                {"mode": "full"},
-                lambda: record_output(
-                    "report_agent",
-                    build_project_report(db, project),
-                ),
-            )
-        )
-
-        db.commit()
-        return runs
-
-    def _resolve_model(self, default_model: str) -> str:
-        if default_model == "deepseek-v4-pro" and not self.settings.self_refutation_use_llm:
-            return "heuristic_self_refutation"
-        model_map = {
-            "qwen3.7-max": self.settings.qwen_reasoning_model,
-            "qwen3.7-plus": self.settings.qwen_task_model,
-            "deepseek-v4-pro": self.settings.deepseek_refutation_model,
-            "text-embedding-v4": self.settings.embedding_model,
-        }
-        return model_map.get(default_model, default_model)
-
-    def _run_step(
-        self,
-        db: Session,
-        project: Project,
-        agent_name: str,
-        default_model: str,
-        input_json: dict[str, Any],
-        operation: Callable[[], dict[str, Any]],
-    ) -> AgentRun:
-        run = AgentRun(
+        orchestrator_run = AgentRun(
             agent_run_id=new_id("RUN"),
             project_id=project.project_id,
-            agent_name=agent_name,
-            model_name=self._resolve_model(default_model),
+            agent_name="iterative_orchestrator_agent",
+            model_name="deterministic-orchestrator",
             status="running",
-            input_json={"project_id": project.project_id, **input_json},
-            output_json={},
+            input_json={
+                "project_id": project.project_id,
+                "run_plan": _schema_to_payload(plan),
+            },
+            output_json={
+                "rounds": [],
+                "status": "running",
+            },
         )
-        db.add(run)
+        db.add(orchestrator_run)
+        db.add(project)
         db.commit()
 
+        runs: list[AgentRun] = [orchestrator_run]
+        round_summaries: list[dict[str, Any]] = []
+        final_route_summary: dict[str, Any] | None = None
+        stop_reason = "max_rounds_reached"
+        previous_top_score: float | None = None
+        consecutive_tool_failures = 0
+        seeds = _initial_iterative_seed_smiles(db, project, plan)
+        advisor_context: list[str] = []
+
         try:
-            output = operation()
+            if not seeds:
+                stop_reason = "generation_requires_at_least_one_seed_ligand"
+            else:
+                for round_number in range(1, plan.max_rounds + 1):
+                    remaining_total = plan.stopping.max_total_molecules - self._molecule_count(db, project)
+                    if remaining_total <= 0:
+                        stop_reason = "max_total_molecules_reached"
+                        break
+
+                    tasks = _generation_tasks_from_run_plan(
+                        db,
+                        project,
+                        plan,
+                        round_number=round_number,
+                        seed_molecules=seeds,
+                        sar_context=advisor_context,
+                        remaining_total=remaining_total,
+                    )
+                    if not tasks:
+                        stop_reason = "run_plan_has_no_enabled_generation_agents"
+                        break
+
+                    round_summary: dict[str, Any] = {
+                        "round": round_number,
+                        "seed_molecules": seeds,
+                        "agents": [],
+                        "stored_molecule_ids": [],
+                        "validation": None,
+                        "filtering": None,
+                        "assessment": None,
+                        "advisor": None,
+                        "top_score": None,
+                        "score_improvement": None,
+                        "stop_reason": None,
+                    }
+                    stored_molecule_ids: list[str] = []
+                    round_agent_failures = 0
+
+                    for task in tasks:
+                        agent_run, result, storage_summary = self._run_generation_agent_task(
+                            db,
+                            project,
+                            task,
+                        )
+                        runs.append(agent_run)
+                        round_summary["agents"].append(
+                            {
+                                "agent_run_id": agent_run.agent_run_id,
+                                "agent": task.agent,
+                                "status": result.status,
+                                "success": result.success,
+                                "failure_reason": result.failure_reason,
+                                "warnings": result.warnings,
+                                "requested_count": task.constraints.get("requested_count"),
+                                "proposed_count": len(result.molecules),
+                                "stored_count": storage_summary["stored_count"],
+                                "molecule_ids": storage_summary["molecule_ids"],
+                            }
+                        )
+                        stored_molecule_ids.extend(storage_summary["molecule_ids"])
+                        if not result.success and result.status != "skipped":
+                            round_agent_failures += 1
+
+                    stored_molecule_ids = _dedupe(stored_molecule_ids)
+                    round_summary["stored_molecule_ids"] = stored_molecule_ids
+                    if round_agent_failures:
+                        consecutive_tool_failures += round_agent_failures
+                    else:
+                        consecutive_tool_failures = 0
+
+                    if not stored_molecule_ids:
+                        round_summary["stop_reason"] = "round_returned_no_new_candidates"
+                        round_summaries.append(round_summary)
+                        stop_reason = "round_returned_no_new_candidates"
+                        _update_iterative_run(orchestrator_run, round_summaries, stop_reason)
+                        db.commit()
+                        break
+
+                    round_summary["validation"] = validate_project_molecules(db, project)
+                    if plan.evaluation.use_filters:
+                        round_summary["filtering"] = filter_project_molecules(db, project)
+
+                    round_summary["assessment"] = self._run_iterative_round_assessment(
+                        db,
+                        project,
+                        plan,
+                        molecule_ids=stored_molecule_ids,
+                        round_number=round_number,
+                    )
+                    round_summary["advisor"] = generate_project_advice(db, project)
+                    advisor_context = _advisor_context(round_summary["advisor"])
+
+                    top_score = _top_ranking_score(db, project)
+                    round_summary["top_score"] = top_score
+                    if previous_top_score is not None and top_score is not None:
+                        round_summary["score_improvement"] = round(top_score - previous_top_score, 3)
+                    if top_score is not None:
+                        previous_top_score = top_score
+
+                    seeds = _top_ranked_seed_smiles(
+                        db,
+                        project,
+                        top_n=min(plan.evaluation.top_n, plan.next_round_seed_count),
+                    ) or seeds
+                    round_summaries.append(round_summary)
+                    _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                    db.commit()
+
+                    if consecutive_tool_failures >= plan.stopping.max_tool_failures:
+                        stop_reason = "max_tool_failures_reached"
+                        round_summary["stop_reason"] = stop_reason
+                        break
+                    if self._molecule_count(db, project) >= plan.stopping.max_total_molecules:
+                        stop_reason = "max_total_molecules_reached"
+                        round_summary["stop_reason"] = stop_reason
+                        break
+                    improvement = round_summary.get("score_improvement")
+                    if (
+                        round_number > 1
+                        and plan.stopping.min_score_improvement > 0
+                        and improvement is not None
+                        and improvement < plan.stopping.min_score_improvement
+                    ):
+                        stop_reason = "min_score_improvement_not_met"
+                        round_summary["stop_reason"] = stop_reason
+                        break
+
+            final_route_summary = self._run_final_synthesis_routes_if_needed(db, project, plan)
+            if final_route_summary is not None:
+                round_summaries.append(
+                    {
+                        "round": "final_route_prediction",
+                        "synthesis_routes": final_route_summary,
+                    }
+                )
+                generate_project_advice(db, project)
+
+            plan.status = "completed"
+            plan.decision_trace.append(
+                {
+                    "step": "run_iterative_completed",
+                    "reason": "RunPlan 已由 iterative orchestrator 执行完成。",
+                    "rounds_executed": len(
+                        [item for item in round_summaries if isinstance(item.get("round"), int)]
+                    ),
+                    "stop_reason": stop_reason,
+                }
+            )
+            save_project_run_plan(project, plan)
+            project.status = "iterative_completed"
+            orchestrator_run.status = "completed"
+            orchestrator_run.output_json = {
+                "status": "completed",
+                "stop_reason": stop_reason,
+                "rounds": round_summaries,
+                "final_synthesis_routes": final_route_summary,
+            }
+            db.add(project)
+            db.add(orchestrator_run)
+            db.commit()
+            report = build_project_report(db, project)
+            runs.append(
+                persist_project_molecule_narratives(
+                    db,
+                    project,
+                    report,
+                    top_n=plan.evaluation.top_n,
+                )
+            )
+            runs.append(persist_project_final_report(db, project, report))
+            return runs
         except Exception as exc:
             db.rollback()
-            run.status = "failed"
-            run.error_message = str(exc)
-            run.output_json = {"error": str(exc)}
+            plan.status = "failed"
+            plan.warnings.append(f"run_iterative_failed:{type(exc).__name__}")
+            save_project_run_plan(project, plan)
             project.status = PIPELINE_FAILED
-            db.add(run)
+            failed_run = (
+                db.query(AgentRun)
+                .filter_by(agent_run_id=orchestrator_run.agent_run_id)
+                .one_or_none()
+            )
+            if failed_run is None:
+                failed_run = orchestrator_run
+                db.add(failed_run)
+            failed_run.status = "failed"
+            failed_run.error_message = str(exc)
+            failed_run.output_json = {
+                "status": "failed",
+                "error": str(exc),
+                "rounds": round_summaries,
+            }
             db.add(project)
             db.commit()
             raise
 
-        run.status = "completed"
-        run.output_json = output
-        run.error_message = None
-        db.commit()
-        return run
-
-    def _run_knowledge_ingestion(self, db: Session, project: Project) -> dict[str, Any]:
-        file_ingestion = parse_pending_project_files(db, self.settings, project)
-        rag_index = build_project_rag_index(
-            db,
-            self.settings,
-            project,
-            include_builtin_target=True,
-            include_uploads=True,
-            rebuild=True,
-        )
-        return {
-            "file_ingestion": file_ingestion,
-            "rag_index": rag_index,
-        }
-
-    def _run_target_analysis(self, db: Session, project: Project) -> dict[str, Any]:
-        use_llm = bool(self.settings.dashscope_api_key)
-        report = TargetAgent(db).analyze_target(project, use_llm=use_llm)
-        return {
-            **asdict(report),
-            "analysis_mode": "llm_with_rule_fallback" if use_llm else "rule_based",
-        }
-
-    def _run_sar_analysis(self, db: Session, project: Project) -> dict[str, Any]:
-        use_llm = bool(self.settings.dashscope_api_key)
-        report = SARAgent(db).analyze_sar(project, use_llm=use_llm)
-        return {
-            **asdict(report),
-            "analysis_mode": "llm_with_rule_fallback" if use_llm else "rule_based",
-        }
-
-    def _run_generation_if_needed(
+    def _run_iterative_round_assessment(
         self,
         db: Session,
         project: Project,
-        config: dict[str, Any],
+        plan: RunPlan,
+        *,
+        molecule_ids: list[str],
+        round_number: int,
     ) -> dict[str, Any]:
-        existing_count = self._molecule_count(db, project)
-        strategy_counts = config["strategy_counts"]
-        requested_size = config["generation_size"]
-        selected_strategies = [
-            strategy for strategy, count in strategy_counts.items() if count > 0
-        ]
-        if requested_size <= 0:
-            return {
-                "skipped": True,
-                "reason": "generation_size_is_zero",
-                "molecule_count": existing_count,
-                "strategy_counts": strategy_counts,
-            }
-        if existing_count > 0 and not config["generate_when_seeds_exist"]:
-            return {
-                "skipped": True,
-                "reason": "existing_molecules_available",
-                "molecule_count": existing_count,
-                "strategy_counts": strategy_counts,
-            }
+        assessment_mode = _assessment_mode_for_run_plan(plan)
+        external_synthesis_routes = (
+            plan.evaluation.use_synthesis
+            and plan.evaluation.synthesis_route_scope == "every_round_top_n"
+        )
+        docking_config = project_docking_config(
+            db,
+            project,
+            plan.constraints.get("binding_site_id"),
+        )
+        return run_project_candidate_assessment(
+            db,
+            project,
+            molecule_ids=molecule_ids,
+            max_molecules=len(molecule_ids),
+            top_n=plan.evaluation.top_n,
+            assessment_mode=assessment_mode,
+            external_top_n=plan.evaluation.top_n,
+            binding_site_id=docking_config.get("binding_site_id"),
+            protein_file=docking_config.get("protein_file"),
+            grid_center=docking_config.get("grid_center"),
+            grid_size=docking_config.get("grid_size"),
+            key_residues=docking_config.get("key_residues") or [],
+            max_synthesis_steps=_bounded_int(
+                plan.constraints.get("max_synthesis_steps"),
+                5,
+                1,
+                12,
+            ),
+            prefer_buyable_building_blocks=bool(
+                plan.constraints.get("prefer_buyable_building_blocks", True)
+            ),
+            enable_external_synthesis_routes=external_synthesis_routes,
+        ) | {
+            "round": round_number,
+            "external_synthesis_route_scope": plan.evaluation.synthesis_route_scope,
+        }
+
+    def _run_generation_agent_task(
+        self,
+        db: Session,
+        project: Project,
+        task: AgentTask,
+    ) -> tuple[AgentRun, AgentResult, dict[str, Any]]:
+        agent_run = AgentRun(
+            agent_run_id=new_id("RUN"),
+            project_id=project.project_id,
+            agent_name=f"{task.agent}_agent",
+            model_name="tool-adapter",
+            status="running",
+            input_json={"project_id": project.project_id, "task": _schema_to_payload(task)},
+            output_json={},
+        )
+        db.add(agent_run)
+        db.commit()
+
         try:
-            generation_constraints = dict(
-                config.get("generation_constraints") or DEFAULT_GENERATION_CONSTRAINTS
+            result = run_generation_agent(task)
+            storage_summary = _store_agent_result_molecules(db, project, result)
+            agent_run.status = result.status
+            agent_run.output_json = {
+                "result": _schema_to_payload(result),
+                "storage": storage_summary,
+            }
+            agent_run.error_message = result.failure_reason
+            db.add(agent_run)
+            db.commit()
+            return agent_run, result, storage_summary
+        except Exception as exc:
+            result = AgentResult(
+                agent=task.agent,
+                round=task.round,
+                success=False,
+                status="failed",
+                molecules=[],
+                warnings=[],
+                failure_reason=f"generation_agent_exception:{type(exc).__name__}",
             )
-            docking_config = project_docking_config(
-                db,
-                project,
-                generation_constraints.get("binding_site_id"),
-            )
-            if docking_config.get("protein_file"):
-                generation_constraints.setdefault(
-                    "receptor_file",
-                    docking_config["protein_file"],
-                )
-            for key in ("grid_center", "grid_size", "key_residues"):
-                if docking_config.get(key):
-                    generation_constraints.setdefault(key, docking_config[key])
-            return generate_project_molecules(
-                db,
-                project,
-                generation_size=requested_size,
-                strategies=selected_strategies,
-                strategy_counts=strategy_counts,
-                constraints=generation_constraints,
-                include_target_library_seeds=True,
-                agent_run_name="molecule_generation_tool_agent",
-            )
-        except ValueError as exc:
-            if str(exc) != "generation_requires_at_least_one_seed_ligand":
-                raise
+            agent_run.status = "failed"
+            agent_run.error_message = str(exc)
+            agent_run.output_json = {
+                "result": _schema_to_payload(result),
+                "error": str(exc),
+                "storage": _empty_storage_summary(),
+            }
+            db.add(agent_run)
+            db.commit()
+            return agent_run, result, _empty_storage_summary()
+
+    def _run_final_synthesis_routes_if_needed(
+        self,
+        db: Session,
+        project: Project,
+        plan: RunPlan,
+    ) -> dict[str, Any] | None:
+        if not plan.evaluation.use_synthesis:
+            return None
+        if plan.evaluation.synthesis_route_scope != "final_round_top_n":
+            return None
+
+        top_molecules = _top_ranked_molecules(db, project, top_n=plan.evaluation.top_n)
+        if not top_molecules:
             return {
                 "skipped": True,
-                "reason": "generation_requires_at_least_one_seed_ligand",
-                "molecule_count": 0,
-                "warnings": [str(exc)],
+                "reason": "no_ranked_molecules_for_final_synthesis_routes",
             }
+
+        tool_status = candidate_assessment_tool_status()
+        synthesis = run_project_synthesis(
+            db,
+            project,
+            top_molecules,
+            tool_status,
+            allow_external_tools=True,
+            max_synthesis_steps=_bounded_int(
+                plan.constraints.get("max_synthesis_steps"),
+                5,
+                1,
+                12,
+            ),
+            prefer_buyable_building_blocks=bool(
+                plan.constraints.get("prefer_buyable_building_blocks", True)
+            ),
+        )
+        ranking = generate_project_rankings(
+            db,
+            project,
+            molecules=top_molecules,
+            max_molecules=len(top_molecules),
+            top_n=plan.evaluation.top_n,
+            tool_status=tool_status,
+        )
+        return {
+            "skipped": False,
+            "scope": "final_round_top_n",
+            "molecule_ids": [molecule.molecule_id for molecule in top_molecules],
+            "synthesis": synthesis.as_dict(),
+            "ranking": ranking.as_dict(),
+        }
 
     def _molecule_count(self, db: Session, project: Project, status: str | None = None) -> int:
         query = db.query(Molecule).filter_by(project_id=project.project_id)
@@ -459,72 +429,272 @@ class PipelineOrchestrator:
         return query.count()
 
 
-def _normalize_pipeline_config(
+def _generation_tasks_from_run_plan(
+    db: Session,
     project: Project,
-    override: dict[str, Any] | None = None,
+    plan: RunPlan,
+    *,
+    round_number: int,
+    seed_molecules: list[str],
+    sar_context: list[str],
+    remaining_total: int,
+) -> list[AgentTask]:
+    constraints = _generation_constraints_for_round(db, project, plan, round_number=round_number)
+    tasks: list[AgentTask] = []
+    remaining = max(0, remaining_total)
+    for agent_name in ("reinvent4", "crem", "autogrow4"):
+        config = plan.agents.get(agent_name)
+        if config is None or config.enabled is False:
+            continue
+        requested_count = min(config.requested_count, remaining)
+        if requested_count <= 0:
+            continue
+        agent_constraints = {
+            **constraints,
+            "requested_count": requested_count,
+        }
+        tasks.append(
+            AgentTask(
+                round=round_number,
+                agent=agent_name,
+                seed_molecules=seed_molecules,
+                constraints=agent_constraints,
+                budget=config.budget,
+                sar_context=sar_context,
+                evaluation_context={
+                    "target_id": project.target_id,
+                    "objective": plan.objective,
+                    "use_docking": plan.evaluation.use_docking,
+                    "use_admet": plan.evaluation.use_admet,
+                    "use_synthesis": plan.evaluation.use_synthesis,
+                    "synthesis_route_scope": plan.evaluation.synthesis_route_scope,
+                    "top_n": plan.evaluation.top_n,
+                },
+            )
+        )
+        remaining -= requested_count
+    return tasks
+
+
+def _generation_constraints_for_round(
+    db: Session,
+    project: Project,
+    plan: RunPlan,
+    *,
+    round_number: int,
 ) -> dict[str, Any]:
-    stored = (project.constraints_json or {}).get("pipeline_config", {})
-    raw = {
-        **DEFAULT_PIPELINE_CONFIG,
-        **(stored if isinstance(stored, dict) else {}),
-        **(override if isinstance(override, dict) else {}),
+    constraints = {
+        **DEFAULT_GENERATION_CONSTRAINTS,
+        **dict(plan.constraints or {}),
+        "optimization_round": round_number,
     }
-    strategy_counts = _normalize_strategy_counts(raw.get("strategy_counts"))
-    top_n = _bounded_int(raw.get("top_n"), DEFAULT_PIPELINE_CONFIG["top_n"], 1, 500)
-    max_assessment_molecules = _bounded_int(
-        raw.get("max_assessment_molecules"),
-        max(top_n, DEFAULT_PIPELINE_CONFIG["max_assessment_molecules"]),
-        1,
-        500,
-    )
-    max_assessment_molecules = max(max_assessment_molecules, top_n)
-    generation_constraints = _normalize_generation_constraints(stored, raw)
-    assessment_mode = _normalize_assessment_mode(raw.get("assessment_mode"))
-    external_top_n = _bounded_int(
-        raw.get("external_top_n"),
-        DEFAULT_PIPELINE_CONFIG["external_top_n"],
-        1,
-        100,
-    )
-    return {
-        "strategy_counts": strategy_counts,
-        "generation_size": sum(strategy_counts.values()),
-        "top_n": top_n,
-        "max_assessment_molecules": max_assessment_molecules,
-        "assessment_mode": assessment_mode,
-        "external_top_n": external_top_n,
-        "generate_when_seeds_exist": bool(raw.get("generate_when_seeds_exist", True)),
-        "generation_constraints": generation_constraints,
-    }
-
-
-def _normalize_strategy_counts(raw: Any) -> dict[str, int]:
-    defaults = DEFAULT_PIPELINE_CONFIG["strategy_counts"]
-    if not isinstance(raw, dict):
-        raw = {}
-    counts: dict[str, int] = {}
-    for strategy, default_count in defaults.items():
-        counts[strategy] = _bounded_int(raw.get(strategy), default_count, 0, 500)
-    return counts
-
-
-def _normalize_generation_constraints(stored: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
-    constraints = dict(DEFAULT_GENERATION_CONSTRAINTS)
-    for source in (
-        stored.get("generation_constraints") if isinstance(stored, dict) else None,
-        raw.get("generation_constraints"),
-    ):
-        if isinstance(source, dict):
-            constraints.update({key: value for key, value in source.items() if value is not None})
+    docking_config = project_docking_config(db, project, constraints.get("binding_site_id"))
+    if docking_config.get("protein_file"):
+        constraints.setdefault("receptor_file", docking_config["protein_file"])
+    for key in ("grid_center", "grid_size", "key_residues", "binding_site_id"):
+        if docking_config.get(key):
+            constraints.setdefault(key, docking_config[key])
     return constraints
 
 
-def _normalize_assessment_mode(value: Any) -> str:
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in ASSESSMENT_MODES:
-            return normalized
-    return DEFAULT_PIPELINE_CONFIG["assessment_mode"]
+def _store_agent_result_molecules(
+    db: Session,
+    project: Project,
+    result: AgentResult,
+) -> dict[str, Any]:
+    summary = _empty_storage_summary()
+    existing_smiles = {
+        _standardize_or_normalize_smiles(row[0])
+        for row in db.query(Molecule.smiles).filter_by(project_id=project.project_id).all()
+    }
+    seen_in_result: set[str] = set()
+
+    for candidate in result.molecules:
+        normalized_smiles = _standardize_or_normalize_smiles(candidate.smiles)
+        if not is_lightly_valid_smiles(normalized_smiles):
+            summary["invalid_count"] += 1
+            summary["failed_reason_summary"]["invalid_smiles"] = (
+                summary["failed_reason_summary"].get("invalid_smiles", 0) + 1
+            )
+            continue
+        if normalized_smiles in existing_smiles or normalized_smiles in seen_in_result:
+            summary["duplicate_count"] += 1
+            summary["failed_reason_summary"]["duplicate"] = (
+                summary["failed_reason_summary"].get("duplicate", 0) + 1
+            )
+            continue
+
+        source_strategy = str(candidate.provenance.get("source_strategy") or result.agent)
+        molecule = Molecule(
+            molecule_id=new_id("MOL"),
+            project_id=project.project_id,
+            smiles=normalized_smiles,
+            inchi_key=None,
+            scaffold=None,
+            source_agent=f"{result.agent}_agent",
+            status="generated",
+            labels=merge_labels(
+                [
+                    "generated",
+                    "candidate_generated",
+                    "requires_structure_validation",
+                    f"generation_agent_{result.agent}",
+                    f"generator_strategy_{source_strategy}",
+                    f"optimization_round_{result.round}",
+                ],
+                list(candidate.metadata.get("labels") or []),
+            ),
+        )
+        db.add(molecule)
+        db.flush()
+
+        existing_smiles.add(normalized_smiles)
+        seen_in_result.add(normalized_smiles)
+        summary["stored_count"] += 1
+        summary["molecule_ids"].append(molecule.molecule_id)
+        summary["stored_candidates"].append(
+            {
+                "molecule_id": molecule.molecule_id,
+                "smiles": normalized_smiles,
+                "rationale": candidate.rationale,
+                "provenance": candidate.provenance,
+                "metadata": candidate.metadata,
+            }
+        )
+
+    if result.status == "completed":
+        project.status = "molecules_generated"
+    db.add(project)
+    db.commit()
+    return summary
+
+
+def _empty_storage_summary() -> dict[str, Any]:
+    return {
+        "stored_count": 0,
+        "duplicate_count": 0,
+        "invalid_count": 0,
+        "failed_reason_summary": {},
+        "molecule_ids": [],
+        "stored_candidates": [],
+    }
+
+
+def _assessment_mode_for_run_plan(plan: RunPlan) -> str:
+    if plan.evaluation.mode == "external_top_n":
+        return "external"
+    return plan.evaluation.mode
+
+
+def _top_ranked_molecules(db: Session, project: Project, *, top_n: int) -> list[Molecule]:
+    rankings = (
+        db.query(Ranking)
+        .filter_by(project_id=project.project_id)
+        .order_by(Ranking.rank.asc(), Ranking.id.asc())
+        .limit(top_n)
+        .all()
+    )
+    molecules: list[Molecule] = []
+    for ranking in rankings:
+        molecule = db.query(Molecule).filter_by(molecule_id=ranking.molecule_id).one_or_none()
+        if molecule is not None:
+            molecules.append(molecule)
+    return molecules
+
+
+def _top_ranked_seed_smiles(db: Session, project: Project, *, top_n: int) -> list[str]:
+    seeds: list[str] = []
+    for molecule in _top_ranked_molecules(db, project, top_n=top_n):
+        if molecule.status in {"invalid_structure", "failed_filter", "failed_assessment"}:
+            continue
+        normalized = _standardize_or_normalize_smiles(molecule.smiles)
+        if normalized and normalized not in seeds:
+            seeds.append(normalized)
+    return seeds
+
+
+def _initial_iterative_seed_smiles(db: Session, project: Project, plan: RunPlan) -> list[str]:
+    manual_seeds = [
+        normalized
+        for value in plan.seed_smiles
+        for normalized in [_standardize_or_normalize_smiles(value)]
+        if normalized and is_lightly_valid_smiles(normalized)
+    ]
+    previous_top_seeds = _top_ranked_seed_smiles(
+        db,
+        project,
+        top_n=min(plan.evaluation.top_n, plan.next_round_seed_count),
+    )
+    project_seeds = collect_generation_seed_smiles(db, project, include_target_library_seeds=True)
+    return _dedupe([*manual_seeds, *previous_top_seeds, *project_seeds])
+
+
+def _top_ranking_score(db: Session, project: Project) -> float | None:
+    ranking = (
+        db.query(Ranking)
+        .filter_by(project_id=project.project_id)
+        .order_by(Ranking.rank.asc(), Ranking.id.asc())
+        .first()
+    )
+    if ranking is None or ranking.overall_score is None:
+        return None
+    return float(ranking.overall_score)
+
+
+def _advisor_context(advisor_output: dict[str, Any] | None) -> list[str]:
+    if not advisor_output:
+        return []
+    context: list[str] = []
+    for suggestion in advisor_output.get("suggestions") or []:
+        action = suggestion.get("action")
+        rationale = suggestion.get("rationale")
+        if action or rationale:
+            context.append(": ".join(str(item) for item in [action, rationale] if item))
+    for constraint in advisor_output.get("next_round_constraints") or []:
+        field = constraint.get("field")
+        operator = constraint.get("operator")
+        value = constraint.get("value")
+        if field:
+            context.append(f"advisor_constraint: {field} {operator or ''} {value or ''}".strip())
+    return _dedupe(context)
+
+
+def _update_iterative_run(
+    orchestrator_run: AgentRun,
+    rounds: list[dict[str, Any]],
+    stop_reason: str | None,
+) -> None:
+    orchestrator_run.output_json = {
+        "status": "running",
+        "stop_reason": stop_reason,
+        "rounds": rounds,
+        "completed_rounds": len([item for item in rounds if isinstance(item.get("round"), int)]),
+    }
+
+
+def _coerce_run_plan(payload: RunPlan | dict[str, Any]) -> RunPlan:
+    if isinstance(payload, RunPlan):
+        return payload
+    if hasattr(RunPlan, "model_validate"):
+        return RunPlan.model_validate(payload)
+    return RunPlan.parse_obj(payload)
+
+
+def _schema_to_payload(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "dict"):
+        return value.dict()
+    return value
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    for value in values:
+        if value in deduped:
+            continue
+        deduped.append(value)
+    return deduped
 
 
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:

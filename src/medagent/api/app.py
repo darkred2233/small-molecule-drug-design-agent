@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from medagent.agents.conversation import ConversationAgent
+from medagent.agents.planner import PlannerAgent
 from medagent.configs.settings import Settings, get_settings
 from medagent.db.models import (
     ADMETResult,
@@ -78,7 +79,7 @@ from medagent.domain.schemas import (
     ReasoningTraceRead,
     RuleFilterResponse,
     RuleFilterResultRead,
-    RoundCreateRequest,
+    RunPlan,
     RunPipelineRequest,
     SeedLigandRead,
     SynthesisRouteRead,
@@ -89,6 +90,7 @@ from medagent.services.advisor import (
     apply_latest_advisor_suggestion,
 )
 from medagent.services.bootstrap import (
+    create_project_seed_ligands,
     ensure_project_target,
     seed_builtin_targets,
     seed_project_target_ligands,
@@ -121,6 +123,12 @@ from medagent.services.molecule_validation import (
 )
 from medagent.pipeline.orchestrator import PipelineOrchestrator
 from medagent.reporting.project_report import build_project_report
+from medagent.services.narrative import (
+    NARRATIVE_SCHEMA_VERSION,
+    build_project_molecule_narrative,
+    persist_project_final_report,
+    persist_project_molecule_narratives,
+)
 from medagent.services.rag import build_project_rag_index, crawl_project_urls, query_project_rag
 from medagent.services.receptor_preparation import (
     binding_site_to_payload,
@@ -128,6 +136,7 @@ from medagent.services.receptor_preparation import (
     list_project_binding_sites,
     prepare_project_receptor,
 )
+from medagent.services.run_plan import ensure_project_run_plan, save_project_run_plan
 from medagent.services.rule_filtering import filter_project_molecules
 
 SessionLocal: sessionmaker[Session]
@@ -151,7 +160,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="小分子药物设计 Agent",
         description=(
             "面向小分子药物设计流程的智能体后端。当前已完成关系数据库、内置靶点-药物库、"
-            "项目创建、自然语言约束解析、RAG 建库检索、MVP full pipeline 和候选分子评估。"
+            "项目创建、自然语言约束解析、RAG 建库检索、RunPlan 多轮迭代和候选分子评估。"
         ),
         version="0.1.0",
         docs_url=None,
@@ -160,7 +169,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_tags=[
             {"name": "系统状态", "description": "服务健康检查和数据库摘要。"},
             {"name": "内置靶点库", "description": "查询 MVP 内置靶点和代表药物。"},
-            {"name": "项目管理", "description": "创建项目、查询项目状态、启动 dry-run 或 full MVP 流程。"},
+            {"name": "项目管理", "description": "创建项目、查询项目状态、启动 RunPlan 多轮迭代流程。"},
             {"name": "对话与约束", "description": "把自然语言优化方向转为结构化约束。"},
             {"name": "文件与导入", "description": "上传资料并创建知识导入任务。"},
             {"name": "RAG", "description": "构建、爬取、查询 RAG 证据库和 evidence links。"},
@@ -305,7 +314,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 <div class="wrap hero">
                   <div>
                     <h1>小分子药物设计 Agent</h1>
-                    <p>中文 API 控制台。当前阶段已完成关系数据库、内置靶点-药物库、项目创建、约束解析、RAG 建库检索和 full MVP 流程。</p>
+                    <p>中文 API 控制台。当前阶段已完成关系数据库、内置靶点-药物库、项目创建、约束解析、RAG 建库检索和 RunPlan 多轮迭代流程。</p>
                   </div>
                   <nav class="actions">
                     <a class="button primary" href="/docs">打开接口文档</a>
@@ -318,7 +327,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 <section class="metric" aria-label="当前数据库概览">
                   <div><strong>10</strong><span>内置 MVP 靶点</span></div>
                   <div><strong>32</strong><span>代表药物结构记录</span></div>
-                  <div><strong>14</strong><span>dry-run Agent 步骤</span></div>
+                  <div><strong>3</strong><span>生成 agent 类型</span></div>
                 </section>
                 <section class="grid">
                   <article class="card">
@@ -331,7 +340,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   </article>
                   <article class="card">
                     <h2>流程运行</h2>
-                    <p>使用 <code>POST /projects/{id}/run</code> 创建 dry-run 记录，或用 <code>mode=full</code> 执行 MVP 候选评估流程。</p>
+                    <p>使用 <code>PUT /projects/{id}/run-plan</code> 保存操控台计划，再用 <code>POST /projects/{id}/run-iterative</code> 启动多轮优化。</p>
                   </article>
                 </section>
               </main>
@@ -477,7 +486,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
               <header>
                 <div class="wrap">
                   <h1>接口文档</h1>
-                  <p>所有业务说明已中文化。当前后端支持内置靶点库、关系数据库摘要、项目创建、自然语言约束解析、流程运行和结果查询。</p>
+                  <p>所有业务说明已中文化。当前后端支持内置靶点库、关系数据库摘要、项目创建、自然语言约束解析、RunPlan 多轮运行和结果查询。</p>
                   <nav>
                     <a class="button primary" href="/">返回首页</a>
                     <a class="button" href="/swagger">打开 Swagger 调试页</a>
@@ -528,8 +537,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   </article>
                   <article class="card">
                     <div class="route"><span class="method post">POST</span><code>/projects/{project_id}/run</code></div>
-                    <h2>启动项目流程运行</h2>
-                    <p>创建完整 Agent 流程记录；使用 <code>dry_run</code> 只登记步骤，使用 <code>full</code> 执行 MVP 工作流。</p>
+                    <h2>启动迭代流程运行</h2>
+                    <p>按当前 RunPlan 启动多轮优化；旧 <code>dry_run</code> 和 <code>full</code> 流程已退役。</p>
                   </article>
                   <article class="card">
                     <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/status</code></div>
@@ -659,9 +668,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             objective=payload.objective,
             constraints_json=constraints_json,
         )
+        ensure_project_run_plan(project)
         db.add(project)
         db.flush()
-        seed_project_target_ligands(db, project)
+        if payload.seed_ligands:
+            create_project_seed_ligands(db, project, payload.seed_ligands)
+        else:
+            seed_project_target_ligands(db, project)
         db.commit()
         db.refresh(project)
         return _project_to_read(project)
@@ -676,13 +689,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         project = _get_project(db, project_id)
         agent = ConversationAgent()
         parsed = agent.parse(payload.message)
+        current_run_plan = ensure_project_run_plan(project)
+        planner_agent = PlannerAgent(use_llm=bool(app_settings.dashscope_api_key))
+        planner_result = planner_agent.plan(payload.message, current_plan=current_run_plan)
+        save_project_run_plan(project, planner_result.run_plan)
+        response_intent = planner_result.intent if planner_result.intent == "update_run_plan" else parsed.intent
+        response_reply = planner_result.reply if planner_result.intent == "update_run_plan" else parsed.reply
 
         message = ConversationMessage(
             message_id=new_id("MSG"),
             project_id=project.project_id,
             role="user",
             content=payload.message,
-            intent=parsed.intent,
+            intent=response_intent,
             extracted_payload={"constraints": [constraint.__dict__ for constraint in parsed.constraints]},
         )
         db.add(message)
@@ -708,17 +727,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 message_id=new_id("MSG"),
                 project_id=project.project_id,
                 role="assistant",
-                content=parsed.reply,
-                intent=parsed.intent,
-                extracted_payload={"created_constraints": created_constraints},
+                content=response_reply,
+                intent=response_intent,
+                extracted_payload={
+                    "created_constraints": created_constraints,
+                    "plan_patch": _schema_to_payload(planner_result.plan_patch),
+                    "plan_diff": [_schema_to_payload(change) for change in planner_result.plan_diff],
+                    "suggested_execution": planner_result.suggested_execution,
+                    "requires_confirmation": planner_result.requires_confirmation,
+                    "warnings": planner_result.warnings,
+                },
             )
         )
         db.commit()
         return ChatResponse(
-            reply=parsed.reply,
-            intent=parsed.intent,
+            reply=response_reply,
+            intent=response_intent,
             created_constraints=created_constraints,
+            run_plan=planner_result.run_plan,
+            plan_patch=planner_result.plan_patch,
+            plan_diff=planner_result.plan_diff,
+            suggested_execution=planner_result.suggested_execution,
+            requires_confirmation=planner_result.requires_confirmation,
+            warnings=planner_result.warnings,
         )
+
+    @app.get(
+        "/projects/{project_id}/run-plan",
+        response_model=RunPlan,
+        tags=["项目管理"],
+        summary="查看当前 RunPlan",
+    )
+    def get_run_plan(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        run_plan = ensure_project_run_plan(project)
+        db.commit()
+        return run_plan
+
+    @app.put(
+        "/projects/{project_id}/run-plan",
+        response_model=RunPlan,
+        tags=["项目管理"],
+        summary="保存当前 RunPlan 草稿",
+    )
+    def update_run_plan(project_id: str, payload: RunPlan, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        save_project_run_plan(project, payload)
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+        return ensure_project_run_plan(project)
 
     @app.post(
         "/projects/{project_id}/files",
@@ -983,7 +1041,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .order_by(EvidenceLink.created_at.asc(), EvidenceLink.id.asc())
             .all()
         )
-        return [_evidence_link_to_read(link) for link in links]
+        return [_evidence_link_to_read(link, db=db) for link in links]
 
     @app.get(
         "/projects/{project_id}/evidence-links/{evidence_id}",
@@ -995,7 +1053,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _get_project(db, project_id)
         link = db.query(EvidenceLink).filter_by(evidence_id=evidence_id).first()
         if link is not None and _evidence_link_belongs_to_project(db, project_id, link):
-            return _evidence_link_to_read(link)
+            return _evidence_link_to_read(link, db=db)
 
         if not link:
             db_evidence = _database_evidence_to_read(db, project_id, evidence_id)
@@ -1040,73 +1098,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         project = _get_project(db, project_id)
         requested = payload or RunPipelineRequest()
-        if requested.mode == "full":
-            _merge_pipeline_config(project, requested.generation_config)
-            PipelineOrchestrator(app_settings).run_full(
-                db,
-                project,
-                pipeline_config=requested.generation_config,
-            )
-            db.refresh(project)
-            return _project_status(db, project)
-        if requested.mode != "dry_run":
+        if requested.mode != "iterative":
             raise HTTPException(
-                status_code=422,
-                detail="运行模式必须是 dry_run 或 full。",
+                status_code=410,
+                detail="旧 dry_run/full 流程已停用；请使用 iterative RunPlan 流程。",
             )
-        PipelineOrchestrator(app_settings).create_dry_run(db, project)
+        if requested.generation_config:
+            _merge_pipeline_config(project, requested.generation_config)
+            ensure_project_run_plan(project, requested.generation_config, overwrite=True)
+            db.commit()
+        else:
+            ensure_project_run_plan(project)
+            db.commit()
+        PipelineOrchestrator(app_settings).run_iterative(db, project)
         db.refresh(project)
         return _project_status(db, project)
 
     @app.post(
-        "/projects/{project_id}/rounds",
+        "/projects/{project_id}/run-iterative",
         response_model=ProjectStatus,
         status_code=202,
         tags=["项目管理"],
-        summary="创建新一轮优化 dry-run",
+        summary="按 RunPlan 启动多轮优化",
     )
-    def create_round(
-        project_id: str,
-        payload: RoundCreateRequest | None = None,
-        db: Session = Depends(get_db),
-    ):
+    def run_iterative(project_id: str, db: Session = Depends(get_db)):
         project = _get_project(db, project_id)
-        requested = payload or RoundCreateRequest()
-        generation_config = _merge_pipeline_config(project, requested.generation_config)
-        advisor_apply: dict | None = None
-        try:
-            advisor_apply = apply_latest_advisor_suggestion(db, project)
-        except AdvisorSuggestionNotFoundError:
-            advisor_apply = None
-
-        runs = PipelineOrchestrator(app_settings).create_dry_run(db, project)
-        for run in runs:
-            if run.agent_name != "generator_agent":
-                continue
-            run.input_json = {
-                **(run.input_json or {}),
-                "mode": "next_round_dry_run",
-                "generation_config": generation_config,
-            }
-            run.output_json = {
-                **(run.output_json or {}),
-                "message": "Registered next-round generation configuration.",
-                "generation_config": generation_config,
-            }
-            if advisor_apply is not None:
-                run.input_json = {
-                    **(run.input_json or {}),
-                    "source": "advisor_apply",
-                    "advisor_apply_agent_run_id": advisor_apply["agent_run_id"],
-                    "generation_payload": advisor_apply["generation_payload"],
-                }
-                run.output_json = {
-                    **(run.output_json or {}),
-                    "message": "Registered next-round generation from Advisor apply.",
-                    "applied_constraint_count": advisor_apply["applied_constraint_count"],
-                    "generation_payload": advisor_apply["generation_payload"],
-                }
+        ensure_project_run_plan(project)
         db.commit()
+        PipelineOrchestrator(app_settings).run_iterative(db, project)
         db.refresh(project)
         return _project_status(db, project)
 
@@ -1180,6 +1199,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             for item in molecules
         ]
+
+    @app.post(
+        "/projects/{project_id}/molecules/narratives",
+        tags=["结果查询"],
+        summary="生成 Top 分子的中文解读",
+    )
+    def generate_molecule_narratives(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        report = build_project_report(db, project)
+        run = persist_project_molecule_narratives(db, project, report)
+        return run.output_json
 
     @app.post(
         "/projects/{project_id}/molecules/import-seeds",
@@ -1366,6 +1396,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             admet_properties=request.admet_properties,
             max_synthesis_steps=request.max_synthesis_steps,
             prefer_buyable_building_blocks=request.prefer_buyable_building_blocks,
+            enable_external_synthesis_routes=request.enable_external_synthesis_routes,
         )
 
     @app.get(
@@ -1567,6 +1598,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [_decision_card_to_read(card) for card in cards]
 
     @app.get(
+        "/projects/{project_id}/molecules/{molecule_id}/narrative",
+        tags=["结果查询"],
+        summary="查看单个候选分子的中文解读",
+    )
+    def get_molecule_narrative(
+        project_id: str,
+        molecule_id: str,
+        db: Session = Depends(get_db),
+    ):
+        project = _get_project(db, project_id)
+        try:
+            return build_project_molecule_narrative(db, project, molecule_id)
+        except ValueError as exc:
+            if str(exc) == "molecule_not_found":
+                raise HTTPException(status_code=404, detail="未找到该分子") from exc
+            raise
+
+    @app.get(
         "/projects/{project_id}/molecules/{molecule_id}",
         response_model=MoleculeRead,
         tags=["结果查询"],
@@ -1641,9 +1690,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if report_run is not None and report_run.output_json:
             technical_appendix = report_run.output_json.get("technical_appendix") or {}
-            if technical_appendix.get("report_schema_version") == "2.0":
+            if (
+                technical_appendix.get("report_schema_version") == "2.0"
+                and technical_appendix.get("narrative_schema_version") == NARRATIVE_SCHEMA_VERSION
+            ):
                 return report_run.output_json
         return build_project_report(db, project)
+
+    @app.post("/projects/{project_id}/report", tags=["结果查询"], summary="生成中文最终报告")
+    def generate_report(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        report = build_project_report(db, project)
+        persist_project_molecule_narratives(db, project, report)
+        run = persist_project_final_report(db, project, report)
+        return run.output_json
+
+    @app.post(
+        "/projects/{project_id}/reports/final",
+        tags=["结果查询"],
+        summary="生成最终中文报告正文",
+    )
+    def generate_final_report(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        report = build_project_report(db, project)
+        run = persist_project_final_report(db, project, report)
+        return run.output_json.get("final_report")
 
     @app.get("/projects/{project_id}/report/download", tags=["结果查询"], summary="下载项目报告")
     def download_report(project_id: str, db: Session = Depends(get_db)):
@@ -1784,7 +1855,13 @@ def _evidence_link_belongs_to_project(db: Session, project_id: str, link: Eviden
     )
 
 
-def _evidence_link_to_read(link: EvidenceLink) -> EvidenceLinkRead:
+def _evidence_link_to_read(link: EvidenceLink, db: Session | None = None) -> EvidenceLinkRead:
+    chunk = None
+    document = None
+    if db is not None and link.chunk_id:
+        chunk = db.query(RagChunk).filter_by(chunk_id=link.chunk_id).one_or_none()
+        if chunk is not None:
+            document = db.query(RagDocument).filter_by(document_id=chunk.document_id).one_or_none()
     return EvidenceLinkRead(
         evidence_id=link.evidence_id,
         molecule_id=link.molecule_id,
@@ -1792,6 +1869,11 @@ def _evidence_link_to_read(link: EvidenceLink) -> EvidenceLinkRead:
         claim_type=link.claim_type,
         confidence=link.confidence,
         rationale=link.rationale,
+        document_title=document.title if document is not None else None,
+        source=document.source if document is not None else None,
+        page_number=chunk.page_number if chunk is not None else None,
+        section=chunk.section if chunk is not None else None,
+        content=chunk.content if chunk is not None else None,
     )
 
 
@@ -2108,6 +2190,14 @@ def _compact_evidence_summary(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
+def _schema_to_payload(model):
+    if model is None:
+        return None
+    if hasattr(model, "model_dump"):
+        return model.model_dump(mode="json")
+    return model.dict()
+
+
 def _reasoning_trace_to_read(trace: ReasoningTrace) -> ReasoningTraceRead:
     return ReasoningTraceRead(
         trace_id=trace.trace_id,
@@ -2317,6 +2407,7 @@ def _project_status(db: Session, project: Project) -> ProjectStatus:
                 "agent_name": run.agent_name,
                 "model_name": run.model_name,
                 "status": run.status,
+                "input_json": run.input_json,
                 "output_json": run.output_json,
             }
             for run in runs

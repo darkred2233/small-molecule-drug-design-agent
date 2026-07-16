@@ -31,6 +31,7 @@ from medagent.services.docking_adapters import (
     pose_artifact_available,
     pose_coordinates_from_file,
 )
+from medagent.services.narrative import attach_narrative_layer
 
 
 REPORT_SECTIONS = [
@@ -46,6 +47,8 @@ REPORT_SECTIONS = [
     "self_refutation",
     "advisor_suggestions",
     "top_candidates",
+    "molecule_narratives",
+    "final_report",
     "evidence_links",
     "technical_appendix",
 ]
@@ -70,6 +73,11 @@ def build_project_report(db: Session, project: Project) -> dict[str, Any]:
     evidence_context = _rag_evidence_context(db, evidence_links)
     target_agent_analysis = _latest_agent_output(db, project, "target_agent")
     sar_agent_analysis = _latest_agent_output(db, project, "sar_agent")
+    iterative_orchestrator_output = _latest_agent_output(
+        db,
+        project,
+        "iterative_orchestrator_agent",
+    )
 
     report = {
         "project_summary": {
@@ -153,8 +161,10 @@ def build_project_report(db: Session, project: Project) -> dict[str, Any]:
             "source": "project_report_service",
             "report_schema_version": "2.0",
             "score_semantics": "heuristic_not_probability_unless_explicitly_stated",
+            "iterative_orchestrator": iterative_orchestrator_output,
         },
     }
+    attach_narrative_layer(report)
     report_file = _write_report_file(project, report)
     report["report_file"] = report_file
     return report

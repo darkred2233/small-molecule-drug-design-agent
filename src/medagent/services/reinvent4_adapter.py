@@ -14,6 +14,7 @@ Reference: https://github.com/MolecularAI/REINVENT4
 import csv
 import importlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ from typing import Any
 
 from medagent.core.config import get_settings
 from medagent.services.docker_runtime import DockerMountBuilder, docker_temporary_directory
+from medagent.services.tool_config import get_tool_runtime_config
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +41,7 @@ class Reinvent4Request:
     scoring_strategy: str = "simple"  # simple, multi_parameter, scaffold_hop
     constraints: dict[str, Any] = field(default_factory=dict)
     prior_file: str | None = None
-    docker_image: str = "reinvent4:latest"
+    docker_image: str | None = None
     use_docker: bool = False
     timeout_seconds: int = 600
 
@@ -50,13 +52,14 @@ class Reinvent4Result:
     tool_name: str
     success: bool
     generated_smiles: list[str] = field(default_factory=list)
-    scores: list[float] = field(default_factory=list)
+    scores: list[float | None] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     stdout: str = ""
     stderr: str = ""
     exit_code: int | None = None
     runtime_seconds: float = 0.0
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +68,12 @@ class Reinvent4Result:
 
 def check_reinvent4_available() -> dict[str, Any]:
     """Check if REINVENT4 is available."""
+    runtime_config = get_tool_runtime_config(
+        "reinvent4",
+        default_command="reinvent",
+        default_images=("reinvent4:latest", "reinvent:latest"),
+        default_timeout_seconds=600,
+    )
     result: dict[str, Any] = {
         "available": False,
         "mode": None,
@@ -76,31 +85,35 @@ def check_reinvent4_available() -> dict[str, Any]:
         "prior_file": None,
         "gpu_available": False,
         "warning": None,
+        **runtime_config.as_status(),
     }
     prior_file = _resolve_prior_file()
     result["model_configured"] = prior_file is not None
     result["prior_file"] = str(prior_file) if prior_file else None
 
-    path = shutil.which("reinvent")
+    path = shutil.which(runtime_config.command or "reinvent")
     if path:
-        proc = subprocess.run(
-            [path, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if proc.returncode == 0:
-            result["runtime_available"] = True
-            result["available"] = result["model_configured"]
-            result["mode"] = "local_cli"
-            result["path"] = path
-            result["version"] = _reinvent_version()
-            if not result["model_configured"]:
-                result["warning"] = "reinvent4_prior_not_configured"
-            return result
+        try:
+            proc = subprocess.run(
+                [path, "--help"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if proc.returncode == 0:
+                result["runtime_available"] = True
+                result["available"] = result["model_configured"]
+                result["mode"] = "local_cli"
+                result["path"] = path
+                result["version"] = _reinvent_version()
+                if not result["model_configured"]:
+                    result["warning"] = "reinvent4_prior_not_configured"
+                return result
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
-    for image in ["reinvent4:latest", "reinvent:latest"]:
+    for image in runtime_config.docker_images:
         try:
             proc = subprocess.run(
                 ["docker", "image", "inspect", image],
@@ -126,7 +139,7 @@ def check_reinvent4_available() -> dict[str, Any]:
                 elif not result["model_configured"]:
                     result["warning"] = "reinvent4_prior_not_configured"
                 return result
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired):
             pass
 
     return result
@@ -143,6 +156,20 @@ def run_reinvent4_generation(
     """Run REINVENT4 molecular generation."""
     if reinvent4_status is None:
         reinvent4_status = check_reinvent4_available()
+
+    request_prior = _resolve_prior_file(request.prior_file)
+    if (
+        not reinvent4_status.get("available")
+        and reinvent4_status.get("runtime_available")
+        and request_prior is not None
+    ):
+        reinvent4_status = {
+            **reinvent4_status,
+            "available": True,
+            "model_configured": True,
+            "prior_file": str(request_prior),
+            "warning": None,
+        }
 
     if not reinvent4_status.get("available"):
         if reinvent4_status.get("runtime_available") and not reinvent4_status.get(
@@ -167,16 +194,22 @@ def run_reinvent4_generation(
     mode = reinvent4_status.get("mode")
 
     if mode == "docker":
-        return _run_reinvent4_docker(request, reinvent4_status.get("docker_image", "reinvent4:latest"))
+        docker_image = (
+            request.docker_image
+            or reinvent4_status.get("docker_image")
+            or "reinvent4:latest"
+        )
+        return _run_reinvent4_docker(request, str(docker_image))
     else:
-        return _run_reinvent4_local(request)
+        executable = str(reinvent4_status.get("path") or "reinvent")
+        return _run_reinvent4_local(request, executable)
 
 
 # ---------------------------------------------------------------------------
 # Local execution
 # ---------------------------------------------------------------------------
 
-def _run_reinvent4_local(request: Reinvent4Request) -> Reinvent4Result:
+def _run_reinvent4_local(request: Reinvent4Request, executable: str) -> Reinvent4Result:
     """Run REINVENT4 via local CLI."""
     start_time = time.monotonic()
     prior_file = _resolve_prior_file(request.prior_file)
@@ -203,7 +236,7 @@ def _run_reinvent4_local(request: Reinvent4Request) -> Reinvent4Result:
         )
 
         # Build command
-        cmd = ["reinvent", str(config_file)]
+        cmd = [executable, str(config_file)]
 
         # Run REINVENT4
         try:
@@ -225,6 +258,13 @@ def _run_reinvent4_local(request: Reinvent4Request) -> Reinvent4Result:
                 warnings=["reinvent4_execution_timeout"],
                 exit_code=-1,
                 runtime_seconds=time.monotonic() - start_time,
+                provenance=_reinvent4_provenance(
+                    request,
+                    execution_mode="local_cli",
+                    command=cmd,
+                    prior_file=prior_file,
+                    device="cpu",
+                ),
             )
         except FileNotFoundError:
             return Reinvent4Result(
@@ -234,6 +274,29 @@ def _run_reinvent4_local(request: Reinvent4Request) -> Reinvent4Result:
                 warnings=["reinvent4_binary_not_found"],
                 exit_code=-1,
                 runtime_seconds=time.monotonic() - start_time,
+                provenance=_reinvent4_provenance(
+                    request,
+                    execution_mode="local_cli",
+                    command=cmd,
+                    prior_file=prior_file,
+                    device="cpu",
+                ),
+            )
+        except OSError as exc:
+            return Reinvent4Result(
+                adapter_mode="reinvent4_execution_os_error",
+                tool_name="reinvent4",
+                success=False,
+                warnings=[f"reinvent4_execution_os_error:{type(exc).__name__}"],
+                exit_code=-1,
+                runtime_seconds=time.monotonic() - start_time,
+                provenance=_reinvent4_provenance(
+                    request,
+                    execution_mode="local_cli",
+                    command=cmd,
+                    prior_file=prior_file,
+                    device="cpu",
+                ),
             )
 
         # Parse output
@@ -246,18 +309,26 @@ def _run_reinvent4_local(request: Reinvent4Request) -> Reinvent4Result:
             import shutil
             shutil.copy2(output_file, output_dir / "reinvent4_output.csv")
 
+        success = exit_code == 0 and len(generated_smiles) > 0
         return Reinvent4Result(
             adapter_mode="reinvent4_local",
             tool_name="reinvent4",
-            success=exit_code == 0 and len(generated_smiles) > 0,
+            success=success,
             generated_smiles=generated_smiles,
             scores=scores,
-            labels=["reinvent4_generated", "reinvent4_local"],
-            warnings=[] if exit_code == 0 else ["reinvent4_execution_failed"],
+            labels=_reinvent4_labels(success, "reinvent4_local"),
+            warnings=_reinvent4_warnings(request, exit_code, generated_smiles),
             stdout=stdout[:2000],
             stderr=stderr[:2000],
             exit_code=exit_code,
             runtime_seconds=time.monotonic() - start_time,
+            provenance=_reinvent4_provenance(
+                request,
+                execution_mode="local_cli",
+                command=cmd,
+                prior_file=prior_file,
+                device="cpu",
+            ),
         )
 
 
@@ -327,6 +398,14 @@ def _run_reinvent4_docker(request: Reinvent4Request, docker_image: str) -> Reinv
                 warnings=["reinvent4_docker_timeout"],
                 exit_code=-1,
                 runtime_seconds=time.monotonic() - start_time,
+                provenance=_reinvent4_provenance(
+                    request,
+                    execution_mode="docker",
+                    command=cmd,
+                    prior_file=prior_file,
+                    device="cuda:0" if use_gpu else "cpu",
+                    docker_image=docker_image,
+                ),
             )
         except FileNotFoundError:
             return Reinvent4Result(
@@ -336,6 +415,31 @@ def _run_reinvent4_docker(request: Reinvent4Request, docker_image: str) -> Reinv
                 warnings=["docker_not_installed"],
                 exit_code=-1,
                 runtime_seconds=time.monotonic() - start_time,
+                provenance=_reinvent4_provenance(
+                    request,
+                    execution_mode="docker",
+                    command=cmd,
+                    prior_file=prior_file,
+                    device="cuda:0" if use_gpu else "cpu",
+                    docker_image=docker_image,
+                ),
+            )
+        except OSError as exc:
+            return Reinvent4Result(
+                adapter_mode="reinvent4_docker_os_error",
+                tool_name="reinvent4",
+                success=False,
+                warnings=[f"reinvent4_docker_os_error:{type(exc).__name__}"],
+                exit_code=-1,
+                runtime_seconds=time.monotonic() - start_time,
+                provenance=_reinvent4_provenance(
+                    request,
+                    execution_mode="docker",
+                    command=cmd,
+                    prior_file=prior_file,
+                    device="cuda:0" if use_gpu else "cpu",
+                    docker_image=docker_image,
+                ),
             )
 
         # Parse output
@@ -347,18 +451,27 @@ def _run_reinvent4_docker(request: Reinvent4Request, docker_image: str) -> Reinv
         if output_file.exists():
             shutil.copy2(output_file, output_dir / "reinvent4_output.csv")
 
+        success = exit_code == 0 and len(generated_smiles) > 0
         return Reinvent4Result(
             adapter_mode="reinvent4_docker",
             tool_name="reinvent4",
-            success=exit_code == 0 and len(generated_smiles) > 0,
+            success=success,
             generated_smiles=generated_smiles,
             scores=scores,
-            labels=["reinvent4_generated", "reinvent4_docker"],
-            warnings=[] if exit_code == 0 else ["reinvent4_docker_failed"],
+            labels=_reinvent4_labels(success, "reinvent4_docker"),
+            warnings=_reinvent4_warnings(request, exit_code, generated_smiles, docker=True),
             stdout=stdout[:2000],
             stderr=stderr[:2000],
             exit_code=exit_code,
             runtime_seconds=time.monotonic() - start_time,
+            provenance=_reinvent4_provenance(
+                request,
+                execution_mode="docker",
+                command=cmd,
+                prior_file=prior_file,
+                device="cuda:0" if use_gpu else "cpu",
+                docker_image=docker_image,
+            ),
         )
 
 
@@ -437,6 +550,60 @@ def _resolve_prior_file(value: str | None = None) -> Path | None:
         return None
 
 
+def _reinvent4_warnings(
+    request: Reinvent4Request,
+    exit_code: int,
+    generated_smiles: list[str],
+    *,
+    docker: bool = False,
+) -> list[str]:
+    warnings = ["reinvent4_prior_sampling_not_target_optimized"]
+    if request.seed_smiles:
+        warnings.append("reinvent4_seed_smiles_not_used_by_sampling_mode")
+    if request.scoring_strategy != "simple":
+        warnings.append("reinvent4_scoring_strategy_not_applied_in_sampling_mode")
+    if exit_code != 0:
+        warnings.append("reinvent4_docker_failed" if docker else "reinvent4_execution_failed")
+    elif not generated_smiles:
+        warnings.append("reinvent4_output_missing_or_empty")
+    return warnings
+
+
+def _reinvent4_labels(success: bool, mode_label: str) -> list[str]:
+    outcome = "reinvent4_generated" if success else "reinvent4_generation_failed"
+    return [outcome, mode_label, "reinvent4_prior_sampling"]
+
+
+def _reinvent4_provenance(
+    request: Reinvent4Request,
+    *,
+    execution_mode: str,
+    command: list[str],
+    prior_file: Path,
+    device: str,
+    docker_image: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "execution_mode": execution_mode,
+        "docker_image": docker_image,
+        "command": command,
+        "run_type": "sampling",
+        "target_optimized": False,
+        "score_semantics": "not_available_for_prior_sampling",
+        "prior_file": str(prior_file),
+        "prior_file_size": _file_size(prior_file),
+        "device": device,
+        "timeout_seconds": request.timeout_seconds,
+    }
+
+
+def _file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
 def _reinvent_version() -> str:
     for package_name in ["reinvent4", "reinvent"]:
         try:
@@ -473,10 +640,10 @@ def _check_gpu_available(docker_image: str) -> bool:
 
 def _parse_reinvent4_output(
     output_path: Path,
-) -> tuple[list[str], list[float]]:
+) -> tuple[list[str], list[float | None]]:
     """Parse REINVENT4 output CSV."""
     smiles_list: list[str] = []
-    scores: list[float] = []
+    scores: list[float | None] = []
 
     if not output_path.exists():
         return smiles_list, scores
@@ -491,11 +658,14 @@ def _parse_reinvent4_output(
                     smiles_list.append(smi)
                     if score:
                         try:
-                            scores.append(float(score))
+                            parsed_score = float(score)
+                            scores.append(
+                                parsed_score if math.isfinite(parsed_score) else None
+                            )
                         except ValueError:
-                            scores.append(0.0)
+                            scores.append(None)
                     else:
-                        scores.append(0.0)
+                        scores.append(None)
     except Exception:
         pass
 
@@ -519,4 +689,10 @@ def reinvent4_tool_status() -> dict[str, Any]:
         "prior_file": status.get("prior_file"),
         "gpu_available": status.get("gpu_available", False),
         "warning": status.get("warning"),
+        "configured_command": status.get("configured_command"),
+        "docker_image_candidates": status.get("docker_image_candidates", []),
+        "configured_timeout_seconds": status.get("configured_timeout_seconds", 600),
+        "config_source": status.get("config_source"),
+        "config_loaded": status.get("config_loaded", False),
+        "config_environment_overrides": status.get("config_environment_overrides", []),
     }

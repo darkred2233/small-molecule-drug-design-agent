@@ -1,9 +1,9 @@
 import { type FormEvent, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
-import { ArrowLeft, CheckCircle2, FlaskConical, Loader2, SlidersHorizontal, Target, X } from 'lucide-react';
+import { ArrowLeft, CheckCircle2, FlaskConical, Loader2, Target, X } from 'lucide-react';
 import { projectsApi } from '@/api';
-import type { BuiltinTarget } from '@/types/api';
+import type { BuiltinDrug, BuiltinTarget, SeedLigandInput } from '@/types/api';
 import { cn } from '@/utils/helpers';
 import TargetPicker, { type TargetSelection } from './TargetPicker';
 
@@ -11,18 +11,6 @@ interface CreateProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
-
-const DEFAULT_STRATEGY_COUNTS = {
-  reinvent4: 10,
-  crem: 10,
-  autogrow4: 10,
-};
-
-const STRATEGY_LABELS = {
-  reinvent4: 'REINVENT4 风格优化',
-  crem: 'CREM 片段替换',
-  autogrow4: 'AutoGrow4 生长连接',
-};
 
 export default function CreateProjectModal({ isOpen, onClose }: CreateProjectModalProps) {
   const navigate = useNavigate();
@@ -32,13 +20,28 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
   const [selection, setSelection] = useState<TargetSelection | null>(null);
   const [projectName, setProjectName] = useState('');
   const [objective, setObjective] = useState('');
-  const [strategyCounts, setStrategyCounts] = useState(DEFAULT_STRATEGY_COUNTS);
-  const [topN, setTopN] = useState(20);
+  const [selectedSeedKeys, setSelectedSeedKeys] = useState<string[]>([]);
+  const [customSeedText, setCustomSeedText] = useState('');
 
   const selectedTargetId = selection?.kind === 'builtin' ? selection.target.target_id : selection?.target_id;
   const selectedBuiltin = selection?.kind === 'builtin' ? selection.target : null;
-  const generationSize = strategyCounts.reinvent4 + strategyCounts.crem + strategyCounts.autogrow4;
-  const maxAssessmentMolecules = Math.max(generationSize + (selectedBuiltin?.seed_ligand_count ?? 0), topN);
+  const builtinSeedDrugs = useMemo(
+    () => selectedBuiltin?.drugs.filter((drug) => getDrugSmiles(drug)) ?? [],
+    [selectedBuiltin]
+  );
+  const seedLigands = useMemo(
+    () => [
+      ...builtinSeedDrugs
+        .filter((drug) => selectedSeedKeys.includes(seedKey(drug)))
+        .map((drug): SeedLigandInput => ({
+          name: drug.drug_name,
+          smiles: getDrugSmiles(drug)!,
+          source: selectedBuiltin ? `target_library:${selectedBuiltin.target_id}` : 'target_library',
+        })),
+      ...parseCustomSeeds(customSeedText),
+    ],
+    [builtinSeedDrugs, customSeedText, selectedBuiltin, selectedSeedKeys]
+  );
 
   const createProject = useMutation({
     mutationFn: projectsApi.create,
@@ -73,8 +76,8 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
     setSelection(null);
     setProjectName('');
     setObjective('');
-    setStrategyCounts(DEFAULT_STRATEGY_COUNTS);
-    setTopN(20);
+    setSelectedSeedKeys([]);
+    setCustomSeedText('');
   };
 
   const handleClose = () => {
@@ -88,6 +91,8 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
     if (!projectName.trim()) {
       setProjectName(`${label} 药物设计`);
     }
+    setSelectedSeedKeys(nextSelection.kind === 'builtin' ? defaultSeedKeys(nextSelection.target) : []);
+    setCustomSeedText('');
   };
 
   const handleNext = () => {
@@ -98,31 +103,23 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
     setStep('details');
   };
 
-  const updateStrategyCount = (strategy: keyof typeof DEFAULT_STRATEGY_COUNTS, value: number) => {
-    setStrategyCounts((current) => ({
-      ...current,
-      [strategy]: clampInteger(value, 0, 500),
-    }));
+  const toggleSeed = (drug: BuiltinDrug) => {
+    const key = seedKey(drug);
+    setSelectedSeedKeys((current) =>
+      current.includes(key) ? current.filter((item) => item !== key) : [...current, key]
+    );
   };
 
   const handleSubmit = (event?: FormEvent) => {
     event?.preventDefault();
-    if (!selection || !projectName.trim() || generationSize < 1 || topN < 1) return;
+    if (!selection || !projectName.trim() || seedLigands.length < 1) return;
 
     createProject.mutate({
       name: projectName.trim(),
       target_id: selectedTargetId,
       target_name: selection.kind === 'custom' ? selection.label : undefined,
       objective: objective.trim() || undefined,
-      generation_config: {
-        strategy_counts: strategyCounts,
-        generation_size: generationSize,
-        top_n: topN,
-        max_assessment_molecules: Math.min(Math.max(maxAssessmentMolecules, topN), 500),
-        assessment_mode: 'external',
-        external_top_n: Math.min(topN, 10),
-        generate_when_seeds_exist: true,
-      },
+      seed_ligands: seedLigands,
     });
   };
 
@@ -140,7 +137,7 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
             <div className="mt-3 flex items-center gap-2 text-xs">
               <StepPill active={step === 'target'} done={Boolean(selection)} label="选择靶点" />
               <span className="h-px w-8 bg-cyan-100" />
-              <StepPill active={step === 'details'} done={false} label="项目设置" />
+              <StepPill active={step === 'details'} done={false} label="样例分子" />
             </div>
           </div>
           <button
@@ -183,29 +180,24 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
                     value={objective}
                     onChange={(event) => setObjective(event.target.value)}
                     placeholder="例如：降低 hERG 风险，保留关键 hinge 结合模式，并保持可合成性。"
-                    rows={8}
+                    rows={5}
                     className="w-full resize-none rounded-lg border border-cyan-200 bg-white px-4 py-3 text-sm leading-6 text-slate-900 shadow-sm shadow-cyan-950/5 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                   />
                 </label>
 
-                <GenerationConfigPanel
-                  strategyCounts={strategyCounts}
-                  topN={topN}
-                  generationSize={generationSize}
-                  maxAssessmentMolecules={maxAssessmentMolecules}
-                  onStrategyCountChange={updateStrategyCount}
-                  onTopNChange={(value) => setTopN(clampInteger(value, 1, 500))}
+                <SeedSelectionPanel
+                  builtinSeedDrugs={builtinSeedDrugs}
+                  selectedSeedKeys={selectedSeedKeys}
+                  customSeedText={customSeedText}
+                  onToggleSeed={toggleSeed}
+                  onCustomSeedTextChange={setCustomSeedText}
                 />
 
-                <div className="rounded-lg border border-cyan-100 bg-cyan-50/30 p-4">
-                  <div className="text-sm text-slate-700">
-                    <p className="font-medium">💡 生成策略配置说明</p>
-                    <p className="mt-2 text-slate-600">
-                      生成策略和分子数量将在项目创建后，通过界面顶部的配置面板进行调整。
-                      每次生成时会使用当前的配置参数。
-                    </p>
+                {seedLigands.length < 1 && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                    至少选择或填写一个样例分子，后续生成 agent 才有 seed 可以继承。
                   </div>
-                </div>
+                )}
 
                 {createProject.error && (
                   <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
@@ -214,7 +206,7 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
                 )}
               </div>
 
-              <SelectedTargetPanel selection={selection} builtinTarget={selectedBuiltin} />
+              <SelectedTargetPanel selection={selection} builtinTarget={selectedBuiltin} seedCount={seedLigands.length} />
             </form>
           )}
         </div>
@@ -248,7 +240,7 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
             <button
               type="button"
               onClick={() => handleSubmit()}
-              disabled={!selection || !projectName.trim() || generationSize < 1 || topN < 1 || createProject.isPending}
+              disabled={!selection || !projectName.trim() || seedLigands.length < 1 || createProject.isPending}
               className="primary-action inline-flex items-center gap-2 rounded-lg px-6 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed"
             >
               {createProject.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
@@ -261,108 +253,79 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
   );
 }
 
-function GenerationConfigPanel({
-  strategyCounts,
-  topN,
-  generationSize,
-  maxAssessmentMolecules,
-  onStrategyCountChange,
-  onTopNChange,
+function SeedSelectionPanel({
+  builtinSeedDrugs,
+  selectedSeedKeys,
+  customSeedText,
+  onToggleSeed,
+  onCustomSeedTextChange,
 }: {
-  strategyCounts: typeof DEFAULT_STRATEGY_COUNTS;
-  topN: number;
-  generationSize: number;
-  maxAssessmentMolecules: number;
-  onStrategyCountChange: (strategy: keyof typeof DEFAULT_STRATEGY_COUNTS, value: number) => void;
-  onTopNChange: (value: number) => void;
+  builtinSeedDrugs: BuiltinDrug[];
+  selectedSeedKeys: string[];
+  customSeedText: string;
+  onToggleSeed: (drug: BuiltinDrug) => void;
+  onCustomSeedTextChange: (value: string) => void;
 }) {
   return (
-    <section className="rounded-lg border border-cyan-100 bg-cyan-50/40 p-4">
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <div className="flex items-center gap-2 text-sm font-semibold text-slate-950">
-            <SlidersHorizontal className="h-4 w-4 text-cyan-700" />
-            生成与筛选参数
-          </div>
-          <p className="mt-1 text-xs leading-5 text-slate-500">
-            按策略设置候选规模，流程会导入种子分子后继续追加生成并保留 Top 候选。
-          </p>
-        </div>
-        <div className="rounded-lg border border-cyan-200 bg-white px-3 py-2 text-right">
-          <div className="text-[11px] text-slate-500">总生成数</div>
-          <div className="text-lg font-semibold text-cyan-800">{generationSize}</div>
-        </div>
+    <section className="space-y-3">
+      <div>
+        <h3 className="text-sm font-semibold text-slate-950">样例分子</h3>
+        <p className="mt-1 text-xs leading-5 text-slate-500">
+          这些分子会作为第一轮 seed；继续运行时系统会自动用上一轮排名靠前的分子补充下一轮 seed。
+        </p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-3">
-        {(Object.keys(strategyCounts) as Array<keyof typeof DEFAULT_STRATEGY_COUNTS>).map((strategy) => (
-          <NumberField
-            key={strategy}
-            label={STRATEGY_LABELS[strategy]}
-            value={strategyCounts[strategy]}
-            min={0}
-            max={500}
-            step={1}
-            onChange={(value) => onStrategyCountChange(strategy, value)}
-          />
-        ))}
-      </div>
-
-      <div className="mt-3 grid gap-3 sm:grid-cols-2">
-        <NumberField
-          label="保留 Top 候选"
-          value={topN}
-          min={1}
-          max={500}
-          step={1}
-          onChange={onTopNChange}
-        />
-        <div className="rounded-lg border border-emerald-100 bg-white p-3">
-          <div className="text-xs font-medium text-slate-600">评估上限</div>
-          <div className="mt-1 text-lg font-semibold text-emerald-800">{maxAssessmentMolecules}</div>
-          <div className="mt-1 text-[11px] leading-4 text-slate-500">
-            用于 ADMET、对接、合成路线和排序，至少覆盖 Top 候选。
-          </div>
-        </div>
-      </div>
-
-      {generationSize < 1 && (
-        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-          至少需要启用一种生成策略。
+      {builtinSeedDrugs.length > 0 && (
+        <div className="grid gap-2 sm:grid-cols-2">
+          {builtinSeedDrugs.map((drug) => {
+            const key = seedKey(drug);
+            const selected = selectedSeedKeys.includes(key);
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={() => onToggleSeed(drug)}
+                className={cn(
+                  'rounded-lg border p-3 text-left transition-colors',
+                  selected
+                    ? 'border-cyan-300 bg-cyan-50 text-cyan-950'
+                    : 'border-slate-200 bg-white text-slate-700 hover:border-cyan-200'
+                )}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold">{drug.drug_name}</div>
+                    {drug.drug_status && <div className="mt-0.5 text-xs text-slate-500">{drug.drug_status}</div>}
+                  </div>
+                  <span
+                    className={cn(
+                      'flex h-5 w-5 items-center justify-center rounded-full border',
+                      selected ? 'border-cyan-600 bg-cyan-600 text-white' : 'border-slate-300 bg-white'
+                    )}
+                  >
+                    {selected && <CheckCircle2 className="h-4 w-4" />}
+                  </span>
+                </div>
+                <code className="mt-2 block truncate rounded bg-white/70 px-2 py-1 text-[11px] text-slate-600">
+                  {getDrugSmiles(drug)}
+                </code>
+              </button>
+            );
+          })}
         </div>
       )}
-    </section>
-  );
-}
 
-function NumberField({
-  label,
-  value,
-  min,
-  max,
-  step,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  onChange: (value: number) => void;
-}) {
-  return (
-    <label className="block rounded-lg border border-cyan-100 bg-white p-3">
-      <span className="block text-xs font-medium text-slate-600">{label}</span>
-      <input
-        type="number"
-        value={value}
-        min={min}
-        max={max}
-        step={step}
-        onChange={(event) => onChange(Number(event.target.value))}
-        className="mt-2 h-10 w-full rounded-md border border-cyan-200 px-3 text-sm font-semibold text-slate-950 focus:outline-none focus:ring-2 focus:ring-cyan-500"
-      />
-    </label>
+      <label className="block">
+        <span className="mb-2 block text-xs font-medium text-slate-600">自定义 seed SMILES</span>
+        <textarea
+          value={customSeedText}
+          onChange={(event) => onCustomSeedTextChange(event.target.value)}
+          placeholder="每行一个，可写：名称 SMILES"
+          rows={4}
+          className="w-full resize-none rounded-lg border border-cyan-200 bg-white px-4 py-3 font-mono text-xs leading-5 text-slate-900 shadow-sm shadow-cyan-950/5 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+        />
+      </label>
+    </section>
   );
 }
 
@@ -384,17 +347,14 @@ function StepPill({ active, done, label }: { active: boolean; done: boolean; lab
   );
 }
 
-function clampInteger(value: number, min: number, max: number) {
-  if (!Number.isFinite(value)) return min;
-  return Math.max(min, Math.min(Math.round(value), max));
-}
-
 function SelectedTargetPanel({
   selection,
   builtinTarget,
+  seedCount,
 }: {
   selection: TargetSelection | null;
   builtinTarget: BuiltinTarget | null;
+  seedCount: number;
 }) {
   if (!selection) return null;
 
@@ -406,6 +366,7 @@ function SelectedTargetPanel({
         <div className="mt-2 rounded bg-white px-2 py-1 font-mono text-xs text-emerald-700">
           {selection.target_id}
         </div>
+        <PanelMetric label="已选 seed" value={seedCount} />
         <p className="mt-3 text-sm leading-6 text-emerald-800">
           项目创建后可在对话中补充 PDB、口袋中心、参考配体或上传结构文件。
         </p>
@@ -434,7 +395,7 @@ function SelectedTargetPanel({
 
       <div className="grid grid-cols-2 gap-2 text-xs">
         <PanelMetric label="PDB" value={builtinTarget?.pdb_ids.length ?? 0} />
-        <PanelMetric label="样例分子" value={builtinTarget?.seed_ligand_count ?? 0} />
+        <PanelMetric label="已选 seed" value={seedCount} />
         <PanelMetric label="SAR 规则" value={builtinTarget?.sar_rules.length ?? 0} />
         <PanelMetric label="ADMET 风险" value={builtinTarget?.admet_risks.length ?? 0} />
       </div>
@@ -462,9 +423,38 @@ function SelectedTargetPanel({
 
 function PanelMetric({ label, value }: { label: string; value: number }) {
   return (
-    <div className="rounded-lg border border-cyan-100 bg-cyan-50/50 p-3">
+    <div className="mt-3 rounded-lg border border-cyan-100 bg-cyan-50/50 p-3">
       <div className="text-slate-500">{label}</div>
       <div className="mt-1 text-lg font-semibold text-slate-950">{value}</div>
     </div>
   );
+}
+
+function defaultSeedKeys(target: BuiltinTarget) {
+  return target.drugs.filter((drug) => getDrugSmiles(drug)).slice(0, 3).map(seedKey);
+}
+
+function seedKey(drug: BuiltinDrug) {
+  return drug.inchi_key || drug.drug_name || getDrugSmiles(drug) || 'seed';
+}
+
+function getDrugSmiles(drug: BuiltinDrug) {
+  return drug.smiles || drug.canonical_smiles || drug.isomeric_smiles;
+}
+
+function parseCustomSeeds(value: string): SeedLigandInput[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const parts = line.split(/\s+/);
+      const smiles = parts[parts.length - 1];
+      const name = parts.length > 1 ? parts.slice(0, -1).join(' ') : `custom-seed-${index + 1}`;
+      return {
+        name,
+        smiles,
+        source: 'project_setup_custom',
+      };
+    });
 }

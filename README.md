@@ -239,6 +239,40 @@ python scripts\check_tools.py --verbose --test
 
 如果 Docker Desktop 未启动或工具镜像不可用，`external` 和 `full` 评估模式可能降级到 surrogate 结果。降级会写入 warnings、adapter mode 和结果标签，方便后续复核。
 
+### 工具运行配置与可信状态
+
+运行时配置优先级为：环境变量 > `configs/tools.yaml` > 代码内兼容默认值。API 容器默认读取 `/app/configs/tools.yaml`，本地运行默认读取仓库中的同名文件。工具状态接口会返回 `config_source`、`config_loaded`、候选镜像和实际超时，便于判断配置是否真正生效。
+
+常用覆盖项：
+
+```env
+GNINA_IMAGE=gnina/gnina:latest
+DIFFDOCK_IMAGE=diffdock:latest
+REINVENT4_IMAGE=reinvent4:latest
+AUTOGROW4_IMAGE=autogrow4:latest
+DIFFDOCK_TIMEOUT_SECONDS=900
+REINVENT4_TIMEOUT_SECONDS=600
+AUTOGROW4_TIMEOUT_SECONDS=1200
+```
+
+三个重点工具的当前语义：
+
+| 工具 | 成功结果代表什么 | 必要条件 | 失败后的行为 |
+| --- | --- | --- | --- |
+| DiffDock | 真实模型生成 pose，并解析到置信度；pose 文件必须存在 | 可用镜像/本地运行时和模型权重；不要求 docking grid | 写入失败 warning，候选评估按既有逻辑回退 |
+| REINVENT4 | 从配置的 prior 做真实 sampling | REINVENT4 运行时和非空 prior 文件 | 显式记录失败原因，再使用 RDKit/Datamol surrogate |
+| AutoGrow4 | 使用受体、网格和 Vina 进行 docking-guided 遗传生成 | 可用运行时、受体文件、`grid_center`、`grid_size`、Vina/Open Babel | 显式记录缺失条件或执行错误，再使用 surrogate |
+
+REINVENT4 当前不是靶点导向强化学习任务。结果会标记 `reinvent4_prior_sampling_not_target_optimized`，避免把 prior sampling 误读为已经完成了多目标 RL 优化。外部生成结果还会再次经过项目的 SMILES 校验、相似度和性质约束；不满足约束的结果不会直接入库。
+
+REINVENT4 prior sampling 没有项目目标函数分数，因此缺失分数保留为 `null`，不会补成看似有效的 `0.0`。AutoGrow4 只有在成功退出、生成分子且解析到 ranked fitness/docking 数值时才向上层报告成功；只有分子文件而没有可解析 fitness 时会显式回退。
+
+DiffDock、GNINA、Vina 的外部结果会记录实际命令、镜像、GPU 使用、超时、退出码和模型状态。只有评分/置信度与本次运行新生成的 pose 文件同时存在时，结果才会被标记为成功。DiffDock 在没有 GPU 时仍允许尝试 CPU 运行，但会写入 `diffdock_running_without_gpu`；生产任务仍建议使用 NVIDIA GPU。
+
+DiffDock 镜像只包含运行代码和依赖，默认不内置模型。`DIFFDOCK_MODEL_DIR` 必须同时包含 `model_parameters.yml` 和 `best_ema_inference_epoch_model.pt`，`DIFFDOCK_CONFIDENCE_MODEL_DIR` 必须同时包含 `model_parameters.yml` 和 `best_model_epoch75.pt`。状态检查只认可这四个明确文件，不会因为镜像中存在其他 `.pt`、`.ckpt` 或 `.pth` 文件而误报可用。
+
+AutoGrow4 通过上游正式的 `-j config.json` 入口运行遗传优化。镜像默认固定到上游 `v4.0.3` 提交 `1b47b3fe2d9faa76a904533bea2312326a3f44c5`。升级时应显式修改 `AUTOGROW4_REF`，并重新完成镜像构建和真实小规模复核。
+
 ## 候选评估模式
 
 候选评估接口：
@@ -403,7 +437,7 @@ Docker 模式下如果 API 容器挂载 Docker socket，就具备较高宿主机
 - 扩展更多靶点的高质量文献、专利和已知配体资料。
 - 继续校准 docking、ADMET、合成可及性和综合排序阈值。
 - 增强外部工具失败时的可解释 warnings 和 UI 展示。
-- 完善 Docker GPU 工具链和 DiffDock/REINVENT4/AutoGrow4 的生产配置。
+- 在目标 GPU 主机上完成 DiffDock/REINVENT4/AutoGrow4 镜像与模型权重的可复现实验记录。
 - 补充更多真实项目复现实验包。
 
 中长期方向：
