@@ -143,6 +143,7 @@ def candidate_assessment_task(
     top_n: int | None = None,
     assessment_mode: str = "external",
     external_top_n: int = 10,
+    skip_ranking: bool = False,
 ) -> dict[str, Any]:
     """
     Candidate Assessment Agent task.
@@ -159,6 +160,7 @@ def candidate_assessment_task(
         top_n=top_n,
         assessment_mode=assessment_mode,
         external_top_n=external_top_n,
+        skip_ranking=skip_ranking,
     )
 
 
@@ -330,6 +332,7 @@ def batch_molecule_task(
                 top_n=kwargs.get("top_n", len(existing_ids)),
                 assessment_mode=kwargs.get("assessment_mode", "fast"),
                 external_top_n=kwargs.get("external_top_n", min(10, len(existing_ids))),
+                skip_ranking=kwargs.get("skip_ranking", False),
             )
             results["succeeded"] += len(existing_ids)
             results["assessment"] = assessment

@@ -212,6 +212,7 @@ def run_project_candidate_assessment(
     max_synthesis_steps: int = 5,
     prefer_buyable_building_blocks: bool = True,
     enable_external_synthesis_routes: bool = True,
+    skip_ranking: bool = False,
 ) -> dict[str, Any]:
     assessment_mode = _normalize_assessment_mode(assessment_mode)
     molecules = _select_assessment_molecules(db, project, molecule_ids, max_molecules)
@@ -249,7 +250,7 @@ def run_project_candidate_assessment(
         prefer_buyable_building_blocks=prefer_buyable_building_blocks,
     )
     coarse_screen = _apply_coarse_screen_labels(db, molecules)
-    ranking = generate_project_rankings(
+    ranking = _skipped_ranking_summary(molecules, ranking_top_n) if skip_ranking else generate_project_rankings(
         db,
         project,
         molecules=molecules,
@@ -320,14 +321,15 @@ def run_project_candidate_assessment(
                     synthesis_refinement,
                     refinement_scope=refinement_scope,
                 )
-            ranking = generate_project_rankings(
-                db,
-                project,
-                molecules=molecules,
-                max_molecules=max_molecules,
-                top_n=ranking_top_n,
-                tool_status=tool_status,
-            )
+            if not skip_ranking:
+                ranking = generate_project_rankings(
+                    db,
+                    project,
+                    molecules=molecules,
+                    max_molecules=max_molecules,
+                    top_n=ranking_top_n,
+                    tool_status=tool_status,
+                )
     project.status = "candidate_assessed"
     db.commit()
     return {
@@ -335,6 +337,7 @@ def run_project_candidate_assessment(
         "assessment_mode": assessment_mode,
         "external_top_n": external_top_n,
         "external_synthesis_routes_enabled": enable_external_synthesis_routes,
+        "ranking_skipped": skip_ranking,
         "conformer": conformer.as_dict(),
         "docking": docking.as_dict(),
         "admet": admet.as_dict(),
@@ -1039,6 +1042,19 @@ def _normalize_assessment_mode(mode: str) -> str:
     if normalized not in ASSESSMENT_MODES:
         raise ValueError(f"Unsupported candidate assessment mode: {mode}")
     return normalized
+
+
+def _skipped_ranking_summary(molecules: list[Molecule], top_n: int) -> StageSummary:
+    ordered_ids = [molecule.molecule_id for molecule in molecules]
+    return StageSummary(
+        agent_run_id="RUN-RANKING-SKIPPED",
+        adapter_mode="ranking_skipped",
+        requested_count=len(molecules),
+        skipped_count=len(molecules),
+        molecule_ids=ordered_ids[:top_n],
+        skipped_molecule_ids=ordered_ids,
+        warnings=["ranking_skipped_by_request"],
+    )
 
 
 def _top_ranked_molecules_for_external_refinement(

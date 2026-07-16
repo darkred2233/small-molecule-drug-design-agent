@@ -313,6 +313,32 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
         assert all("rule_filter" in item["score_breakdown"] for item in rankings)
 
 
+def test_candidate_assessment_can_skip_ranking(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "assessment_mode": "fast",
+                "max_molecules": 2,
+                "top_n": 2,
+                "skip_ranking": True,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["conformer"]["generated_count"] == 2
+        assert body["docking"]["evaluated_count"] == 2
+        assert body["admet"]["evaluated_count"] == 2
+        assert body["synthesis"]["evaluated_count"] == 2
+        assert body["ranking"]["adapter_mode"] == "ranking_skipped"
+        assert body["ranking"]["skipped_count"] == 2
+        assert body["ranking"]["warnings"] == ["ranking_skipped_by_request"]
+        assert client.get(f"/projects/{project_id}/rankings").json() == []
+
+
 def test_external_assessment_runs_available_admet_model_for_all_candidates(tmp_path, monkeypatch):
     status = _minimal_tool_status_with_external()
     status["gnina"]["available"] = False

@@ -34,7 +34,7 @@ from medagent.db.models import (
     Target,
     UploadedFile as UploadedFileModel,
 )
-from medagent.db.session import build_session_factory
+from medagent.db.session import build_session_factory, configure_session_factory
 from medagent.data.builtin_targets import get_builtin_target_ids
 from medagent.data.target_metadata import get_target_metadata
 from medagent.domain.schemas import (
@@ -145,6 +145,7 @@ SessionLocal: sessionmaker[Session]
 def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or get_settings()
     session_factory = build_session_factory(app_settings)
+    configure_session_factory(session_factory)
     globals()["SessionLocal"] = session_factory
 
     @asynccontextmanager
@@ -1397,6 +1398,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_synthesis_steps=request.max_synthesis_steps,
             prefer_buyable_building_blocks=request.prefer_buyable_building_blocks,
             enable_external_synthesis_routes=request.enable_external_synthesis_routes,
+            skip_ranking=request.skip_ranking,
         )
 
     @app.get(

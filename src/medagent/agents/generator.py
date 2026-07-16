@@ -16,13 +16,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from medagent.db.models import (
-    AgentRun,
     Project,
     SeedLigand,
 )
 from medagent.services.molecule_generation import (
-    MoleculeGenerationConfig,
-    generate_molecules,
+    generate_project_molecules,
 )
 
 
@@ -130,37 +128,21 @@ class GeneratorAgent:
         Returns:
             GenerationResult
         """
-        # 记录Agent运行
-        agent_run = AgentRun(
-            project_id=project.project_id,
-            agent_name="generator_agent",
-            agent_type="generation",
-            input_data={
-                "method": strategy.method,
-                "seed_count": len(strategy.seed_ligands),
-                "target_count": strategy.target_count,
-            },
-            status="running",
-        )
-        self.db.add(agent_run)
-        self.db.commit()
-
         try:
-            # 配置生成参数
-            config = MoleculeGenerationConfig(
-                method=strategy.method,
-                seed_smiles=strategy.seed_ligands,
-                num_molecules=strategy.target_count,
-                constraints=strategy.constraints,
-                keep_core=strategy.keep_core,
-                similarity_range=(strategy.min_similarity, strategy.max_similarity),
-            )
-
-            # 调用生成服务
-            generation_result = generate_molecules(
-                project_id=project.project_id,
-                config=config,
+            generation_constraints = {
+                **strategy.constraints,
+                "keep_core": strategy.keep_core,
+                "min_tanimoto_to_seed": strategy.min_similarity,
+                "max_tanimoto_to_seed": strategy.max_similarity,
+            }
+            generation_result = generate_project_molecules(
                 db=self.db,
+                project=project,
+                generation_size=strategy.target_count,
+                strategies=[strategy.method],
+                strategy_counts={strategy.method: strategy.target_count},
+                constraints=generation_constraints,
+                agent_run_name="generator_agent",
             )
 
             # 统计结果
@@ -186,16 +168,6 @@ class GeneratorAgent:
                 failures=failures,
             )
 
-            # 更新Agent运行状态
-            agent_run.status = "completed"
-            agent_run.output_data = {
-                "generated_count": generated_count,
-                "valid_count": valid_count,
-                "molecule_ids": molecule_ids[:10],  # 只保存前10个ID
-            }
-            agent_run.success = True
-            self.db.commit()
-
             return GenerationResult(
                 project_id=project.project_id,
                 strategy=strategy,
@@ -207,11 +179,7 @@ class GeneratorAgent:
                 recommendations=recommendations,
             )
 
-        except Exception as e:
-            agent_run.status = "failed"
-            agent_run.error_message = str(e)
-            agent_run.success = False
-            self.db.commit()
+        except Exception:
             raise
 
     def _select_generation_method(

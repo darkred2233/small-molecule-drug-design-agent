@@ -574,6 +574,14 @@ class CandidateAssessmentRunRequest(BaseModel):
             "external retrosynthesis route prediction."
         ),
     )
+    skip_ranking: bool = Field(
+        default=False,
+        title="Skip candidate ranking",
+        description=(
+            "When true, conformer/docking/ADMET/synthesis assessment runs without writing "
+            "candidate ranking rows."
+        ),
+    )
 
 
 class AssessmentStageSummary(BaseModel):
