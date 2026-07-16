@@ -49,16 +49,26 @@ agents:
     use_llm: true
     provider: "qwen"
     model: "qwen-max"
+    # 修复后所有方法都使用LLM
 
   sar:
     use_llm: true
     provider: "qwen"
     model: "qwen-max"
+    # 修复后3个核心方法使用LLM（识别SAR模式、提取药效团、生成优化建议）
+
+  conversation:
+    use_llm: true
+    provider: "qwen"
+    model: "qwen-plus"
+    # 修复后LLM优先，规则引擎兜底
 
   self_refutation:
+    use_llm: true
     provider: "deepseek"
     model: "deepseek-chat"
     strict_mode: false
+    # 修复后新增LLM质询
 
   ranker:
     weights:
@@ -68,12 +78,12 @@ agents:
       synthesis: 0.15
 
   advisor:
-    provider: "qwen"
-    model: "qwen-plus"
+    # 保持规则引擎，不调用LLM
+    enabled: true
 
   report:
     include_details: true
-    max_molecules: 10
+    max_molecules: 50
 
 tools:
   rdkit:

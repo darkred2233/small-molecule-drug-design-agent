@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +30,30 @@ class Settings(BaseSettings):
     dashscope_api_key: str | None = None
     dashscope_compatible_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     dashscope_rerank_url: str | None = None
+    self_refutation_use_llm: bool = False
+    self_refutation_provider: str = "deepseek"
+    self_refutation_model: str = "deepseek-chat"
+    reinvent4_prior_file: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "REINVENT4_PRIOR_FILE",
+            "MEDAGENT_REINVENT4_PRIOR_FILE",
+        ),
+    )
+    diffdock_model_dir: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DIFFDOCK_MODEL_DIR",
+            "MEDAGENT_DIFFDOCK_MODEL_DIR",
+        ),
+    )
+    diffdock_confidence_model_dir: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DIFFDOCK_CONFIDENCE_MODEL_DIR",
+            "MEDAGENT_DIFFDOCK_CONFIDENCE_MODEL_DIR",
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="MEDAGENT_",

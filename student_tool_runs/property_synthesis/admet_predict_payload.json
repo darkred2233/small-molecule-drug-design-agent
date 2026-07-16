@@ -1,0 +1,34 @@
+{
+  "smiles_list": [
+    "O=C(NCCO)c1ccccc1",
+    "NC(=O)c1ccccc1",
+    "O=C(O)c1ccccc1",
+    "O=C(NCCO)c1ccc(F)cc1",
+    "O=C(NCCO)c1ccc(Cl)cc1",
+    "Cc1ccc(C(=O)NCCO)cc1",
+    "COc1ccc(C(=O)NCCO)cc1",
+    "N#Cc1ccc(C(=O)NCCO)cc1",
+    "O=C(NCCO)c1ccc(C(F)(F)F)cc1",
+    "O=C(N(CCO)CC)c1ccccc1",
+    "CCOC(=O)c1ccc(F)cc1",
+    "CCCS(=O)(=O)Nc1ccc(F)c(C(=O)c2c[nH]c3ncc(SCC(=O)O)cc23)c1F"
+  ],
+  "molecule_ids": [
+    "ANALOG-TOP1-001",
+    "ANALOG-TOP1-002",
+    "ANALOG-TOP1-003",
+    "ANALOG-TOP1-004",
+    "ANALOG-TOP1-005",
+    "ANALOG-TOP1-006",
+    "ANALOG-TOP1-007",
+    "ANALOG-TOP1-008",
+    "ANALOG-TOP1-009",
+    "ANALOG-TOP1-010",
+    "ANALOG-TOP1-011",
+    "ANALOG-TOP1-012"
+  ],
+  "properties": ["hERG", "Ames", "CYP3A4", "CYP2D6", "solubility", "permeability", "DILI", "Pgp", "BBB"],
+  "use_docker": false,
+  "timeout_seconds": 300
+}
+

@@ -28,6 +28,7 @@ class TargetValidationResult:
     known_inhibitors: list[str] = field(default_factory=list)
     structural_info: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    druggability_score_semantics: str = "heuristic_not_probability"
 
 
 @dataclass
@@ -50,6 +51,7 @@ class BindingSitePrediction:
     volume: float | None
     druggability_score: float  # 0-1
     description: str
+    druggability_score_semantics: str = "llm_or_rule_based_heuristic_not_probability"
 
 
 @dataclass
@@ -73,7 +75,8 @@ class TargetAnalysisReport:
     literature_summary: str = ""
     recommendations: list[str] = field(default_factory=list)
     risk_assessment: str = ""
-    success_probability: float = 0.0
+    target_support_score: float = 0.0
+    score_semantics: str = "heuristic_not_probability"
 
 
 class TargetAgent:
@@ -81,7 +84,13 @@ class TargetAgent:
 
     def __init__(self, db: Session):
         self.db = db
-        self.llm_client = get_llm_client()
+        self._llm_client: Any | None = None
+
+    @property
+    def llm_client(self) -> Any:
+        if self._llm_client is None:
+            self._llm_client = get_llm_client()
+        return self._llm_client
 
     def analyze_target(
         self,
@@ -98,8 +107,8 @@ class TargetAgent:
         Returns:
             TargetAnalysisReport
         """
-        target_protein = project.target_protein
-        disease_area = project.disease_area
+        target_protein = getattr(project, "target_protein", None) or project.target_id or project.name
+        disease_area = getattr(project, "disease_area", None) or project.objective or "unknown"
 
         # 1. 靶点验证
         validation_result = self._validate_target(target_protein, disease_area, use_llm)
@@ -136,8 +145,8 @@ class TargetAgent:
             competitive_drugs,
         )
 
-        # 8. 成功概率
-        success_probability = self._estimate_success_probability(
+        # 8. 靶点支持度启发式评分；不是项目成功概率
+        target_support_score = self._estimate_target_support_score(
             validation_result,
             disease_associations,
             competitive_drugs,
@@ -152,7 +161,7 @@ class TargetAgent:
             literature_summary=literature_summary,
             recommendations=recommendations,
             risk_assessment=risk_assessment,
-            success_probability=success_probability,
+            target_support_score=target_support_score,
         )
 
     def _validate_target(
@@ -274,28 +283,38 @@ class TargetAgent:
 3. 证据水平（clinical/preclinical/computational）
 4. 简要描述
 
-返回JSON数组格式。
+返回JSON数组格式：
+[
+  {{
+    "disease": "疾病名称",
+    "association_strength": "strong/moderate/weak",
+    "evidence_level": "clinical/preclinical/computational",
+    "description": "简要描述",
+    "references": []
+  }}
+]
 """
 
             messages = [LLMMessage(role="user", content=prompt)]
 
             try:
-                self.llm_client.complete(
+                response = self.llm_client.complete(
                     messages=messages,
                     provider="qwen",
+                    model="qwen-max",
                     temperature=0.3,
+                    max_tokens=1500,
                 )
 
-                # 简化处理，实际需要解析JSON
-                return [
-                    DiseaseAssociation(
-                        disease=disease_area,
-                        association_strength="moderate",
-                        evidence_level="preclinical",
-                        description=f"{target_protein}与{disease_area}存在已知关联",
-                        references=[],
-                    )
-                ]
+                # 解析JSON响应
+                import json
+                import re
+
+                content = response.content
+                json_match = re.search(r'\[.*\]', content, re.DOTALL)
+                if json_match:
+                    results = json.loads(json_match.group())
+                    return [DiseaseAssociation(**item) for item in results]
 
             except Exception as e:
                 print(f"LLM分析失败: {e}")
@@ -318,7 +337,56 @@ class TargetAgent:
     ) -> list[BindingSitePrediction]:
         """预测结合位点"""
 
-        # 简化实现
+        if use_llm:
+            prompt = f"""
+作为结构生物学专家，请分析靶点 {target_protein} 的潜在结合位点：
+
+请列出：
+1. 结合位点ID和名称
+2. 关键残基（如果已知）
+3. 中心坐标（如果已知PDB结构）
+4. 位点体积（单位：Å³）
+5. 可成药性评分（0-1）
+6. 位点描述
+
+返回JSON数组格式：
+[
+  {{
+    "site_id": "site1",
+    "site_name": "Active Site",
+    "residues": ["TYR123", "ASP456"],
+    "center_coordinates": [x, y, z],
+    "volume": 500.0,
+    "druggability_score": 0.8,
+    "description": "主要活性位点"
+  }}
+]
+"""
+
+            messages = [LLMMessage(role="user", content=prompt)]
+
+            try:
+                response = self.llm_client.complete(
+                    messages=messages,
+                    provider="qwen",
+                    model="qwen-max",
+                    temperature=0.3,
+                    max_tokens=1500,
+                )
+
+                import json
+                import re
+
+                content = response.content
+                json_match = re.search(r'\[.*\]', content, re.DOTALL)
+                if json_match:
+                    results = json.loads(json_match.group())
+                    return [BindingSitePrediction(**item) for item in results]
+
+            except Exception as e:
+                print(f"LLM预测失败: {e}")
+
+        # 默认返回
         return [
             BindingSitePrediction(
                 site_id="site1",
@@ -339,7 +407,53 @@ class TargetAgent:
     ) -> list[CompetitiveDrug]:
         """分析竞争药物"""
 
-        # 简化实现
+        if use_llm:
+            prompt = f"""
+作为药物市场分析专家，请列出针对 {target_protein} 靶点在 {disease_area} 领域的竞争药物：
+
+请列出：
+1. 药物名称
+2. 药物类型（approved/clinical_trial/preclinical）
+3. 临床阶段（Phase I/II/III/Approved）
+4. 作用机制
+5. 开发公司
+
+返回JSON数组格式：
+[
+  {{
+    "drug_name": "药物名称",
+    "drug_type": "approved/clinical_trial/preclinical",
+    "phase": "Phase III",
+    "mechanism": "作用机制",
+    "company": "公司名称"
+  }}
+]
+"""
+
+            messages = [LLMMessage(role="user", content=prompt)]
+
+            try:
+                response = self.llm_client.complete(
+                    messages=messages,
+                    provider="qwen",
+                    model="qwen-max",
+                    temperature=0.3,
+                    max_tokens=1500,
+                )
+
+                import json
+                import re
+
+                content = response.content
+                json_match = re.search(r'\[.*\]', content, re.DOTALL)
+                if json_match:
+                    results = json.loads(json_match.group())
+                    return [CompetitiveDrug(**item) for item in results]
+
+            except Exception as e:
+                print(f"LLM分析失败: {e}")
+
+        # 默认返回空列表
         return []
 
     def _summarize_literature(
@@ -437,13 +551,13 @@ class TargetAgent:
         else:
             return "风险可控"
 
-    def _estimate_success_probability(
+    def _estimate_target_support_score(
         self,
         validation_result: TargetValidationResult,
         disease_associations: list[DiseaseAssociation],
         competitive_drugs: list[CompetitiveDrug],
     ) -> float:
-        """估计成功概率"""
+        """计算靶点证据支持度启发式评分；该值不是校准概率。"""
 
         score = 0.0
 

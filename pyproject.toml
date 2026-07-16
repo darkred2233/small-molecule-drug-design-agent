@@ -23,6 +23,8 @@ dev = [
 chem = [
     "admet-ai==2.0.1",
     "datamol>=0.12.0",
+    "gemmi>=0.7,<0.8",
+    "meeko>=0.7.1,<0.8",
     "rdkit>=2023.9.1",
 ]
 rag = [

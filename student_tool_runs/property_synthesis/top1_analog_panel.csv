@@ -1,0 +1,14 @@
+panel_id,molecule_id,smiles,design_intent,expected_check
+BRAF-B-001,ANALOG-TOP1-001,O=C(NCCO)c1ccccc1,原始Top1；保留苯甲酰乙醇胺骨架,作为局部优化参考起点
+BRAF-B-002,ANALOG-TOP1-002,NC(=O)c1ccccc1,去掉乙醇侧链；小分子酰胺对照,观察极性和分子量下降后的得失
+BRAF-B-003,ANALOG-TOP1-003,O=C(O)c1ccccc1,羧酸对照；更强极性和酸性,观察TPSA和ADMET风险
+BRAF-B-004,ANALOG-TOP1-004,O=C(NCCO)c1ccc(F)cc1,对位氟取代；轻微电子效应,观察QED和LogP变化
+BRAF-B-005,ANALOG-TOP1-005,O=C(NCCO)c1ccc(Cl)cc1,对位氯取代；提高疏水性和体积,观察LogP与合成可行性
+BRAF-B-006,ANALOG-TOP1-006,Cc1ccc(C(=O)NCCO)cc1,对位甲基取代；轻度提高疏水性,观察是否仍保持良好性质
+BRAF-B-007,ANALOG-TOP1-007,COc1ccc(C(=O)NCCO)cc1,对位甲氧基取代；增加受体特征,观察TPSA/HBA变化
+BRAF-B-008,ANALOG-TOP1-008,N#Cc1ccc(C(=O)NCCO)cc1,对位氰基取代；增加极性受体,观察TPSA和ADMET风险
+BRAF-B-009,ANALOG-TOP1-009,O=C(NCCO)c1ccc(C(F)(F)F)cc1,对位三氟甲基取代；显著提高疏水性,观察LogP/QED是否改善
+BRAF-B-010,ANALOG-TOP1-010,O=C(N(CCO)CC)c1ccccc1,二级胺侧链替换；减少HBD,观察渗透性相关指标
+BRAF-B-011,ANALOG-TOP1-011,CCOC(=O)c1ccc(F)cc1,酯类对照；来自当前Top10,观察无HBD候选的性质
+BRAF-B-012,ANALOG-TOP1-012,CCCS(=O)(=O)Nc1ccc(F)c(C(=O)c2c[nH]c3ncc(SCC(=O)O)cc23)c1F,复杂Top2；高分但性质压力较大,作为高分复杂分子对照
+

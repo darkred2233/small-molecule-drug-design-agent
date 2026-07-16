@@ -14,19 +14,42 @@ services:
       MEDAGENT_DASHSCOPE_API_KEY: ${MEDAGENT_DASHSCOPE_API_KEY:-}
       MEDAGENT_DASHSCOPE_COMPATIBLE_BASE_URL: ${MEDAGENT_DASHSCOPE_COMPATIBLE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       MEDAGENT_DASHSCOPE_RERANK_URL: ${MEDAGENT_DASHSCOPE_RERANK_URL:-}
+      REINVENT4_PRIOR_FILE: ${REINVENT4_PRIOR_FILE:-/app/.local/models/reinvent4/reinvent_pubchem.prior}
+      DIFFDOCK_MODEL_DIR: ${DIFFDOCK_MODEL_DIR:-/app/.local/models/diffdock/score_model}
+      DIFFDOCK_CONFIDENCE_MODEL_DIR: ${DIFFDOCK_CONFIDENCE_MODEL_DIR:-/app/.local/models/diffdock/confidence_model}
+      MEDAGENT_DOCKER_WORK_ROOT: /app/.local/tool-runs
+      AIZYNTHFINDER_CONFIG: ${AIZYNTHFINDER_CONFIG:-/app/data/aizynthfinder/config.yml}
+      MEDAGENT_AIZYNTHFINDER_DATA_DIR: ${MEDAGENT_AIZYNTHFINDER_DATA_DIR:-/app/data/aizynthfinder}
     ports:
       - "8000:8000"
     volumes:
       - medagent-local:/app/.local
+      - ./.local/models:/app/.local/models:ro
+      - ./data/aizynthfinder:/app/data/aizynthfinder:ro
+      # The API uses this socket to launch short-lived chemistry tool containers.
+      # Treat the API container as host-privileged and expose it only on trusted machines.
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   postgres:
-    image: pgvector/pgvector:pg16
+    image: m.daocloud.io/docker.io/pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: medagent
       POSTGRES_USER: medagent
@@ -43,7 +66,7 @@ services:
       retries: 5
 
   minio:
-    image: minio/minio:latest
+    image: m.daocloud.io/docker.io/minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: medagent
@@ -55,7 +78,7 @@ services:
       - minio-data:/data
 
   minio-init:
-    image: minio/mc:latest
+    image: m.daocloud.io/docker.io/minio/mc:latest
     depends_on:
       minio:
         condition: service_started
@@ -67,10 +90,18 @@ services:
       echo 'MinIO bucket initialized';
       "
 
-  # Chemprop ADMET prediction service
+  # Optional Chemprop runtime for user-supplied checkpoints. The API image already
+  # contains ADMET-AI 2.0.1 and does not need this image for standard ADMET prediction.
   chemprop:
     image: chemprop:latest
     build: docker/chemprop
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     volumes:
       - ./data/predictions:/data/output
       - ./data/models:/data/models
@@ -81,6 +112,13 @@ services:
   # GNINA docking service
   gnina:
     image: ${GNINA_IMAGE:-gnina/gnina:latest}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     volumes:
       - ./data/poses:/data/output
     command: ["--help"]
@@ -101,6 +139,13 @@ services:
   diffdock:
     image: diffdock:latest
     build: docker/diffdock
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     volumes:
       - ./data/poses:/data/output
     command: ["--help"]
@@ -111,6 +156,13 @@ services:
   reinvent4:
     image: reinvent4:latest
     build: docker/reinvent4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     volumes:
       - ./data/generated:/data/output
     command: ["--help"]
@@ -131,6 +183,13 @@ services:
   aizynthfinder:
     image: aizynthfinder:latest
     build: docker/aizynthfinder
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     volumes:
       - ./data/retrosynthesis:/data/output
       - ./data/aizynthfinder:/data/aizynthfinder:ro

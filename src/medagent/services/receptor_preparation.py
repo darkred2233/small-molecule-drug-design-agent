@@ -1,6 +1,6 @@
 import shutil
 import subprocess
-import time
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +13,7 @@ from medagent.core.config import Settings
 from medagent.db.models import BindingSite, Project, Target, UploadedFile
 from medagent.services.file_ingestion import parse_pdb_summary, path_from_storage_uri, safe_filename
 from medagent.services.ids import new_id
+from medagent.services.pdbqt_validation import is_valid_vina_receptor_pdbqt
 
 
 @dataclass
@@ -128,6 +129,55 @@ def get_project_binding_site(
     if not site.project_id and site.target_id != project.target_id:
         return None
     return site
+
+
+def project_docking_config(
+    db: Session,
+    project: Project,
+    binding_site_id: str | None = None,
+) -> dict[str, Any]:
+    if binding_site_id:
+        site = get_project_binding_site(db, project, binding_site_id)
+    else:
+        sites = list_project_binding_sites(db, project)
+        site = _first_site_with_docking_config(sites)
+    if site is None:
+        return {}
+
+    grid_box = site.grid_box or {}
+    receptor_reference = (
+        site.prepared_receptor_file
+        or site.receptor_file
+        or grid_box.get("prepared_receptor_file")
+        or grid_box.get("receptor_file")
+    )
+    return {
+        "binding_site_id": site.binding_site_id,
+        "protein_file": resolve_receptor_path(receptor_reference),
+        "grid_center": grid_box.get("center") or grid_box.get("grid_center"),
+        "grid_size": grid_box.get("size") or grid_box.get("grid_size"),
+        "key_residues": site.key_residues or [],
+    }
+
+
+def _first_site_with_docking_config(sites: list[BindingSite]) -> BindingSite | None:
+    fallback: BindingSite | None = None
+    for site in sites:
+        if fallback is None:
+            fallback = site
+        grid_box = site.grid_box or {}
+        has_receptor = bool(
+            site.prepared_receptor_file
+            or site.receptor_file
+            or grid_box.get("prepared_receptor_file")
+            or grid_box.get("receptor_file")
+        )
+        has_grid = bool(grid_box.get("center") or grid_box.get("grid_center")) and bool(
+            grid_box.get("size") or grid_box.get("grid_size")
+        )
+        if has_receptor and has_grid:
+            return site
+    return fallback
 
 
 def receptor_preparation_tool_status() -> dict[str, Any]:
@@ -284,7 +334,7 @@ def _prepare_receptor_for_vina(
     output_dir: Path,
     tool_status: dict[str, Any],
 ) -> tuple[Path | None, list[str]]:
-    if receptor_path.suffix.lower() == ".pdbqt":
+    if is_valid_vina_receptor_pdbqt(receptor_path):
         return receptor_path, []
 
     obabel = tool_status["obabel"].get("path")
@@ -292,8 +342,24 @@ def _prepare_receptor_for_vina(
         return None, ["receptor_pdbqt_preparation_tool_not_installed"]
 
     output_path = output_dir / f"{receptor_path.stem}.pdbqt"
-    command = [str(obabel), f"-i{receptor_path.suffix.lstrip('.')}", str(receptor_path), "-opdbqt", "-O", str(output_path)]
-    started = time.perf_counter()
+    temp_handle = tempfile.NamedTemporaryFile(
+        prefix=f".{receptor_path.stem}.",
+        suffix=".pdbqt",
+        dir=output_dir,
+        delete=False,
+    )
+    temp_path = Path(temp_handle.name)
+    temp_handle.close()
+    temp_path.unlink(missing_ok=True)
+    command = [
+        str(obabel),
+        f"-i{receptor_path.suffix.lstrip('.')}",
+        str(receptor_path),
+        "-opdbqt",
+        "-O",
+        str(temp_path),
+        "-xr",
+    ]
     try:
         completed = subprocess.run(
             command,
@@ -303,14 +369,21 @@ def _prepare_receptor_for_vina(
             check=False,
         )
     except subprocess.TimeoutExpired:
+        temp_path.unlink(missing_ok=True)
         return None, ["receptor_pdbqt_preparation_timeout"]
     except OSError:
+        temp_path.unlink(missing_ok=True)
         return None, ["receptor_pdbqt_preparation_failed"]
 
-    if completed.returncode == 0 and output_path.exists():
+    try:
+        if completed.returncode != 0:
+            return None, ["receptor_pdbqt_preparation_failed"]
+        if not is_valid_vina_receptor_pdbqt(temp_path):
+            return None, ["receptor_pdbqt_preparation_invalid_rigid_output"]
+        temp_path.replace(output_path)
         return output_path, []
-    _ = time.perf_counter() - started
-    return None, ["receptor_pdbqt_preparation_failed"]
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _summarize_receptor(receptor_path: Path) -> dict[str, Any]:

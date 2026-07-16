@@ -17,7 +17,7 @@ from medagent.data.target_metadata import get_target_metadata
 from medagent.db.models import AgentRun, EvidenceLink, Project, RagChunk, RagDocument, Target, UploadedFile
 from medagent.rag.chunking import chunk_text
 from medagent.rag.embedding import build_embedding_client, embedding_ref
-from medagent.rag.rerank import build_reranker
+from medagent.rag.rerank import Reranker, build_reranker
 from medagent.rag.retrieval import RetrievalCandidate, retrieve_candidates
 from medagent.services.ids import new_id
 
@@ -153,14 +153,23 @@ def query_project_rag(
     create_evidence: bool = True,
 ) -> dict[str, Any]:
     top_k = top_k or settings.rag_default_top_k
+    embedding_client = build_embedding_client(settings)
+    reranker = build_reranker(settings)
+    rerank_model = reranker.model_name if reranker.produces_scores else None
     run = create_agent_run(
         db,
         project,
         RAG_RETRIEVAL_AGENT_NAME,
-        model_name=settings.rerank_model,
-        input_json={"query": query, "query_type": query_type, "top_k": top_k, "molecule_id": molecule_id},
+        model_name=rerank_model or embedding_client.model_name,
+        input_json={
+            "query": query,
+            "query_type": query_type,
+            "top_k": top_k,
+            "molecule_id": molecule_id,
+            "embedding_model": embedding_client.model_name,
+            "rerank_model": rerank_model,
+        },
     )
-    embedding_client = build_embedding_client(settings)
     query_embedding = embedding_client.embed_texts([query], input_type="query")[0]
     chunks, documents_by_id = load_project_chunks(db, project)
     candidates = retrieve_candidates(
@@ -171,25 +180,35 @@ def query_project_rag(
         vector_top_k=settings.rag_vector_top_k,
         keyword_top_k=settings.rag_keyword_top_k,
     )
-    ranked = rerank_candidates(settings, query, candidates, top_k)
+    ranked = rerank_candidates(reranker, query, candidates, top_k)
     retrieved_chunks = [
         candidate_to_payload(
             db,
             candidate,
+            retrieval_rank=rank,
+            embedding_model=embedding_client.model_name,
+            rerank_model=rerank_model,
             query=query,
             query_type=query_type,
             molecule_id=molecule_id,
             create_evidence=create_evidence,
         )
-        for candidate in ranked
+        for rank, candidate in enumerate(ranked, start=1)
     ]
     evidence_ids = [item["evidence_id"] for item in retrieved_chunks if item.get("evidence_id")]
+    retrieval_method = query_retrieval_method(retrieved_chunks, embedding_client.model_name)
     output = {
         "query": query,
         "query_type": query_type,
         "retrieved_chunks": retrieved_chunks,
         "evidence_ids": evidence_ids,
-        "confidence": retrieval_confidence(retrieved_chunks),
+        "confidence": None,
+        "confidence_semantics": "not_calibrated",
+        "retrieval_support_score": retrieval_support_score(retrieved_chunks),
+        "retrieval_support_score_semantics": "heuristic_not_probability",
+        "embedding_model": embedding_client.model_name,
+        "rerank_model": rerank_model,
+        "retrieval_method": retrieval_method,
         "missing_information": [] if retrieved_chunks else ["rag_retrieval_no_results"],
         "adapter_mode": RAG_ADAPTER_MODE,
     }
@@ -404,7 +423,7 @@ def load_project_chunks(db: Session, project: Project) -> tuple[list[RagChunk], 
 
 
 def rerank_candidates(
-    settings: Settings,
+    reranker: Reranker,
     query: str,
     candidates: list[RetrievalCandidate],
     top_k: int,
@@ -412,7 +431,6 @@ def rerank_candidates(
     if not candidates:
         return []
     shortlist = candidates[: max(top_k, 1) * 4]
-    reranker = build_reranker(settings)
     reranked = reranker.rerank(query, [candidate.chunk.content for candidate in shortlist], top_n=top_k)
     if not reranked:
         return shortlist[:top_k]
@@ -430,6 +448,9 @@ def candidate_to_payload(
     db: Session,
     candidate: RetrievalCandidate,
     *,
+    retrieval_rank: int,
+    embedding_model: str,
+    rerank_model: str | None,
     query: str,
     query_type: str,
     molecule_id: str | None,
@@ -443,7 +464,7 @@ def candidate_to_payload(
             molecule_id=molecule_id,
             chunk_id=candidate.chunk.chunk_id,
             claim_type=query_type,
-            confidence=round(candidate.rerank_score or candidate.combined_score, 3),
+            confidence=None,
             rationale=evidence_summary,
         )
         db.add(link)
@@ -451,6 +472,7 @@ def candidate_to_payload(
         evidence_id = link.evidence_id
 
     return {
+        "retrieval_rank": retrieval_rank,
         "chunk_id": candidate.chunk.chunk_id,
         "document_id": candidate.document.document_id,
         "source_type": candidate.document.document_type,
@@ -462,7 +484,17 @@ def candidate_to_payload(
         "keyword_score": candidate.keyword_score,
         "combined_score": candidate.combined_score,
         "rerank_score": candidate.rerank_score,
+        "retrieval_method": candidate_retrieval_method(candidate, embedding_model),
+        "score_semantics": (
+            "reranker_relevance_score_not_probability"
+            if candidate.rerank_score is not None
+            else "heuristic_retrieval_score_not_probability"
+        ),
+        "embedding_model": embedding_model,
+        "rerank_model": rerank_model if candidate.rerank_score is not None else None,
         "evidence_id": evidence_id,
+        "evidence_confidence": None,
+        "evidence_confidence_semantics": "not_calibrated",
         "evidence_summary": evidence_summary,
         "content": candidate.chunk.content,
     }
@@ -635,12 +667,34 @@ def summarize_evidence(content: str, query: str) -> str:
     return summary[:260]
 
 
-def retrieval_confidence(retrieved_chunks: list[dict[str, Any]]) -> float:
+def retrieval_support_score(retrieved_chunks: list[dict[str, Any]]) -> float:
     if not retrieved_chunks:
         return 0.0
-    best_score = max(float(item.get("rerank_score") or item.get("combined_score") or 0.0) for item in retrieved_chunks)
-    evidence_bonus = min(len(retrieved_chunks) / 10.0, 1.0) * 0.20
-    return round(min(best_score + evidence_bonus, 1.0), 3)
+    best_score = max(float(item.get("combined_score") or 0.0) for item in retrieved_chunks)
+    return round(min(max(best_score, 0.0), 1.0), 3)
+
+
+def candidate_retrieval_method(candidate: RetrievalCandidate, embedding_model: str) -> str:
+    vector_method = "local_hash_vector" if embedding_model == "local-hash-embedding" else "dense_vector"
+    if candidate.vector_score > 0 and candidate.keyword_score > 0:
+        method = f"hybrid_{vector_method}_bm25"
+    elif candidate.vector_score > 0:
+        method = vector_method
+    else:
+        method = "bm25"
+    if candidate.rerank_score is not None:
+        return f"{method}_with_model_rerank"
+    return method
+
+
+def query_retrieval_method(retrieved_chunks: list[dict[str, Any]], embedding_model: str) -> str:
+    if not retrieved_chunks:
+        vector_method = (
+            "local_hash_vector" if embedding_model == "local-hash-embedding" else "dense_vector"
+        )
+        return f"hybrid_{vector_method}_bm25"
+    methods = {str(item["retrieval_method"]) for item in retrieved_chunks}
+    return next(iter(methods)) if len(methods) == 1 else "mixed_retrieval_methods"
 
 
 def rag_build_summary(

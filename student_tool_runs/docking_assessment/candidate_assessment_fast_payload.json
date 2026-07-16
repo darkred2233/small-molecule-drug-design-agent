@@ -1,0 +1,39 @@
+{
+  "molecule_ids": [
+    "MOL-D87CC67DED",
+    "MOL-450DC51730",
+    "MOL-62E15AFF71",
+    "MOL-72DA7467ED",
+    "MOL-AB0A4C6BC4"
+  ],
+  "max_molecules": 5,
+  "top_n": 5,
+  "assessment_mode": "fast",
+  "external_top_n": 5,
+  "protein_file": "student_tool_runs/data/3OG7_BRAF_receptor.pdb",
+  "prepared_ligand_files": {
+    "MOL-D87CC67DED": "student_tool_runs/data/ligands/MOL-D87CC67DED.sdf",
+    "MOL-450DC51730": "student_tool_runs/data/ligands/MOL-450DC51730.sdf",
+    "MOL-62E15AFF71": "student_tool_runs/data/ligands/MOL-62E15AFF71.sdf",
+    "MOL-72DA7467ED": "student_tool_runs/data/ligands/MOL-72DA7467ED.sdf",
+    "MOL-AB0A4C6BC4": "student_tool_runs/data/ligands/MOL-AB0A4C6BC4.sdf"
+  },
+  "grid_center": [1.869, -2.638, -19.918],
+  "grid_size": [24.305, 13.133, 14.396],
+  "key_residues": [
+    "ALA481:A",
+    "ASP594:A",
+    "CYS532:A",
+    "GLN530:A",
+    "GLY534:A",
+    "LYS483:A",
+    "PHE516:A",
+    "PHE595:A",
+    "TRP531:A",
+    "VAL482:A"
+  ],
+  "admet_properties": ["solubility", "permeability", "hERG", "CYP3A4", "CYP2D6", "Ames", "DILI", "Pgp_substrate"],
+  "max_synthesis_steps": 5,
+  "prefer_buyable_building_blocks": true
+}
+

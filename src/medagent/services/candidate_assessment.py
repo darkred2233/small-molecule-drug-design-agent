@@ -1,5 +1,10 @@
 import math
+import os
 import shutil
+import copy
+import hashlib
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from importlib import metadata, util
 from pathlib import Path
@@ -10,7 +15,6 @@ from sqlalchemy.orm import Session
 from medagent.db.models import (
     ADMETResult,
     AgentRun,
-    BindingSite,
     ConformerResult,
     DockingResult,
     Molecule,
@@ -41,10 +45,17 @@ from medagent.services.docking_adapters import (
     run_external_docking,
     select_docking_tool,
 )
+from medagent.services.docking_workflow import (
+    prepare_ligand_from_smiles,
+)
 from medagent.services.ids import new_id
 from medagent.services.molecule_validation import merge_labels
+from medagent.services.pdbqt_validation import (
+    is_valid_vina_ligand_pdbqt,
+    is_valid_vina_receptor_pdbqt,
+)
 from medagent.services.rdkit_adapter import find_rdkit_filter_matches
-from medagent.services.receptor_preparation import resolve_receptor_path
+from medagent.services.receptor_preparation import project_docking_config
 
 
 CONFORMER_AGENT_NAME = "conformer_agent"
@@ -258,6 +269,7 @@ def run_project_candidate_assessment(
             external_top_n=external_top_n if assessment_mode == "external" else len(coarse_passed_molecules),
         )
         _mark_coarse_screen_summary(docking, coarse_screen, assessment_mode, len(refinement_molecules))
+        _mark_coarse_screen_summary(admet, coarse_screen, assessment_mode, len(refinement_molecules))
         _mark_coarse_screen_summary(synthesis, coarse_screen, assessment_mode, len(refinement_molecules))
         if refinement_molecules:
             docking_refinement = run_project_docking(
@@ -273,6 +285,14 @@ def run_project_candidate_assessment(
                 grid_size=grid_size,
                 key_residues=key_residues or [],
             )
+            admet_refinement = run_project_admet(
+                db,
+                project,
+                refinement_molecules,
+                tool_status,
+                allow_external_tools=True,
+                admet_properties=admet_properties or [],
+            )
             synthesis_refinement = run_project_synthesis(
                 db,
                 project,
@@ -285,6 +305,7 @@ def run_project_candidate_assessment(
             _apply_external_refinement_labels(db, coarse_passed_molecules, refinement_molecules)
             refinement_scope = "top_n" if assessment_mode == "external" else "full"
             _mark_external_refinement_summary(docking, docking_refinement, refinement_scope=refinement_scope)
+            _mark_external_refinement_summary(admet, admet_refinement, refinement_scope=refinement_scope)
             _mark_external_refinement_summary(synthesis, synthesis_refinement, refinement_scope=refinement_scope)
             ranking = generate_project_rankings(
                 db,
@@ -609,6 +630,8 @@ def run_project_admet(
                 molecule,
                 single_result,
                 adapter_mode=chemprop_result.adapter_mode,
+                adapter_output=chemprop_result,
+                tool_status=tool_status.get("chemprop", {}),
             )
             molecule.labels = _replace_result_labels(molecule.labels, ADMET_RESULT_LABELS, admet.labels)
             _update_agent_run_progress(
@@ -737,6 +760,8 @@ def _upsert_admet_result_from_chemprop(
     molecule: Molecule,
     chemprop_result: SingleADMETResult,
     adapter_mode: str = "chemprop_admet",
+    adapter_output: ChempropADMETOutput | None = None,
+    tool_status: dict[str, Any] | None = None,
 ) -> ADMETResult:
     """Create or update ADMET result from Chemprop prediction."""
     result = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
@@ -752,9 +777,26 @@ def _upsert_admet_result_from_chemprop(
     result.permeability = chemprop_result.permeability
     result.admet_risk_score = chemprop_result.admet_risk_score
     result.labels = _dedupe(chemprop_result.labels)
+    tool_status = tool_status or {}
+    tool_name = adapter_output.tool_name if adapter_output is not None else "chemprop"
     result.raw_output = {
         "adapter_mode": adapter_mode,
-        "tool_name": "chemprop",
+        "tool_name": tool_name,
+        "tool_version": tool_status.get("version"),
+        "model_name": (
+            "ADMET-AI bundled Chemprop ensemble"
+            if tool_status.get("mode") == "admet_ai"
+            else tool_status.get("model_name")
+        ),
+        "model_count": tool_status.get("model_count"),
+        "compute_device": (
+            adapter_output.compute_device
+            if adapter_output is not None
+            else tool_status.get("device")
+        ),
+        "input_hash": _smiles_input_hash(molecule.smiles),
+        "status": "success",
+        "result_kind": "model_prediction",
         "CYP3A4_inhibition": chemprop_result.CYP3A4_inhibition,
         "CYP3A4_risk": chemprop_result.CYP3A4_risk,
         "CYP2D6_inhibition": chemprop_result.CYP2D6_inhibition,
@@ -950,7 +992,7 @@ def list_project_synthesis_routes(db: Session, project: Project) -> list[Synthes
 
 
 def candidate_assessment_tool_status() -> dict[str, Any]:
-    return {
+    return copy.deepcopy({
         "rdkit": _package_status("rdkit"),
         "gnina": check_gnina_available(),
         "vina": check_vina_available(),
@@ -961,7 +1003,7 @@ def candidate_assessment_tool_status() -> dict[str, Any]:
         "deepchem": _package_status("deepchem"),
         "aizynthfinder": aizynthfinder_tool_status(),
         "askcos": _package_status("askcos"),
-    }
+    })
 
 
 def _select_assessment_molecules(
@@ -1083,10 +1125,15 @@ def _apply_external_refinement_labels(
 def _external_evidence_labels(db: Session, molecule: Molecule) -> list[str]:
     labels: list[str] = []
     docking = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
-    if docking is not None:
+    if docking is not None and not _is_surrogate_docking_result(docking):
         docking_labels = docking.labels or []
         if "external_docking_adapter_used" in docking_labels:
             labels.append("external_docking_adapter_used")
+    admet = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    if admet is not None and not _is_surrogate_admet_result(admet):
+        admet_labels = admet.labels or []
+        if "admet_ai_predicted" in admet_labels or "chemprop_predicted" in admet_labels:
+            labels.append("external_admet_adapter_used")
     synthesis = db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
     if synthesis is not None:
         synthesis_labels = synthesis.labels or []
@@ -1142,7 +1189,7 @@ def _assessment_failure_reasons(
         reasons.append("assessment_conformer_failed")
 
     docking = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
-    if docking is not None:
+    if docking is not None and not _is_surrogate_docking_result(docking):
         docking_labels = docking.labels or []
         if "bad_pose" in docking_labels or (docking.clash_count or 0) >= 2:
             reasons.append("assessment_bad_pose")
@@ -1150,16 +1197,37 @@ def _assessment_failure_reasons(
             reasons.append("assessment_bad_pose")
 
     admet = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
-    if admet is not None:
+    if admet is not None and not _is_surrogate_admet_result(admet):
         admet_labels = admet.labels or []
         if "admet_blocker" in admet_labels or admet.hERG_risk == "high_risk" or admet.Ames_risk == "high_risk":
             reasons.append("assessment_admet_blocker")
 
     synthesis = synthesis_route or db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
-    if synthesis is not None and not synthesis.route_found:
+    if synthesis is not None and not _is_surrogate_synthesis_result(synthesis) and not synthesis.route_found:
         reasons.append("assessment_route_not_found")
 
     return _dedupe(reasons)
+
+
+def _is_surrogate_docking_result(result: DockingResult) -> bool:
+    raw_output = result.raw_output or {}
+    return raw_output.get("status") == "surrogate_only" or "rdkit_surrogate_docking" in (
+        result.labels or []
+    )
+
+
+def _is_surrogate_admet_result(result: ADMETResult) -> bool:
+    raw_output = result.raw_output or {}
+    return raw_output.get("status") == "surrogate_only" or "rdkit_surrogate_admet" in (
+        result.labels or []
+    )
+
+
+def _is_surrogate_synthesis_result(result: SynthesisRoute) -> bool:
+    route_json = result.route_json or {}
+    return route_json.get("status") == "surrogate_only" or "rdkit_surrogate_synthesis" in (
+        result.labels or []
+    )
 
 
 def _apply_assessment_status(molecule: Molecule, failure_reasons: list[str]) -> None:
@@ -1351,12 +1419,27 @@ def _upsert_docking_result(
         db.add(result)
 
     result.tool_run_id = None
-    result.vina_score = vina_score
-    result.cnn_score = cnn_score
-    result.key_hbond_count = key_hbond_count
-    result.clash_count = clash_count
-    result.pose_file = f"db://conformer_results/{molecule.molecule_id}"
+    result.vina_score = None
+    result.cnn_score = None
+    result.diffdock_confidence = None
+    result.key_hbond_count = None
+    result.clash_count = None
+    result.pose_file = None
     result.labels = labels
+    result.raw_output = {
+        "adapter_mode": "rdkit_surrogate_docking",
+        "tool_name": "rdkit",
+        "tool_version": _package_status("rdkit").get("version"),
+        "model_name": None,
+        "input_hash": _smiles_input_hash(molecule.smiles),
+        "status": "surrogate_only",
+        "result_kind": "non_docking_coarse_estimate",
+        "estimated_affinity_like_score": vina_score,
+        "estimated_pose_confidence": cnn_score,
+        "estimated_key_hbond_count": key_hbond_count,
+        "estimated_clash_count": clash_count,
+        "warnings": fallback_warnings or [],
+    }
     return result
 
 
@@ -1374,6 +1457,8 @@ def _external_docking_fallback_labels(warnings: list[str]) -> list[str]:
         labels.extend(["external_docking_setup_incomplete", "external_docking_grid_missing"])
     if "external_docking_adapter_unavailable_for_inputs" in warning_set:
         labels.append("external_docking_tools_unavailable")
+    if "vina_inputs_preparation_failed" in warning_set:
+        labels.append("external_docking_setup_incomplete")
     return _dedupe(labels)
 
 
@@ -1389,15 +1474,7 @@ def _upsert_external_docking_result(
     if vina_score is None:
         vina_score = external_result.cnn_affinity
     cnn_score = external_result.cnn_score
-    key_hbond_count = min(
-        len(key_residues) or 2,
-        max(0, descriptors.hbd + min(descriptors.hba, 2)),
-    )
-    clash_count = int(
-        ("high_strain" in (conformer.labels or []))
-        + (1 if descriptors.rotatable_bond_count > 10 else 0)
-        + (1 if descriptors.heavy_atom_count > 60 else 0)
-    )
+    diffdock_confidence = external_result.diffdock_confidence
     labels = list(external_result.labels or [])
     if not labels:
         labels = ["external_docking_adapter_used", f"{external_result.tool_name}_adapter"]
@@ -1408,9 +1485,9 @@ def _upsert_external_docking_result(
             labels.append("good_ligand_efficiency")
     if cnn_score is not None:
         labels.append("pose_confident" if cnn_score >= 0.6 else "pose_uncertain")
-    labels.append("key_interaction_estimated" if key_hbond_count else "key_interaction_missing")
-    if clash_count:
-        labels.append("steric_clash")
+    if diffdock_confidence is not None:
+        labels.append("diffdock_confidence_recorded")
+    labels.append("pose_interactions_not_computed")
 
     result = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
     if result is None:
@@ -1420,10 +1497,33 @@ def _upsert_external_docking_result(
     result.tool_run_id = external_result.adapter_mode
     result.vina_score = _rounded(vina_score)
     result.cnn_score = _rounded(cnn_score)
-    result.key_hbond_count = key_hbond_count
-    result.clash_count = clash_count
+    result.diffdock_confidence = _rounded(diffdock_confidence)
+    result.key_hbond_count = None
+    result.clash_count = None
     result.pose_file = external_result.pose_file
     result.labels = _dedupe(labels)
+    result.raw_output = {
+        "adapter_mode": external_result.adapter_mode,
+        "tool_name": external_result.tool_name,
+        "input_hash": _smiles_input_hash(molecule.smiles),
+        "status": "success",
+        "result_kind": "external_docking",
+        "cnn_affinity": external_result.cnn_affinity,
+        "diffdock_confidence": external_result.diffdock_confidence,
+        "diffdock_confidence_semantics": (
+            "model_specific_uncalibrated_score_higher_is_better"
+            if external_result.diffdock_confidence is not None
+            else None
+        ),
+        "selected_pose_rank": external_result.selected_pose_rank,
+        "pose_count": external_result.pose_count,
+        "pose_selection_method": external_result.pose_selection_method,
+        "best_pose_confirmed": external_result.best_pose_confirmed,
+        "runtime_seconds": round(external_result.runtime_seconds, 3),
+        "exit_code": external_result.exit_code,
+        "warnings": external_result.warnings,
+        "pose_interactions_computed": False,
+    }
     return result
 
 
@@ -1478,6 +1578,12 @@ def _upsert_admet_result(
     result.labels = _dedupe(labels)
     result.raw_output = {
         "adapter_mode": "rdkit_surrogate_admet",
+        "tool_name": "rdkit",
+        "tool_version": tool_status.get("rdkit", {}).get("version"),
+        "model_name": None,
+        "input_hash": _smiles_input_hash(molecule.smiles),
+        "status": "surrogate_only",
+        "result_kind": "non_admet_coarse_estimate",
         "tool_status": {
             key: tool_status[key]
             for key in ["admetlab", "chemprop", "deepchem", "rdkit"]
@@ -1544,16 +1650,14 @@ def _upsert_external_synthesis_route(
     estimated_steps = max(1, min(12, int(math.ceil(sa_score))))
     route_steps = external_result.num_steps or estimated_steps
     route_found = bool(external_result.route_found)
-    buyable_blocks = max(
-        1,
-        min(6, descriptors.ring_count + descriptors.hba // 2 + int(prefer_buyable_building_blocks)),
-    )
+    buyable_blocks = _external_buyable_block_count(external_result)
     route_confidence = _external_route_confidence(external_result, route_found)
+    route_plan = external_result.route_plan or []
+    starting_materials = external_result.starting_materials or []
+    has_route_details = bool(route_plan or starting_materials or external_result.route_trees)
 
     labels = _synthesis_difficulty_labels(sa_score)
     labels.append("route_found" if route_found else "route_not_found")
-    if buyable_blocks:
-        labels.append("buyable_blocks_available")
     if route_steps > max_synthesis_steps:
         labels.append("too_many_steps")
     labels.extend(
@@ -1587,13 +1691,11 @@ def _upsert_external_synthesis_route(
         "route_score": external_result.route_score,
         "route_summary": external_result.route_summary
         or _external_route_summary(route_found, route_steps),
-        "route_plan": _route_plan(
-            descriptors=descriptors,
-            route_found=route_found,
-            route_steps=route_steps,
-            buyable_blocks=buyable_blocks,
-        ),
-        "starting_materials": _starting_materials(descriptors, buyable_blocks),
+        "route_plan": route_plan,
+        "starting_materials": starting_materials,
+        "route_trees": external_result.route_trees,
+        "stock_info": external_result.stock_info,
+        "route_metadata": external_result.route_metadata,
         "route_risks": _external_route_risks(
             route_found=route_found,
             route_steps=route_steps,
@@ -1603,7 +1705,21 @@ def _upsert_external_synthesis_route(
         "external_warnings": external_result.warnings,
         "exit_code": external_result.exit_code,
         "runtime_seconds": round(external_result.runtime_seconds, 3),
-        "route_note": "Reaction-level retrosynthesis parsed from AiZynthFinder output.",
+        "route_note": (
+            "AiZynthFinder route tree parsed with stock-matched starting materials."
+            if has_route_details
+            else (
+                "AiZynthFinder summary parsed; reaction tree, starting materials, and stock hits "
+                "were not present in the adapter output."
+            )
+        ),
+        "input_hash": _smiles_input_hash(molecule.smiles),
+        "status": "success" if external_result.success else "failed",
+        "result_kind": (
+            "external_retrosynthesis_route"
+            if has_route_details
+            else "external_retrosynthesis_summary"
+        ),
     }
     return result
 
@@ -1636,9 +1752,7 @@ def _upsert_synthesis_route(
         labels.append("moderate_synthesis")
     else:
         labels.append("hard_to_synthesize")
-    labels.append("route_found" if route_found else "route_not_found")
-    if buyable_blocks:
-        labels.append("buyable_blocks_available")
+    labels.append("surrogate_synthesis_estimate")
     if route_steps > max_synthesis_steps:
         labels.append("too_many_steps")
     if hazardous_reaction_count:
@@ -1650,13 +1764,19 @@ def _upsert_synthesis_route(
         result = SynthesisRoute(molecule_id=molecule.molecule_id)
         db.add(result)
 
-    result.route_found = route_found
-    result.route_steps = route_steps
-    result.route_confidence = route_confidence
-    result.buyable_building_blocks = buyable_blocks
+    result.route_found = False
+    result.route_steps = None
+    result.route_confidence = None
+    result.buyable_building_blocks = None
     result.labels = _dedupe(labels)
     result.route_json = {
         "adapter_mode": "rdkit_surrogate_synthesis",
+        "tool_name": "rdkit",
+        "tool_version": tool_status.get("rdkit", {}).get("version"),
+        "model_name": None,
+        "input_hash": _smiles_input_hash(molecule.smiles),
+        "status": "surrogate_only",
+        "result_kind": "non_retrosynthesis_coarse_estimate",
         "tool_status": {
             key: tool_status[key]
             for key in ["aizynthfinder", "askcos", "rdkit"]
@@ -1664,16 +1784,13 @@ def _upsert_synthesis_route(
         },
         "SA_score": sa_score,
         "SCScore": sc_score,
+        "estimated_route_feasible": route_found,
+        "estimated_route_steps": route_steps,
+        "estimated_route_confidence": route_confidence,
+        "estimated_buyable_building_blocks": buyable_blocks,
         "hazardous_reaction_count": hazardous_reaction_count,
         "protecting_group_count": protecting_group_count,
         "route_summary": _route_summary(route_found, route_steps, buyable_blocks),
-        "route_plan": _route_plan(
-            descriptors=descriptors,
-            route_found=route_found,
-            route_steps=route_steps,
-            buyable_blocks=buyable_blocks,
-        ),
-        "starting_materials": _starting_materials(descriptors, buyable_blocks),
         "route_risks": _route_risks(
             route_found=route_found,
             route_steps=route_steps,
@@ -1925,6 +2042,19 @@ def _synthesis_difficulty_labels(sa_score: float) -> list[str]:
     return ["hard_to_synthesize"]
 
 
+def _external_buyable_block_count(external_result: AiZynthFinderResult) -> int | None:
+    metadata = external_result.route_metadata or {}
+    count = metadata.get("number_of_precursors_in_stock")
+    if count is not None:
+        try:
+            return int(count)
+        except (TypeError, ValueError):
+            pass
+    if external_result.starting_materials:
+        return len(external_result.starting_materials)
+    return None
+
+
 def _external_route_confidence(
     external_result: AiZynthFinderResult,
     route_found: bool,
@@ -1936,10 +2066,13 @@ def _external_route_confidence(
 
 def _route_summary(route_found: bool, route_steps: int, buyable_blocks: int) -> str:
     if route_found:
-        return f"Surrogate route found in {route_steps} steps with {buyable_blocks} buyable blocks."
+        return (
+            "RDKit descriptor heuristic suggests moderate synthetic accessibility "
+            f"(estimated {route_steps} steps; {buyable_blocks} fragment equivalents)."
+        )
     return (
-        f"No confident surrogate route within step budget; estimated {route_steps} steps "
-        f"and {buyable_blocks} buyable blocks."
+        "RDKit descriptor heuristic suggests difficult synthetic accessibility "
+        f"(estimated {route_steps} steps; no reaction route was generated)."
     )
 
 
@@ -1947,84 +2080,6 @@ def _external_route_summary(route_found: bool, route_steps: int) -> str:
     if route_found:
         return f"AiZynthFinder found a retrosynthesis route in {route_steps} steps."
     return "AiZynthFinder completed, but no solved route was found within constraints."
-
-
-def _route_plan(
-    descriptors: DescriptorSnapshot,
-    route_found: bool,
-    route_steps: int,
-    buyable_blocks: int,
-) -> list[dict[str, object]]:
-    plan = [
-        {
-            "step": 1,
-            "stage": "Commercial building-block selection",
-            "input": _starting_materials(descriptors, buyable_blocks),
-            "operation": "Select purchasable aromatic/heteroatom fragments matching the target scaffold.",
-            "output": "Buyable fragment set for analog synthesis.",
-            "rationale": "Keeps the proposed route anchored to available starting materials.",
-        },
-        {
-            "step": 2,
-            "stage": "Core assembly or scaffold elaboration",
-            "input": ["selected core fragment", "linker or cap fragment"],
-            "operation": _core_assembly_operation(descriptors),
-            "output": "Advanced scaffold intermediate.",
-            "rationale": "Approximates the main bond-forming step from ring count and heteroatom pattern.",
-        },
-        {
-            "step": 3,
-            "stage": "Late-stage substituent tuning",
-            "input": ["advanced scaffold intermediate", "R-group fragment"],
-            "operation": "Install polarity, solubility, or binding-pocket substituents.",
-            "output": "Target candidate analog.",
-            "rationale": "Leaves SAR-sensitive substituents late so optimization remains flexible.",
-        },
-    ]
-    if route_steps > 3:
-        plan.append(
-            {
-                "step": 4,
-                "stage": "Purification and salt/form screen",
-                "input": ["target candidate analog"],
-                "operation": "Purify and evaluate salt or form options for developability.",
-                "output": "Screening-ready compound batch.",
-                "rationale": "Additional steps are expected from higher SA/SCScore complexity.",
-            }
-        )
-    if not route_found:
-        plan.append(
-            {
-                "step": len(plan) + 1,
-                "stage": "Route redesign required",
-                "input": ["current candidate"],
-                "operation": "Reduce route length or replace difficult motifs before synthesis nomination.",
-                "output": "Simplified analog proposal.",
-                "rationale": "The surrogate route exceeded the configured confidence or step budget.",
-            }
-        )
-    return plan
-
-
-def _starting_materials(descriptors: DescriptorSnapshot, buyable_blocks: int) -> list[str]:
-    materials = ["commercial aryl/heteroaryl core"]
-    if descriptors.hba + descriptors.hbd > 2:
-        materials.append("polar linker or heteroatom-bearing fragment")
-    if descriptors.ring_count > 1:
-        materials.append("substituted aromatic cap fragment")
-    while len(materials) < buyable_blocks:
-        materials.append(f"diversity fragment {len(materials)}")
-    return materials[:buyable_blocks]
-
-
-def _core_assembly_operation(descriptors: DescriptorSnapshot) -> str:
-    if descriptors.ring_count >= 2 and descriptors.hba >= 2:
-        return "Couple heteroaryl core fragments, then tune hydrogen-bond acceptor placement."
-    if descriptors.ring_count >= 2:
-        return "Build the aromatic core through fragment coupling or cyclization."
-    if descriptors.hba + descriptors.hbd >= 3:
-        return "Assemble the polar linker through amide/urea-like bond formation."
-    return "Elaborate a compact core through one main C-C or C-N bond-forming step."
 
 
 def _route_risks(
@@ -2071,76 +2126,7 @@ def _binding_site_docking_config(
     project: Project,
     binding_site_id: str | None,
 ) -> dict[str, Any]:
-    site = _select_binding_site_for_docking(db, project, binding_site_id)
-    if site is None:
-        return {}
-
-    grid_box = site.grid_box or {}
-    receptor_reference = (
-        site.prepared_receptor_file
-        or site.receptor_file
-        or grid_box.get("prepared_receptor_file")
-        or grid_box.get("receptor_file")
-    )
-    protein_file = resolve_receptor_path(receptor_reference)
-    return {
-        "binding_site_id": site.binding_site_id,
-        "protein_file": protein_file,
-        "grid_center": grid_box.get("center") or grid_box.get("grid_center"),
-        "grid_size": grid_box.get("size") or grid_box.get("grid_size"),
-        "key_residues": site.key_residues or [],
-    }
-
-
-def _select_binding_site_for_docking(
-    db: Session,
-    project: Project,
-    binding_site_id: str | None,
-) -> BindingSite | None:
-    if binding_site_id:
-        site = db.query(BindingSite).filter_by(binding_site_id=binding_site_id).one_or_none()
-        if site is None:
-            return None
-        if site.project_id and site.project_id != project.project_id:
-            return None
-        if not site.project_id and site.target_id != project.target_id:
-            return None
-        return site
-
-    project_sites = (
-        db.query(BindingSite)
-        .filter(BindingSite.project_id == project.project_id)
-        .order_by(BindingSite.updated_at.desc(), BindingSite.id.desc())
-        .all()
-    )
-    project_site = _first_site_with_docking_config(project_sites)
-    if project_site is not None:
-        return project_site
-
-    if not project.target_id:
-        return None
-    target_sites = (
-        db.query(BindingSite)
-        .filter(BindingSite.project_id.is_(None), BindingSite.target_id == project.target_id)
-        .order_by(BindingSite.id.asc())
-        .all()
-    )
-    return _first_site_with_docking_config(target_sites)
-
-
-def _first_site_with_docking_config(sites: list[BindingSite]) -> BindingSite | None:
-    fallback: BindingSite | None = None
-    for site in sites:
-        if fallback is None:
-            fallback = site
-        grid_box = site.grid_box or {}
-        has_receptor = bool(site.prepared_receptor_file or site.receptor_file)
-        has_grid = bool(grid_box.get("center") or grid_box.get("grid_center")) and bool(
-            grid_box.get("size") or grid_box.get("grid_size")
-        )
-        if has_receptor and has_grid:
-            return site
-    return fallback
+    return project_docking_config(db, project, binding_site_id)
 
 
 def _attempt_external_docking(
@@ -2164,6 +2150,14 @@ def _attempt_external_docking(
             labels=["external_docking_adapter_failed"],
             warnings=["prepared_ligand_file_not_found"],
         )
+    preparation_warnings: list[str] = []
+    if _should_prepare_vina_inputs(tool_status, protein_file, ligand_file):
+        protein_file, ligand_file, preparation_warnings = _prepare_vina_docking_inputs(
+            project,
+            molecule,
+            receptor_file=protein_file,
+            ligand_file=ligand_file,
+        )
     if not ligand_file:
         ligand_file = _write_ligand_sdf(project, molecule)
     if ligand_file is None:
@@ -2172,7 +2166,7 @@ def _attempt_external_docking(
             tool_name="external_docking",
             success=False,
             labels=["external_docking_adapter_failed"],
-            warnings=["ligand_sdf_generation_failed"],
+            warnings=_dedupe(preparation_warnings + ["ligand_sdf_generation_failed"]),
         )
     request = DockingToolRequest(
         receptor_file=protein_file,
@@ -2180,6 +2174,7 @@ def _attempt_external_docking(
         output_dir=str(ASSESSMENT_RUNTIME_ROOT / _safe_path_part(project.project_id) / "poses"),
         grid_center=grid_center,
         grid_size=grid_size,
+        timeout_seconds=_docking_timeout_seconds(),
         molecule_id=molecule.molecule_id,
     )
     external_result = run_external_docking(request, tool_status)
@@ -2187,15 +2182,230 @@ def _attempt_external_docking(
         selected_tool = select_docking_tool(request, tool_status)
         warning = "external_docking_adapter_unavailable_for_inputs"
         if selected_tool is None and tool_status.get("vina", {}).get("available"):
-            warning = "vina_requires_prepared_pdbqt_inputs"
+            warning = (
+                "vina_inputs_preparation_failed"
+                if preparation_warnings
+                else "vina_requires_prepared_pdbqt_inputs"
+            )
         return DockingToolResult(
             adapter_mode="external_docking_unavailable",
             tool_name="external_docking",
             success=False,
             labels=["external_docking_adapter_failed"],
-            warnings=[warning],
+            warnings=_dedupe(preparation_warnings + [warning]),
         )
     return external_result
+
+
+def _should_prepare_vina_inputs(
+    tool_status: dict[str, Any],
+    receptor_file: str,
+    ligand_file: str | None,
+) -> bool:
+    if not tool_status.get("vina", {}).get("available"):
+        return False
+    if tool_status.get("gnina", {}).get("available"):
+        return False
+    receptor_ready = is_valid_vina_receptor_pdbqt(Path(receptor_file))
+    ligand_ready = bool(ligand_file) and is_valid_vina_ligand_pdbqt(Path(ligand_file))
+    return not (receptor_ready and ligand_ready)
+
+
+def _prepare_vina_docking_inputs(
+    project: Project,
+    molecule: Molecule,
+    receptor_file: str,
+    ligand_file: str | None,
+) -> tuple[str, str | None, list[str]]:
+    warnings: list[str] = []
+    prepared_receptor_file = receptor_file
+    prepared_ligand_file = ligand_file
+
+    receptor_path = Path(receptor_file)
+    receptor_dir = ASSESSMENT_RUNTIME_ROOT / _safe_path_part(project.project_id) / "receptors"
+    if not is_valid_vina_receptor_pdbqt(receptor_path):
+        existing_receptor = _existing_vina_receptor_file(receptor_path, receptor_dir)
+        if existing_receptor is not None:
+            prepared_receptor_file = str(existing_receptor)
+        else:
+            receptor_pdbqt, receptor_warnings = _prepare_vina_receptor_file(
+                receptor_path,
+                receptor_dir,
+            )
+            if receptor_pdbqt is not None:
+                prepared_receptor_file = receptor_pdbqt
+            else:
+                warnings.extend(receptor_warnings)
+
+    if not prepared_ligand_file or not is_valid_vina_ligand_pdbqt(Path(prepared_ligand_file)):
+        ligand_dir = ASSESSMENT_RUNTIME_ROOT / _safe_path_part(project.project_id) / "ligands"
+        existing_ligand = _existing_vina_ligand_file(molecule, ligand_dir)
+        if existing_ligand is not None:
+            prepared_ligand_file = str(existing_ligand)
+        else:
+            try:
+                ligand_result = prepare_ligand_from_smiles(
+                    molecule.smiles,
+                    ligand_dir,
+                    _safe_path_part(molecule.molecule_id),
+                    target_format="pdbqt",
+                    add_hydrogens=True,
+                    generate_3d=True,
+                    num_conformers=1,
+                )
+                if _is_successful_pdbqt_result(ligand_result.ligand_file, ligand_result.format):
+                    prepared_ligand_file = str(ligand_result.ligand_file)
+                else:
+                    warnings.extend(
+                        _vina_preparation_warnings(
+                            "vina_ligand_pdbqt_preparation_failed",
+                            ligand_result.warnings,
+                        )
+                    )
+            except Exception as exc:
+                warnings.extend(
+                    _vina_preparation_warnings(
+                        "vina_ligand_pdbqt_preparation_failed",
+                        [type(exc).__name__],
+                    )
+                )
+
+    if not (
+        _is_valid_vina_receptor_path(prepared_receptor_file)
+        and _is_existing_pdbqt_path(prepared_ligand_file)
+    ):
+        return receptor_file, ligand_file, _dedupe(warnings)
+    return prepared_receptor_file, prepared_ligand_file, _dedupe(warnings)
+
+
+def _existing_vina_receptor_file(receptor_path: Path, output_dir: Path) -> Path | None:
+    candidates = [
+        receptor_path,
+        output_dir / f"{_safe_path_part(receptor_path.stem)}.pdbqt",
+        output_dir / f"{receptor_path.stem}_prepared.pdbqt",
+        output_dir / f"{receptor_path.stem}_temp.pdbqt",
+        output_dir / f"{receptor_path.stem}.pdbqt",
+    ]
+    return _first_existing_pdbqt_file(candidates, validator=is_valid_vina_receptor_pdbqt)
+
+
+def _prepare_vina_receptor_file(receptor_path: Path, output_dir: Path) -> tuple[str | None, list[str]]:
+    obabel = shutil.which("obabel")
+    if obabel is None:
+        return None, _vina_preparation_warnings(
+            "vina_receptor_pdbqt_preparation_failed",
+            ["obabel_not_available"],
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_format = receptor_path.suffix.lstrip(".") or "pdb"
+    output_path = output_dir / f"{_safe_path_part(receptor_path.stem)}.pdbqt"
+    temp_handle = tempfile.NamedTemporaryFile(
+        prefix=f".{_safe_path_part(receptor_path.stem)}.",
+        suffix=".pdbqt",
+        dir=output_dir,
+        delete=False,
+    )
+    temp_path = Path(temp_handle.name)
+    temp_handle.close()
+    temp_path.unlink(missing_ok=True)
+    command = [
+        obabel,
+        f"-i{input_format}",
+        str(receptor_path),
+        "-opdbqt",
+        "-O",
+        str(temp_path),
+        "-xr",
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        temp_path.unlink(missing_ok=True)
+        return None, _vina_preparation_warnings(
+            "vina_receptor_pdbqt_preparation_failed",
+            ["obabel_timeout"],
+        )
+    except OSError as exc:
+        temp_path.unlink(missing_ok=True)
+        return None, _vina_preparation_warnings(
+            "vina_receptor_pdbqt_preparation_failed",
+            [type(exc).__name__],
+        )
+
+    try:
+        if completed.returncode != 0:
+            return None, _vina_preparation_warnings(
+                "vina_receptor_pdbqt_preparation_failed",
+                [f"obabel_exit_code_{completed.returncode}"],
+            )
+        if not is_valid_vina_receptor_pdbqt(temp_path):
+            return None, _vina_preparation_warnings(
+                "vina_receptor_pdbqt_preparation_failed",
+                ["invalid_rigid_receptor_pdbqt"],
+            )
+        temp_path.replace(output_path)
+        return str(output_path), []
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _existing_vina_ligand_file(molecule: Molecule, output_dir: Path) -> Path | None:
+    safe_molecule_id = _safe_path_part(molecule.molecule_id)
+    candidates = [
+        output_dir / f"{safe_molecule_id}_ligand.pdbqt",
+        output_dir / f"{safe_molecule_id}.pdbqt",
+    ]
+    return _first_existing_pdbqt_file(candidates, validator=is_valid_vina_ligand_pdbqt)
+
+
+def _first_existing_pdbqt_file(
+    candidates: list[Path],
+    validator=None,
+) -> Path | None:
+    for candidate in candidates:
+        if candidate.suffix.lower() != ".pdbqt" or not candidate.exists():
+            continue
+        if validator is None or validator(candidate):
+            return candidate
+    return None
+
+
+def _is_successful_pdbqt_result(file_path: str | None, file_format: str | None) -> bool:
+    if file_format != "pdbqt" or not file_path:
+        return False
+    return is_valid_vina_ligand_pdbqt(Path(file_path))
+
+
+def _is_existing_pdbqt_path(file_path: str | None) -> bool:
+    if not file_path:
+        return False
+    return is_valid_vina_ligand_pdbqt(Path(file_path))
+
+
+def _is_valid_vina_receptor_path(file_path: str | None) -> bool:
+    return bool(file_path) and is_valid_vina_receptor_pdbqt(Path(file_path))
+
+
+def _docking_timeout_seconds() -> int:
+    raw_value = os.environ.get("MEDAGENT_DOCKING_TIMEOUT_SECONDS", "900")
+    try:
+        return max(30, int(raw_value))
+    except ValueError:
+        return 900
+
+
+def _vina_preparation_warnings(prefix: str, details: list[str] | None) -> list[str]:
+    warnings = [prefix]
+    warnings.extend(f"{prefix}:{detail}" for detail in details or [] if detail)
+    return warnings
 
 
 def _external_docking_setup_warnings(
@@ -2215,12 +2425,6 @@ def _external_docking_setup_warnings(
         warnings.append("protein_file_not_found")
     if not _is_vector3(grid_center) or not _is_vector3(grid_size):
         warnings.append("grid_center_and_grid_size_required_for_external_docking")
-    if (
-        tool_status.get("vina", {}).get("available")
-        and not tool_status.get("gnina", {}).get("available")
-        and not prepared_ligand_files
-    ):
-        warnings.append("vina_requires_prepared_pdbqt_inputs")
     return warnings
 
 
@@ -2280,6 +2484,10 @@ def _is_vector3(values: list[float] | None) -> bool:
 def _safe_path_part(value: str) -> str:
     safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
     return safe.strip("._") or "item"
+
+
+def _smiles_input_hash(smiles: str) -> str:
+    return hashlib.sha256(smiles.encode("utf-8")).hexdigest()
 
 
 def _external_docking_available(tool_status: dict[str, Any]) -> bool:

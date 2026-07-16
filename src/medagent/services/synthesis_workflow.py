@@ -212,14 +212,45 @@ def check_building_block_availability(smiles: str) -> BuildingBlockCheck:
     """
     检查分子是否为可购买砌块
 
-    实际应用中应连接到：
-    - ZINC数据库
-    - eMolecules
-    - Mcule
-    - 其他商业化合物库
-
-    这里提供简化版本：基于分子大小和复杂度判断
+    优先查询ZINC20 API，失败时回退到启发式判断
     """
+    # 首先尝试ZINC20 API
+    result = _check_zinc20(smiles)
+    if result is not None:
+        return result
+
+    # 回退到启发式判断
+    return _heuristic_building_block_check(smiles)
+
+
+def _check_zinc20(smiles: str) -> BuildingBlockCheck | None:
+    """查询ZINC20数据库"""
+    try:
+        import httpx
+
+        resp = httpx.get(
+            "https://zinc20.docking.org/substances/search/",
+            params={"q": smiles, "count": 1},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("count", 0) > 0:
+                return BuildingBlockCheck(
+                    smiles=smiles,
+                    is_available=True,
+                    vendor="ZINC20",
+                    catalog_id=None,
+                    price_range="< $100/g",
+                )
+    except Exception as e:
+        print(f"ZINC20 查询失败: {e}")
+
+    return None
+
+
+def _heuristic_building_block_check(smiles: str) -> BuildingBlockCheck:
+    """基于启发式规则的可购买性判断（回退方案）"""
     try:
         from rdkit import Chem
         from rdkit.Chem import Descriptors, Lipinski

@@ -1,0 +1,9 @@
+run_id,molecule_id,mode,tool_name,adapter_mode,success,vina_score,cnn_score,pose_file,runtime_seconds,route_found,route_steps,notes
+A-001,MOL-D87CC67DED,single_docking,,,,,,,,,,,
+A-002,MOL-450DC51730,single_docking,,,,,,,,,,,
+A-003,MOL-62E15AFF71,single_docking,,,,,,,,,,,
+A-004,MOL-72DA7467ED,single_docking,,,,,,,,,,,
+A-005,MOL-AB0A4C6BC4,single_docking,,,,,,,,,,,
+A-FAST,,candidate_assessment_fast,,,,,,,,,,,
+A-EXT,,candidate_assessment_external_top5,,,,,,,,,,,
+

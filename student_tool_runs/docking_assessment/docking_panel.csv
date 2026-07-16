@@ -1,0 +1,7 @@
+panel_id,molecule_id,smiles,role,ligand_file,baseline_pose_file,baseline_vina_score,baseline_cnn_score,baseline_key_hbond_count,baseline_route_found,note
+BRAF-A-001,MOL-D87CC67DED,O=C(NCCO)c1ccccc1,current_top1,student_tool_runs/data/ligands/MOL-D87CC67DED.sdf,student_tool_runs/data/poses/MOL-D87CC67DED_gnina_pose.sdf,-3.41,,4,1,当前项目Top1
+BRAF-A-002,MOL-450DC51730,CCCS(=O)(=O)Nc1ccc(F)c(C(=O)c2c[nH]c3ncc(SCC(=O)O)cc23)c1F,current_top2,student_tool_runs/data/ligands/MOL-450DC51730.sdf,student_tool_runs/data/poses/MOL-450DC51730_gnina_pose.sdf,-3.52,,5,1,当前项目Top2
+BRAF-A-003,MOL-62E15AFF71,CC(C)NC(=O)c1ccccc1,small_benzamide_control,student_tool_runs/data/ligands/MOL-62E15AFF71.sdf,student_tool_runs/data/poses/MOL-62E15AFF71_gnina_pose.sdf,-1.75,0.10,2,1,苯甲酰胺小分子对照
+BRAF-A-004,MOL-72DA7467ED,CC(C)(C)c1nc(NC(=O)CCNS(=O)(=O)c2c(F)cccc2F)c(-c2ccnc(N)n2)s1,large_polar_control,student_tool_runs/data/ligands/MOL-72DA7467ED.sdf,student_tool_runs/data/poses/MOL-72DA7467ED_gnina_pose.sdf,-4.47,,5,0,较大且极性压力高的候选
+BRAF-A-005,MOL-AB0A4C6BC4,CCOC(=O)Nc1ccccc1,pose_failure_control,student_tool_runs/data/ligands/MOL-AB0A4C6BC4.sdf,student_tool_runs/data/poses/MOL-AB0A4C6BC4_gnina_pose.sdf,6.68,0.28,3,1,对接分数异常偏差的反例
+

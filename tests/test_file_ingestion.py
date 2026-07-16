@@ -83,10 +83,35 @@ def test_upload_csv_file_preserves_activity_values(tmp_path):
 
         assert ingest_response.status_code == 202
         ligands = client.get(f"/projects/{project_id}/seed-ligands").json()
-        assert [(item["name"], item["activity_value"], item["activity_unit"]) for item in ligands] == [
-            ("ligand_a", 12.5, "nM"),
-            ("ligand_b", 0.8, "uM"),
+        assert [
+            (
+                item["name"],
+                item["activity_value"],
+                item["activity_unit"],
+                item["activity_type"],
+            )
+            for item in ligands
+        ] == [
+            ("ligand_a", 12.5, "nM", None),
+            ("ligand_b", 0.8, "uM", None),
         ]
+
+
+def test_upload_csv_file_preserves_activity_endpoint_type(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = create_project(client)
+        csv_payload = "name,smiles,IC50,unit\nligand_a,CCN,12.5,nM\n"
+        upload_response = client.post(
+            f"/projects/{project_id}/files",
+            files={"file": ("ligands.csv", csv_payload, "text/csv")},
+        )
+
+        assert upload_response.status_code == 202
+        assert client.post(f"/projects/{project_id}/ingest").status_code == 202
+        ligand = client.get(f"/projects/{project_id}/seed-ligands").json()[0]
+        assert ligand["activity_value"] == 12.5
+        assert ligand["activity_unit"] == "nM"
+        assert ligand["activity_type"] == "IC50"
 
 
 def test_upload_pdb_file_records_structure_summary(tmp_path):

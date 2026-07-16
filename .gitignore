@@ -21,3 +21,5 @@ database/*
 *.pid
 *.zip
 coverage/
+test-results/
+playwright-report/

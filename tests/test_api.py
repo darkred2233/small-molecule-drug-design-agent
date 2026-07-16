@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -19,6 +20,7 @@ from medagent.db.models import (
     Molecule,
     MoleculeProperty,
     OptimizationConstraint,
+    Project,
     RagChunk,
     RagDocument,
     Ranking,
@@ -32,7 +34,13 @@ from medagent.db.models import (
 
 
 def make_client(tmp_path):
-    app = create_app(Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}"))
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'test.db'}",
+            dashscope_api_key=None,
+            self_refutation_use_llm=False,
+        )
+    )
     return TestClient(app)
 
 
@@ -134,6 +142,157 @@ def test_project_router_uses_current_project_schema(tmp_path):
         detail_response = client.get(f"/projects/{project_id}")
         assert detail_response.status_code == 200
         assert detail_response.json()["objective"] == "verify project router schema"
+
+
+def test_database_rule_filter_evidence_link_resolves_without_rag_chunk(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "DB evidence"}).json()["project_id"]
+        molecule_id = "MOL-DB-EVIDENCE"
+
+        with api_app.SessionLocal() as db:
+            db.add(
+                Molecule(
+                    molecule_id=molecule_id,
+                    project_id=project_id,
+                    smiles="CCO",
+                    status="passed_filter",
+                )
+            )
+            db.add(
+                RuleFilterResult(
+                    filter_result_id="FILTER-DB-EVIDENCE",
+                    project_id=project_id,
+                    molecule_id=molecule_id,
+                    rule_set="target_aware_drug_likeness_v2",
+                    decision="passed",
+                    failed_rules=[],
+                    warnings=[],
+                    labels=["rule_filter_evaluated", "rule_filter_passed"],
+                    properties_snapshot={"mw": 46.07, "logp": -0.001},
+                    raw_output={"drug_likeness_violation_count": 0},
+                )
+            )
+            db.commit()
+
+        response = client.get(f"/projects/{project_id}/evidence-links/DB:RULE_FILTER:{molecule_id}")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["evidence_id"] == f"DB:RULE_FILTER:{molecule_id}"
+        assert body["molecule_id"] == molecule_id
+        assert body["chunk_id"] is None
+        assert body["claim_type"] == "database_rule_filter"
+        assert body["confidence"] is None
+        assert "rule_filter_results" in body["rationale"]
+        assert "target_aware_drug_likeness_v2" in body["rationale"]
+
+
+def test_database_synthesis_evidence_link_resolves_without_rag_chunk(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Synthesis evidence"}).json()[
+            "project_id"
+        ]
+        molecule_id = "MOL-00A50B1CFC"
+
+        with api_app.SessionLocal() as db:
+            db.add(
+                Molecule(
+                    molecule_id=molecule_id,
+                    project_id=project_id,
+                    smiles="CCO",
+                    status="candidate_assessed",
+                )
+            )
+            db.add(
+                SynthesisRoute(
+                    molecule_id=molecule_id,
+                    route_found=True,
+                    route_steps=3,
+                    route_confidence=0.987,
+                    buyable_building_blocks=6,
+                    labels=["route_found", "aizynthfinder_route"],
+                    route_json={"route_summary": "AiZynthFinder found a route in 3 steps."},
+                )
+            )
+            db.commit()
+
+        response = client.get(
+            f"/projects/{project_id}/evidence-links/DB:SYNTHESIS:{molecule_id}"
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["evidence_id"] == f"DB:SYNTHESIS:{molecule_id}"
+        assert body["molecule_id"] == molecule_id
+        assert body["chunk_id"] is None
+        assert body["claim_type"] == "database_synthesis"
+        assert body["confidence"] == 0.987
+        assert "synthesis_routes" in body["rationale"]
+        assert "AiZynthFinder found a route in 3 steps." in body["rationale"]
+
+
+def test_database_docking_evidence_link_includes_pose_coordinates(tmp_path):
+    pose_file = tmp_path / "docking_pose.sdf"
+    pose_file.write_text(
+        """docking_pose
+  MedAgent
+
+  1  0  0  0  0  0            999 V2000
+   27.3872   45.5746   -5.7012 O   0  0  0  0  0  0  0  0  0  0  0  0
+M  END
+$$$$
+""",
+        encoding="utf-8",
+    )
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Docking evidence"}).json()[
+            "project_id"
+        ]
+        molecule_id = "MOL-DOCKING-EVIDENCE"
+
+        with api_app.SessionLocal() as db:
+            db.add(
+                Molecule(
+                    molecule_id=molecule_id,
+                    project_id=project_id,
+                    smiles="CCO",
+                    status="candidate_assessed",
+                )
+            )
+            db.add(
+                DockingResult(
+                    molecule_id=molecule_id,
+                    tool_run_id="gnina_docker_docking",
+                    vina_score=-3.33,
+                    cnn_score=0.795,
+                    pose_file=str(pose_file),
+                    labels=["external_docking_adapter_used", "gnina_adapter"],
+                    raw_output={
+                        "selected_pose_rank": 1,
+                        "pose_count": 9,
+                        "pose_selection_method": "gnina_output_mode_1",
+                        "best_pose_confirmed": True,
+                    },
+                )
+            )
+            db.commit()
+
+        response = client.get(f"/projects/{project_id}/evidence-links/DB:DOCKING:{molecule_id}")
+
+        assert response.status_code == 200
+        body = response.json()
+        payload = json.loads(body["rationale"])
+        assert body["claim_type"] == "database_docking"
+        assert payload["pose_artifact_available"] is True
+        assert payload["selected_pose_rank"] == 1
+        assert payload["pose_count"] == 9
+        assert payload["pose_coordinates"]["atoms"][0] == {
+            "index": 1,
+            "element": "O",
+            "x": 27.3872,
+            "y": 45.5746,
+            "z": -5.7012,
+        }
 
 
 def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, monkeypatch):
@@ -327,6 +486,181 @@ def test_pipeline_dry_run_registers_agent_steps(tmp_path):
         assert any(run["agent_name"] == "self_refutation_agent" for run in body["agent_runs"])
 
 
+def test_create_round_accepts_generation_config_for_repeated_rounds(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Repeated rounds"}).json()["project_id"]
+        generation_config = {
+            "strategy_counts": {"reinvent4": 2, "crem": 3, "autogrow4": 0},
+            "top_n": 4,
+            "max_assessment_molecules": 8,
+            "assessment_mode": "fast",
+            "external_top_n": 4,
+        }
+
+        first_response = client.post(
+            f"/projects/{project_id}/rounds",
+            json={"generation_config": generation_config},
+        )
+        second_response = client.post(
+            f"/projects/{project_id}/rounds",
+            json={"generation_config": generation_config},
+        )
+
+        assert first_response.status_code == 202
+        assert second_response.status_code == 202
+        generator_runs = [
+            run
+            for run in second_response.json()["agent_runs"]
+            if run["agent_name"] == "generator_agent"
+        ]
+        assert generator_runs[-1]["output_json"]["generation_config"] == generation_config
+
+        with api_app.SessionLocal() as db:
+            project = db.query(Project).filter_by(project_id=project_id).one()
+            assert project.constraints_json["pipeline_config"] == generation_config
+
+
+def test_report_top_candidates_include_generation_method(tmp_path):
+    pose_file = tmp_path / "best_pose.sdf"
+    pose_sdf = """best_pose
+  MedAgent
+
+  2  1  0  0  0  0            999 V2000
+   27.3872   45.5746   -5.7012 O   0  0  0  0  0  0  0  0  0  0  0  0
+   26.7749   46.3037   -4.9285 C   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+M  END
+$$$$
+"""
+    pose_file.write_text(pose_sdf, encoding="utf-8")
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Report provenance"}).json()["project_id"]
+
+        with api_app.SessionLocal() as db:
+            db.add(
+                Molecule(
+                    molecule_id="MOL-REPORT-PROVENANCE",
+                    project_id=project_id,
+                    smiles="CCO",
+                    source_agent="generator_agent:crem",
+                    status="candidate_assessed",
+                    labels=["generated", "generator_strategy_crem"],
+                )
+            )
+            db.add(
+                Ranking(
+                    project_id=project_id,
+                    molecule_id="MOL-REPORT-PROVENANCE",
+                    rank=1,
+                    pro_score=80,
+                    con_score=10,
+                    evidence_confidence=0.8,
+                    overall_score=75,
+                    final_decision="recommend",
+                    score_breakdown={},
+                )
+            )
+            db.add(
+                DockingResult(
+                    molecule_id="MOL-REPORT-PROVENANCE",
+                    tool_run_id="diffdock_docker_docking",
+                    diffdock_confidence=1.25,
+                    pose_file=str(pose_file),
+                    labels=["external_docking_adapter_used", "diffdock_adapter"],
+                    raw_output={
+                        "tool_name": "diffdock",
+                        "selected_pose_rank": 1,
+                        "pose_count": 10,
+                        "pose_selection_method": "diffdock_rank_1_by_confidence",
+                    },
+                )
+            )
+            db.add(
+                RagDocument(
+                    document_id="DOC-REPORT-EVIDENCE",
+                    project_id=project_id,
+                    title="EGFR uploaded evidence",
+                    source="FILE-REPORT-EVIDENCE",
+                    document_type="paper_or_patent_pdf",
+                    metadata_json={"filename": "egfr_evidence.pdf"},
+                )
+            )
+            db.add(
+                RagChunk(
+                    chunk_id="CHK-REPORT-EVIDENCE",
+                    document_id="DOC-REPORT-EVIDENCE",
+                    page_number=7,
+                    section="Results",
+                    content="The compound showed an EGFR-relevant computational signal.",
+                    embedding_model="local-hash-embedding",
+                    embedding_ref="local-hash-embedding:test",
+                    embedding_json=[],
+                    token_count=8,
+                    metadata_json={"chunk_index": 1},
+                )
+            )
+            db.add(
+                EvidenceLink(
+                    evidence_id="EVD-REPORT-EVIDENCE",
+                    molecule_id="MOL-REPORT-PROVENANCE",
+                    chunk_id="CHK-REPORT-EVIDENCE",
+                    claim_type="candidate_support",
+                    confidence=None,
+                    rationale="Computational support only.",
+                )
+            )
+            db.commit()
+
+        response = client.get(f"/projects/{project_id}/report")
+
+        assert response.status_code == 200
+        candidate = response.json()["top_candidates"][0]
+        assert candidate["generation_source_agent"] == "generator_agent:crem"
+        assert candidate["generation_method"] == "crem"
+        assert candidate["pro_score"] == 80
+        assert candidate["con_score"] == 10
+        assert candidate["evidence_confidence"] == 0.8
+        assert candidate["ranking_score_semantics"] == "heuristic_not_probability"
+        assert candidate["evidence_confidence_semantics"] == "heuristic_completeness_not_probability"
+        assert candidate["docking"]["selected_pose_rank"] == 1
+        assert candidate["docking"]["pose_count"] == 10
+        assert candidate["docking"]["pose_selection_method"] == "diffdock_rank_1_by_confidence"
+        assert candidate["docking"]["best_pose_confirmed"] is True
+        assert candidate["docking"]["pose_artifact_available"] is True
+        assert candidate["docking"]["pose_file"] == str(pose_file)
+        pose_coordinates = candidate["docking"]["pose_coordinates"]
+        assert pose_coordinates["format"] == "sdf"
+        assert pose_coordinates["atom_count"] == 2
+        assert pose_coordinates["truncated"] is False
+        assert pose_coordinates["atoms"][0] == {
+            "index": 1,
+            "element": "O",
+            "x": 27.3872,
+            "y": 45.5746,
+            "z": -5.7012,
+        }
+        evidence = candidate["evidence_chain"][0]
+        assert evidence["evidence_id"] == "EVD-REPORT-EVIDENCE"
+        assert evidence["chunk_id"] == "CHK-REPORT-EVIDENCE"
+        assert evidence["document_id"] == "DOC-REPORT-EVIDENCE"
+        assert evidence["document_title"] == "EGFR uploaded evidence"
+        assert evidence["filename"] == "egfr_evidence.pdf"
+        assert evidence["page_number"] == 7
+        assert evidence["section"] == "Results"
+        assert evidence["content"] == "The compound showed an EGFR-relevant computational signal."
+        assert evidence["evidence_confidence"] is None
+        assert evidence["evidence_confidence_semantics"] == "not_calibrated"
+
+        pose_response = client.get(
+            f"/projects/{project_id}/molecules/MOL-REPORT-PROVENANCE/docking/pose"
+        )
+        assert pose_response.status_code == 200
+        assert pose_response.content.replace(b"\r\n", b"\n") == pose_sdf.encode()
+        assert "MOL-REPORT-PROVENANCE_best_pose.sdf" in pose_response.headers[
+            "content-disposition"
+        ]
+
+
 def test_pipeline_full_runs_end_to_end(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post(
@@ -364,6 +698,8 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         assert body["status"] == "pipeline_completed"
         agent_names = [run["agent_name"] for run in body["agent_runs"]]
         assert "knowledge_ingestion_agent" in agent_names
+        assert "target_agent" in agent_names
+        assert "sar_agent" in agent_names
         assert "filter_agent" in agent_names
         assert "candidate_assessment_agent" in agent_names
         assert "ranker_agent" in agent_names
@@ -374,6 +710,8 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         pipeline_run_names = {
             "knowledge_ingestion_agent",
             "molecule_import_agent",
+            "target_agent",
+            "sar_agent",
             "generator_agent",
             "validation_agent",
             "filter_agent",
@@ -387,8 +725,21 @@ def test_pipeline_full_runs_end_to_end(tmp_path):
         pipeline_runs = [
             run for run in body["agent_runs"] if run["agent_name"] in pipeline_run_names
         ]
-        assert len(pipeline_runs) == 11
+        assert len(pipeline_runs) == 13
         assert all(run["status"] == "completed" for run in pipeline_runs)
+        self_refutation_run = next(
+            run for run in pipeline_runs if run["agent_name"] == "self_refutation_agent"
+        )
+        assert self_refutation_run["model_name"] == "heuristic_self_refutation"
+
+        with api_app.SessionLocal() as db:
+            critiques = db.query(Critique).all()
+            assert critiques
+            assert all(
+                critique.analysis_method == "heuristic_self_refutation"
+                for critique in critiques
+            )
+            assert all(critique.llm_provider is None for critique in critiques)
 
         molecules = client.get(f"/projects/{project_id}/molecules").json()
         assert len(molecules) >= 2

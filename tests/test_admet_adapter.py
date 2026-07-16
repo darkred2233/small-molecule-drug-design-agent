@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+from medagent.services import admet_adapter
 from medagent.services.admet_adapter import (
     ChempropADMETRequest,
     SingleADMETResult,
@@ -101,6 +102,8 @@ class TestChempropAvailability:
                 "version": "2.0.1",
                 "models_dir": "models",
                 "model_count": 10,
+                "gpu_available": True,
+                "device": "cuda",
             },
         )
         monkeypatch.setattr(
@@ -115,8 +118,11 @@ class TestChempropAvailability:
         assert status["version"] == "2.0.1"
         assert status["models_dir"] == "models"
         assert status["model_count"] == 10
+        assert status["gpu_available"] is True
+        assert status["device"] == "cuda"
 
-    def test_detects_cli_when_version_probe_fails(self, monkeypatch):
+    def test_cli_without_checkpoint_is_not_available_for_prediction(self, monkeypatch):
+        monkeypatch.delenv("CHEMPROP_CHECKPOINT_DIR", raising=False)
         monkeypatch.setattr(
             "medagent.services.admet_adapter._check_admet_ai_available",
             lambda: None,
@@ -138,10 +144,32 @@ class TestChempropAvailability:
 
         status = check_chemprop_available()
 
-        assert status["available"] is True
+        assert status["available"] is False
+        assert status["runtime_available"] is True
+        assert status["model_configured"] is False
         assert status["mode"] == "local_cli"
         assert status["path"] == "chemprop"
-        assert status["warning"] == "chemprop_cli_version_unavailable"
+        assert status["warning"] == "chemprop_checkpoint_not_configured"
+
+    def test_cli_with_checkpoint_is_available_for_prediction(self, tmp_path, monkeypatch):
+        checkpoint_dir = tmp_path / "models"
+        checkpoint_dir.mkdir()
+        monkeypatch.setenv("CHEMPROP_CHECKPOINT_DIR", str(checkpoint_dir))
+        monkeypatch.setattr(
+            "medagent.services.admet_adapter._check_admet_ai_available",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "medagent.services.admet_adapter._check_chemprop_cli",
+            lambda: {"version": "2.2.4", "path": "chemprop"},
+        )
+
+        status = check_chemprop_available()
+
+        assert status["available"] is True
+        assert status["runtime_available"] is True
+        assert status["model_configured"] is True
+        assert status["models_dir"] == str(checkpoint_dir.resolve())
 
 
 class TestRunChempropADMET:
@@ -169,6 +197,27 @@ class TestRunChempropADMET:
         assert result.success is False
         assert result.adapter_mode == "chemprop_model_not_configured"
         assert "chemprop_checkpoint_not_configured" in result.warnings
+
+    def test_docker_command_uses_image_entrypoint_and_mounts_checkpoint(self, tmp_path):
+        data_dir = tmp_path / "data"
+        checkpoint_dir = tmp_path / "models"
+        data_dir.mkdir()
+        checkpoint_dir.mkdir()
+
+        command = admet_adapter._build_chemprop_docker_command(
+            docker_image="chemprop:latest",
+            container_name="chemprop_test",
+            data_dir=data_dir,
+            checkpoint_dir=checkpoint_dir,
+            use_gpu=True,
+        )
+
+        image_index = command.index("chemprop:latest")
+        assert command[image_index + 1] == "predict"
+        assert command.count("chemprop") == 0
+        assert f"{checkpoint_dir.resolve()}:/models:ro" in command
+        assert command[command.index("--checkpoint-dir") + 1] == "/models"
+        assert command[command.index("--gpus") + 1] == "all"
 
 
 class TestParseChempropOutput:
@@ -279,6 +328,49 @@ class TestParseAdmetAiPredictions:
         assert results[0].DILI_probability == 0.0
         assert results[0].permeability_score == 0.0
         assert results[0].admet_risk_score == 0.0
+
+    def test_uses_prediction_index_after_admet_ai_filters_invalid_smiles(self):
+        class IndexedPredictions:
+            index = ["CCO", "CCN"]
+
+            def to_dict(self, orient):
+                assert orient == "records"
+                return [
+                    {"hERG": 0.11, "AMES": 0.12, "DILI": 0.13},
+                    {"hERG": 0.21, "AMES": 0.22, "DILI": 0.23},
+                ]
+
+        results = _parse_admet_ai_predictions(
+            IndexedPredictions(),
+            molecule_ids=["BAD-FIRST", "ETOH", "BAD-MIDDLE", "ETHYLAMINE"],
+            smiles_list=["not-a-smiles", "CCO", "also-invalid", "CCN"],
+        )
+
+        assert [(item.molecule_id, item.smiles) for item in results] == [
+            ("ETOH", "CCO"),
+            ("ETHYLAMINE", "CCN"),
+        ]
+        assert [item.hERG_probability for item in results] == [0.11, 0.21]
+
+    def test_maps_duplicate_smiles_to_input_occurrences_in_order(self):
+        class IndexedPredictions:
+            index = ["CCO", "CCO"]
+
+            def to_dict(self, orient):
+                assert orient == "records"
+                return [
+                    {"hERG": 0.31, "AMES": 0.32, "DILI": 0.33},
+                    {"hERG": 0.41, "AMES": 0.42, "DILI": 0.43},
+                ]
+
+        results = _parse_admet_ai_predictions(
+            IndexedPredictions(),
+            molecule_ids=["ETOH-1", "ETOH-2"],
+            smiles_list=["CCO", "CCO"],
+        )
+
+        assert [item.molecule_id for item in results] == ["ETOH-1", "ETOH-2"]
+        assert [item.hERG_probability for item in results] == [0.31, 0.41]
 
 
 class TestChempropADMETOutput:

@@ -21,6 +21,8 @@ def seed_builtin_targets(db: Session) -> None:
                 summary=target_payload["summary"],
             )
             db.add(target)
+            # Production sessions disable autoflush; persist the parent before FK children.
+            db.flush()
         else:
             target.name = target_payload["name"]
             target.aliases = target_payload["aliases"]
@@ -84,6 +86,7 @@ def seed_project_target_ligands(db: Session, project: Project) -> dict:
             smiles=smiles,
             activity_value=None,
             activity_unit=None,
+            activity_type=None,
             source=_seed_source(drug),
         )
         db.add(seed)

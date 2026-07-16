@@ -1,0 +1,14 @@
+panel_id,molecule_id,valid,mw,logp,tpsa,hbd,hba,rotb,qed,admet_summary,route_found,route_steps,route_confidence,selected_for_next_round,reason
+BRAF-B-001,ANALOG-TOP1-001,,,,,,,,,,,,,,
+BRAF-B-002,ANALOG-TOP1-002,,,,,,,,,,,,,,
+BRAF-B-003,ANALOG-TOP1-003,,,,,,,,,,,,,,
+BRAF-B-004,ANALOG-TOP1-004,,,,,,,,,,,,,,
+BRAF-B-005,ANALOG-TOP1-005,,,,,,,,,,,,,,
+BRAF-B-006,ANALOG-TOP1-006,,,,,,,,,,,,,,
+BRAF-B-007,ANALOG-TOP1-007,,,,,,,,,,,,,,
+BRAF-B-008,ANALOG-TOP1-008,,,,,,,,,,,,,,
+BRAF-B-009,ANALOG-TOP1-009,,,,,,,,,,,,,,
+BRAF-B-010,ANALOG-TOP1-010,,,,,,,,,,,,,,
+BRAF-B-011,ANALOG-TOP1-011,,,,,,,,,,,,,,
+BRAF-B-012,ANALOG-TOP1-012,,,,,,,,,,,,,,
+

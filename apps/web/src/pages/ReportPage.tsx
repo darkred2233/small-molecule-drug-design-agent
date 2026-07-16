@@ -3,6 +3,8 @@ import { useQuery } from '@tanstack/react-query';
 import {
   Activity,
   ArrowLeft,
+  BookOpen,
+  Box,
   CheckCircle2,
   Download,
   FileText,
@@ -17,8 +19,10 @@ import { Link, useParams } from 'react-router-dom';
 import { reportsApi } from '@/api';
 import type {
   AdmetSummary,
+  PoseCoordinates,
   ProjectReport,
   ReportCandidate,
+  ReportEvidenceLink,
   ReportSeedLigand,
   RuleFilterSummary,
   SynthesisSummary,
@@ -27,7 +31,15 @@ import type {
   TargetSarRule,
 } from '@/types/api';
 import { cn, formatNumber } from '@/utils/helpers';
-import { decisionTone } from '@/utils/reportPresentation';
+import {
+  bestPoseConfirmed,
+  decisionTone,
+  evidenceExcerpt,
+  formatBestPose,
+  formatEvidenceCitation,
+  formatEvidenceSourceLabel,
+  poseFilename,
+} from '@/utils/reportPresentation';
 
 export default function ReportPage() {
   const { projectId } = useParams();
@@ -273,9 +285,9 @@ export default function ReportPage() {
                   tone="emerald"
                 />
                 <Metric
-                  label="未找到"
+                  label="未外部确认"
                   value={synthesisOverview?.route_missing_count ?? 0}
-                  tone="rose"
+                  tone="amber"
                 />
                 <Metric
                   label="平均步数"
@@ -300,19 +312,24 @@ export default function ReportPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {(synthesisOverview?.routes ?? []).map((route) => (
-                      <tr key={route.molecule_id} className="border-b border-cyan-50">
-                        <td className="px-3 py-2 font-medium text-slate-900">{route.molecule_id}</td>
-                        <td className="px-3 py-2">
-                          <StatusChip tone={route.route_found ? 'emerald' : 'slate'}>
-                            {route.route_found ? '找到' : '未找到'}
-                          </StatusChip>
-                        </td>
-                        <td className="px-3 py-2">{route.route_steps ?? '-'}</td>
-                        <td className="px-3 py-2">{formatNumber(route.route_confidence, 3)}</td>
-                        <td className="px-3 py-2">{route.buyable_building_blocks ?? '-'}</td>
-                      </tr>
-                    ))}
+                    {(synthesisOverview?.routes ?? []).map((route) => {
+                      const status = synthesisStatus(route);
+                      return (
+                        <tr key={route.molecule_id} className="border-b border-cyan-50">
+                          <td className="px-3 py-2 font-medium text-slate-900">{route.molecule_id}</td>
+                          <td className="px-3 py-2">
+                            <StatusChip tone={status.tone}>{status.label}</StatusChip>
+                          </td>
+                          <td className="px-3 py-2">{route.route_steps ?? route.estimated_route_steps ?? '-'}</td>
+                          <td className="px-3 py-2">
+                            {formatNumber(route.route_confidence ?? route.estimated_route_confidence, 3)}
+                          </td>
+                          <td className="px-3 py-2">
+                            {route.buyable_building_blocks ?? route.estimated_buyable_building_blocks ?? '-'}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -369,14 +386,25 @@ export default function ReportPage() {
                     </div>
                   </div>
                   <div className="space-y-2 text-sm">
+                    <MiniLine label="正向证据分" value={formatNumber(topCandidate.pro_score, 2)} />
+                    <MiniLine label="风险证据分" value={formatNumber(topCandidate.con_score, 2)} />
+                    <MiniLine
+                      label="证据完整度"
+                      value={formatNumber(topCandidate.evidence_confidence, 3)}
+                    />
                     <MiniLine label="SAR 结果" value={topCandidate.rule_filter?.[0]?.decision ?? '未评估'} />
                     <MiniLine
                       label="ADMET"
                       value={topCandidate.admet?.hERG?.risk ?? topCandidate.admet?.Ames?.risk ?? '未评估'}
                     />
                     <MiniLine
+                      label="ADMET 计算"
+                      value={formatAdmetRuntime(topCandidate.admet)}
+                    />
+                    <MiniLine label="最佳 Pose" value={formatBestPose(topCandidate.docking)} />
+                    <MiniLine
                       label="合成"
-                      value={topCandidate.synthesis?.route_found ? '已找到路线' : '未找到路线'}
+                      value={topCandidate.synthesis ? synthesisStatus(topCandidate.synthesis).detail : '未评估'}
                     />
                   </div>
                 </div>
@@ -397,8 +425,10 @@ export default function ReportPage() {
                   <tr className="border-b border-cyan-100 text-left text-slate-700">
                     <th className="px-3 py-2">排名</th>
                     <th className="px-3 py-2">分子</th>
+                    <th className="px-3 py-2">生成方式</th>
                     <th className="px-3 py-2">得分</th>
                     <th className="px-3 py-2">决策</th>
+                    <th className="px-3 py-2">最佳 Pose</th>
                     <th className="px-3 py-2">SAR</th>
                     <th className="px-3 py-2">ADMET</th>
                     <th className="px-3 py-2">合成</th>
@@ -410,6 +440,38 @@ export default function ReportPage() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Top5 分子详情" icon={<CheckCircle2 className="h-4 w-4" />}>
+          {report.top_candidates.length === 0 ? (
+            <div className="text-sm text-slate-500">暂无排名结果。</div>
+          ) : (
+            <div className="grid gap-4 xl:grid-cols-2">
+              {report.top_candidates.slice(0, 5).map((candidate) => (
+                <TopCandidateDetailCard
+                  key={`${candidate.molecule_id}-detail`}
+                  projectId={projectId}
+                  candidate={candidate}
+                />
+              ))}
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="最佳 Pose 与文献证据" icon={<BookOpen className="h-4 w-4" />}>
+          {report.top_candidates.length === 0 ? (
+            <div className="text-sm text-slate-500">暂无候选证据。</div>
+          ) : (
+            <div className="grid gap-4 xl:grid-cols-2">
+              {report.top_candidates.slice(0, 10).map((candidate) => (
+                <CandidateEvidenceCard
+                  key={`${candidate.molecule_id}-evidence`}
+                  projectId={projectId}
+                  candidate={candidate}
+                />
+              ))}
             </div>
           )}
         </Panel>
@@ -472,11 +534,13 @@ function StatusPill({ status }: { status: string }) {
   );
 }
 
+type ChipTone = 'emerald' | 'slate' | 'amber' | 'rose' | 'cyan';
+
 function StatusChip({
   tone,
   children,
 }: {
-  tone: 'emerald' | 'slate' | 'amber' | 'rose' | 'cyan';
+  tone: ChipTone;
   children: ReactNode;
 }) {
   const tones = {
@@ -618,6 +682,7 @@ function AdmetSummaryCard({ item }: { item: AdmetSummary }) {
 
 function SynthesisRouteCard({ route }: { route: SynthesisSummary }) {
   const plan = route.route_plan ?? [];
+  const status = synthesisStatus(route);
   return (
     <div className="rounded-lg border border-cyan-100 bg-white p-4">
       <div className="flex items-start justify-between gap-3">
@@ -627,9 +692,7 @@ function SynthesisRouteCard({ route }: { route: SynthesisSummary }) {
             {route.route_summary ?? (route.route_found ? '已找到代理路线。' : '未找到可信代理路线。')}
           </p>
         </div>
-        <StatusChip tone={route.route_found ? 'emerald' : 'rose'}>
-          {route.route_found ? '可合成' : '需重设'}
-        </StatusChip>
+        <StatusChip tone={status.tone}>{status.cardLabel}</StatusChip>
       </div>
       {route.starting_materials && route.starting_materials.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1">
@@ -665,6 +728,43 @@ function SynthesisRouteCard({ route }: { route: SynthesisSummary }) {
   );
 }
 
+function TopCandidateDetailCard({
+  projectId,
+  candidate,
+}: {
+  projectId: string;
+  candidate: ReportCandidate;
+}) {
+  const synthesis = candidate.synthesis ? synthesisStatus(candidate.synthesis) : null;
+
+  return (
+    <article className="rounded-lg border border-cyan-100 bg-white p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-slate-950">
+            #{candidate.rank} {candidate.molecule_id}
+          </div>
+          <div className="mt-1 max-w-full truncate font-mono text-[11px] text-slate-500">
+            {shortSmiles(candidate.smiles)}
+          </div>
+        </div>
+        <StatusChip tone={decisionTone(candidate.final_decision)}>
+          {candidate.final_decision}
+        </StatusChip>
+      </div>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <Datum label="总分" value={formatNumber(candidate.overall_score, 2)} />
+        <Datum label="证据完整度" value={formatNumber(candidate.evidence_confidence, 3)} />
+        <Datum label="最佳 Pose" value={formatBestPose(candidate.docking)} />
+        <Datum label="合成" value={synthesis?.detail ?? '未评估'} />
+      </div>
+
+      <CandidateEvidenceBlock projectId={projectId} candidate={candidate} />
+    </article>
+  );
+}
+
 function CandidateRow({
   projectId,
   candidate,
@@ -681,9 +781,23 @@ function CandidateRow({
         </Link>
         <div className="mt-1 max-w-md truncate font-mono text-[11px] text-slate-500">{shortSmiles(candidate.smiles)}</div>
       </td>
-      <td className="px-3 py-2 text-slate-700">{formatNumber(candidate.overall_score, 2)}</td>
+      <td className="px-3 py-2">
+        <StatusChip tone="slate">{formatGenerationMethod(candidate.generation_method)}</StatusChip>
+      </td>
+      <td className="px-3 py-2 text-slate-700">
+        <div>{formatNumber(candidate.overall_score, 2)}</div>
+        <div className="mt-1 whitespace-nowrap text-[11px] text-slate-500">
+          正向 {formatNumber(candidate.pro_score, 1)} / 风险 {formatNumber(candidate.con_score, 1)}
+        </div>
+        <div className="whitespace-nowrap text-[11px] text-slate-500">
+          证据 {formatNumber(candidate.evidence_confidence, 2)}
+        </div>
+      </td>
       <td className="px-3 py-2">
         <StatusChip tone={decisionTone(candidate.final_decision)}>{candidate.final_decision}</StatusChip>
+      </td>
+      <td className="px-3 py-2 text-xs text-slate-700">
+        <div className="max-w-48 whitespace-normal leading-5">{formatBestPose(candidate.docking)}</div>
       </td>
       <td className="px-3 py-2">
         <div className="flex flex-wrap gap-1">
@@ -699,12 +813,17 @@ function CandidateRow({
           {candidate.admet?.hERG?.risk && <StatusChip tone={decisionTone(candidate.admet.hERG.risk)}>{candidate.admet.hERG.risk}</StatusChip>}
           {!candidate.admet?.hERG?.risk && <span className="text-slate-500">-</span>}
         </div>
+        {candidate.admet?.compute_device && (
+          <div className="mt-1 text-[11px] uppercase text-slate-500">
+            {candidate.admet.compute_device}
+          </div>
+        )}
       </td>
       <td className="px-3 py-2">
         <div className="flex flex-wrap gap-1">
           {candidate.synthesis ? (
-            <StatusChip tone={candidate.synthesis.route_found ? 'emerald' : 'slate'}>
-              {candidate.synthesis.route_found ? `${candidate.synthesis.route_steps ?? '-'} 步` : '未找到'}
+            <StatusChip tone={synthesisStatus(candidate.synthesis).tone}>
+              {synthesisStatus(candidate.synthesis).compact}
             </StatusChip>
           ) : (
             <span className="text-slate-500">-</span>
@@ -715,6 +834,233 @@ function CandidateRow({
   );
 }
 
+function CandidateEvidenceCard({
+  projectId,
+  candidate,
+}: {
+  projectId: string;
+  candidate: ReportCandidate;
+}) {
+  return (
+    <article className="rounded-lg border border-cyan-100 bg-white p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-slate-950">
+            #{candidate.rank} {candidate.molecule_id}
+          </div>
+          <div className="mt-1 max-w-full truncate font-mono text-[11px] text-slate-500">
+            {shortSmiles(candidate.smiles)}
+          </div>
+        </div>
+        <StatusChip tone={decisionTone(candidate.final_decision)}>
+          {candidate.final_decision}
+        </StatusChip>
+      </div>
+
+      <CandidateEvidenceBlock projectId={projectId} candidate={candidate} />
+    </article>
+  );
+}
+
+function CandidateEvidenceBlock({
+  projectId,
+  candidate,
+}: {
+  projectId: string;
+  candidate: ReportCandidate;
+}) {
+  const evidence = candidate.evidence_chain ?? [];
+  return (
+    <div className="mt-4 space-y-4">
+      <BestPoseCard projectId={projectId} candidate={candidate} />
+      <EvidenceList evidence={evidence} />
+    </div>
+  );
+}
+
+function BestPoseCard({
+  projectId,
+  candidate,
+}: {
+  projectId: string;
+  candidate: ReportCandidate;
+}) {
+  const docking = candidate.docking;
+  if (!docking) {
+    return (
+      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-500">
+        暂无对接 Pose
+      </div>
+    );
+  }
+
+  const confirmed = bestPoseConfirmed(docking);
+  const canDownload = confirmed && Boolean(docking.pose_file);
+
+  return (
+    <div className="rounded-lg border border-cyan-100 bg-cyan-50/30 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-xs font-semibold text-cyan-800">
+            <Box className="h-3.5 w-3.5" />
+            最佳 Pose
+          </div>
+          <div className="mt-1 text-sm font-semibold leading-5 text-slate-950">
+            {formatBestPose(docking)}
+          </div>
+        </div>
+        <StatusChip tone={confirmed ? 'emerald' : 'amber'}>
+          {confirmed ? '已确认' : '未确认'}
+        </StatusChip>
+      </div>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <Datum label="Pose 文件" value={poseFilename(docking.pose_file) || '-'} mono />
+        <Datum label="选择方法" value={docking.pose_selection_method ?? '-'} />
+        <Datum
+          label="Pose 排名"
+          value={docking.selected_pose_rank == null ? '-' : `#${docking.selected_pose_rank}`}
+        />
+        <Datum label="文件状态" value={docking.pose_artifact_available ? '可用' : '不可用'} />
+      </div>
+
+      {docking.pose_file && (
+        <div
+          className="mt-3 truncate rounded-md bg-white px-2 py-1 font-mono text-[11px] text-slate-500"
+          title={docking.pose_file}
+        >
+          {docking.pose_file}
+        </div>
+      )}
+
+      <PoseCoordinateTable coordinates={docking.pose_coordinates} />
+
+      {canDownload && (
+        <a
+          href={reportsApi.poseDownloadUrl(projectId, candidate.molecule_id)}
+          download={`${candidate.molecule_id}_best_pose`}
+          className="mt-3 inline-flex items-center gap-2 rounded-md border border-cyan-200 bg-white px-3 py-1.5 text-xs font-medium text-cyan-800 hover:border-cyan-300 hover:bg-cyan-50"
+        >
+          <Download className="h-3.5 w-3.5" />
+          下载 Pose
+        </a>
+      )}
+    </div>
+  );
+}
+
+function PoseCoordinateTable({ coordinates }: { coordinates?: PoseCoordinates | null }) {
+  const atoms = coordinates?.atoms ?? [];
+  if (atoms.length === 0) {
+    return null;
+  }
+
+  return (
+    <section className="mt-3 overflow-hidden rounded-md border border-cyan-100 bg-white">
+      <div className="flex items-center justify-between gap-3 border-b border-cyan-100 px-3 py-2">
+        <div>
+          <h5 className="text-xs font-semibold text-slate-700">最佳 Pose XYZ 坐标</h5>
+          <div className="mt-0.5 text-[11px] text-slate-500">
+            {coordinates?.format?.toUpperCase()} · {coordinates?.atom_count ?? atoms.length} atoms
+          </div>
+        </div>
+        {coordinates?.truncated && (
+          <div className="text-right text-[11px] text-amber-700">
+            仅显示前 {coordinates.returned_atom_count} / {coordinates.atom_count} 个原子
+          </div>
+        )}
+      </div>
+      <div className="max-h-72 overflow-auto">
+        <table className="w-full min-w-[360px] text-left text-[11px]">
+          <thead className="sticky top-0 bg-slate-50 text-slate-500">
+            <tr>
+              <th className="px-3 py-2 font-medium">#</th>
+              <th className="px-3 py-2 font-medium">Atom</th>
+              <th className="px-3 py-2 text-right font-medium">X</th>
+              <th className="px-3 py-2 text-right font-medium">Y</th>
+              <th className="px-3 py-2 text-right font-medium">Z</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100 font-mono text-slate-700">
+            {atoms.map((atom) => (
+              <tr key={atom.index}>
+                <td className="px-3 py-1.5">{atom.index}</td>
+                <td className="px-3 py-1.5">{atom.element}</td>
+                <td className="px-3 py-1.5 text-right">{formatNumber(atom.x, 4)}</td>
+                <td className="px-3 py-1.5 text-right">{formatNumber(atom.y, 4)}</td>
+                <td className="px-3 py-1.5 text-right">{formatNumber(atom.z, 4)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function EvidenceList({ evidence }: { evidence: ReportEvidenceLink[] }) {
+  if (evidence.length === 0) {
+    return (
+      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-500">
+        暂无 RAG 文献证据
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {evidence.slice(0, 4).map((item) => (
+        <EvidenceCard key={item.evidence_id} evidence={item} />
+      ))}
+      {evidence.length > 4 && (
+        <div className="text-xs text-slate-500">还有 {evidence.length - 4} 条证据已写入报告 JSON。</div>
+      )}
+    </div>
+  );
+}
+
+function EvidenceCard({ evidence }: { evidence: ReportEvidenceLink }) {
+  return (
+    <div className="rounded-lg border border-cyan-100 bg-white p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-slate-950">
+            {formatEvidenceSourceLabel(evidence)}
+          </div>
+          <div className="mt-1 text-xs text-slate-500">{formatEvidenceCitation(evidence)}</div>
+        </div>
+        <StatusChip tone="cyan">{evidence.claim_type}</StatusChip>
+      </div>
+      <p className="mt-2 text-xs leading-5 text-slate-600">{evidenceExcerpt(evidence)}</p>
+      {evidence.rationale && (
+        <div className="mt-2 rounded-md bg-cyan-50 px-2 py-1 text-[11px] leading-5 text-cyan-900">
+          {evidence.rationale}
+        </div>
+      )}
+      <div className="mt-2 font-mono text-[11px] text-slate-400">{evidence.evidence_id}</div>
+    </div>
+  );
+}
+
+function Datum({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="min-w-0 rounded-md bg-white px-2 py-1">
+      <div className="text-[11px] text-slate-500">{label}</div>
+      <div className={cn('mt-0.5 truncate text-xs font-medium text-slate-900', mono && 'font-mono')}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
 function MiniLine({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-lg border border-cyan-100 bg-white px-3 py-2">
@@ -722,6 +1068,62 @@ function MiniLine({ label, value }: { label: string; value: string }) {
       <span className="font-medium text-slate-900">{value}</span>
     </div>
   );
+}
+
+function synthesisStatus(route: SynthesisSummary): {
+  tone: ChipTone;
+  label: string;
+  cardLabel: string;
+  compact: string;
+  detail: string;
+} {
+  const labels = route.labels ?? [];
+  const isSurrogate =
+    route.adapter_mode === 'rdkit_surrogate_synthesis' ||
+    route.result_kind === 'non_retrosynthesis_coarse_estimate' ||
+    labels.includes('rdkit_surrogate_synthesis');
+  const steps = route.route_steps ?? route.estimated_route_steps;
+  const confidence = route.route_confidence ?? route.estimated_route_confidence;
+  const stepText = steps == null ? null : `${steps} 步`;
+  const confidenceText = confidence == null ? null : `置信 ${formatNumber(confidence, 2)}`;
+
+  if (route.route_found) {
+    return {
+      tone: 'emerald',
+      label: '找到',
+      cardLabel: '可合成',
+      compact: stepText ?? '找到',
+      detail: ['已找到路线', stepText, confidenceText].filter(Boolean).join(' · '),
+    };
+  }
+
+  if (isSurrogate) {
+    const feasible = route.estimated_route_feasible;
+    const label = feasible === true ? '粗筛可行' : '待复核';
+    return {
+      tone: 'amber',
+      label,
+      cardLabel: label,
+      compact: stepText ? `${label} ${stepText}` : label,
+      detail: [label, stepText, confidenceText, '待外部逆合成确认'].filter(Boolean).join(' · '),
+    };
+  }
+
+  return {
+    tone: 'rose',
+    label: '未找到',
+    cardLabel: '需重设',
+    compact: '未找到',
+    detail: '未找到可信路线',
+  };
+}
+
+function formatAdmetRuntime(admet?: AdmetSummary | null) {
+  if (!admet) return '未评估';
+
+  const model = admet.model_name ?? admet.tool_name ?? admet.adapter_mode ?? '模型未记录';
+  const device = admet.compute_device ? admet.compute_device.toUpperCase() : '设备未记录';
+  return `${model} / ${device}`;
 }
 
 function Badge({ children, tone }: { children: ReactNode; tone: 'cyan' | 'emerald' | 'slate' | 'amber' | 'rose' }) {
@@ -757,6 +1159,17 @@ function statusTone(status: string) {
 function shortSmiles(smiles: string | null) {
   if (!smiles) return '-';
   return smiles.length > 64 ? `${smiles.slice(0, 64)}...` : smiles;
+}
+
+function formatGenerationMethod(method?: string | null) {
+  if (!method) return '-';
+  const labels: Record<string, string> = {
+    reinvent4: 'REINVENT4',
+    crem: 'CREM',
+    autogrow4: 'AutoGrow4',
+    seed_ligand_import: '种子导入',
+  };
+  return labels[method] ?? method;
 }
 
 function formatVector(values?: number[] | null) {

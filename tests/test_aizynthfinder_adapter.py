@@ -25,6 +25,9 @@ def test_aizynthfinder_status_has_stable_shape():
         "path",
         "docker_image",
         "model_configured",
+        "runtime_available",
+        "gpu_available",
+        "warning",
     }
 
 
@@ -89,6 +92,51 @@ def test_aizynthfinder_local_run_uses_smiles_file_and_parses_output(tmp_path, mo
     assert result.route_score == 0.873
     assert result.adapter_mode == "aizynthfinder_local"
     assert captured["cwd"] == str(config_file.parent)
+
+
+def test_aizynthfinder_local_run_preserves_route_tree_and_stock_details(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.yml"
+    config_file.write_text("policy: {}\nstock: {}\n", encoding="utf-8")
+
+    def fake_run(cmd, **_kwargs):
+        output_file = Path(cmd[cmd.index("--output") + 1])
+        _write_detailed_aizynthfinder_json(output_file)
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(aizynthfinder_adapter.subprocess, "run", fake_run)
+
+    result = run_aizynthfinder_retrosynthesis(
+        AiZynthFinderRequest(
+            smiles="CC(C)NC(=O)c1ccccc1",
+            output_dir=str(tmp_path / "out"),
+            config_file=str(config_file),
+            max_steps=3,
+        ),
+        {"available": True, "mode": "local_cli", "path": "aizynthcli"},
+    )
+
+    assert result.success
+    assert result.route_found
+    assert result.starting_materials == [
+        "CC(C)N (zinc)",
+        "O=C(Cl)c1ccccc1 (zinc)",
+    ]
+    assert result.route_plan == [
+        {
+            "step": 1,
+            "stage": "AiZynthFinder disconnection",
+            "input": ["CC(C)N", "O=C(Cl)c1ccccc1"],
+            "operation": "Forward reaction from AiZynthFinder template uspto p=0.725.",
+            "output": "CC(C)NC(=O)c1ccccc1",
+            "rationale": "reaction_smiles=[C:1](=[O:2])([cH3:3])[N:5][CH3:4]>>Cl[C:1](=[O:2])[cH3:3].[CH3:4][N:5]",
+        }
+    ]
+    assert result.route_trees
+    assert result.stock_info == {
+        "CC(C)N": ["zinc"],
+        "O=C(Cl)c1ccccc1": ["zinc"],
+    }
+    assert result.route_metadata["number_of_solved_routes"] == 1
 
 
 def test_aizynthfinder_python_package_mode_uses_module_entrypoint(tmp_path, monkeypatch):
@@ -268,6 +316,78 @@ def _write_aizynthfinder_json(
                         "number_of_steps": steps,
                         "number_of_solved_routes": 1 if is_solved else 0,
                         "top_score": score,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_detailed_aizynthfinder_json(output_file: Path) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "target": "CC(C)NC(=O)c1ccccc1",
+                        "is_solved": True,
+                        "number_of_steps": 1,
+                        "number_of_solved_routes": 1,
+                        "top_score": 0.9976287063,
+                        "number_of_precursors": 2,
+                        "number_of_precursors_in_stock": 2,
+                        "precursors_in_stock": "O=C(Cl)c1ccccc1, CC(C)N",
+                        "precursors_availability": "zinc;zinc",
+                        "stock_info": {
+                            "O=C(Cl)c1ccccc1": ["zinc"],
+                            "CC(C)N": ["zinc"],
+                        },
+                        "trees": [
+                            {
+                                "type": "mol",
+                                "smiles": "CC(C)NC(=O)c1ccccc1",
+                                "is_chemical": True,
+                                "in_stock": False,
+                                "children": [
+                                    {
+                                        "type": "reaction",
+                                        "smiles": (
+                                            "[C:1](=[O:2])([cH3:3])[N:5][CH3:4]"
+                                            ">>Cl[C:1](=[O:2])[cH3:3].[CH3:4][N:5]"
+                                        ),
+                                        "is_reaction": True,
+                                        "metadata": {
+                                            "policy_name": "uspto",
+                                            "policy_probability": 0.7247999907,
+                                            "template_code": 20596,
+                                        },
+                                        "children": [
+                                            {
+                                                "type": "mol",
+                                                "smiles": "CC(C)N",
+                                                "is_chemical": True,
+                                                "in_stock": True,
+                                            },
+                                            {
+                                                "type": "mol",
+                                                "smiles": "O=C(Cl)c1ccccc1",
+                                                "is_chemical": True,
+                                                "in_stock": True,
+                                            },
+                                        ],
+                                    }
+                                ],
+                                "scores": {
+                                    "state score": 0.9976287063,
+                                    "number of reactions": 1,
+                                    "number of pre-cursors": 2,
+                                    "number of pre-cursors in stock": 2,
+                                },
+                                "metadata": {"is_solved": True},
+                            }
+                        ],
                     }
                 ]
             }

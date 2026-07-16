@@ -9,11 +9,19 @@ import { useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { chatApi, projectsApi, assessmentApi } from '@/api';
 import { useWorkspaceStore } from '@/state/workspaceStore';
-import { Play, FileText, Loader2, Bot, Sparkles, Gauge } from 'lucide-react';
+import { Play, FileText, Loader2, Bot, Sparkles, Gauge, SlidersHorizontal } from 'lucide-react';
 import ChatComposer from './ChatComposer';
 import ConstraintChips from './ConstraintChips';
 import DesignGuidancePanel from './DesignGuidancePanel';
 import { cn } from '@/utils/helpers';
+import {
+  DEFAULT_STRATEGY_COUNTS,
+  STRATEGY_KEYS,
+  STRATEGY_LABELS,
+  buildRoundGenerationConfig,
+  sumStrategyCounts,
+  updateStrategyCount,
+} from '@/utils/generationConfig';
 import type { AssessmentMode } from '@/types/api';
 
 const ASSESSMENT_MODE_OPTIONS: Array<{
@@ -47,6 +55,8 @@ export default function ChatPanel() {
   const [messages, setMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; intent?: string }>>([]);
   const [assessmentMode, setAssessmentMode] = useState<AssessmentMode>('external');
   const [externalTopN, setExternalTopN] = useState(10);
+  const [strategyCounts, setStrategyCounts] = useState(DEFAULT_STRATEGY_COUNTS);
+  const generationSize = sumStrategyCounts(strategyCounts);
 
   // Load constraints
   const { data: constraints } = useQuery({
@@ -109,10 +119,7 @@ export default function ChatPanel() {
   const handleRunFull = () => {
     runPipeline.mutate({
       mode: 'full',
-      generationConfig: {
-        assessment_mode: assessmentMode,
-        external_top_n: externalTopN,
-      },
+      generationConfig: buildRoundGenerationConfig(strategyCounts, externalTopN, assessmentMode),
     });
   };
 
@@ -182,6 +189,30 @@ export default function ChatPanel() {
                   className="h-7 w-16 rounded border border-slate-200 bg-white px-2 text-xs text-slate-800 disabled:bg-slate-100 disabled:text-slate-400"
                 />
               </label>
+              <div className="flex items-center gap-1 pl-1 text-xs font-medium text-slate-600">
+                <SlidersHorizontal className="h-3.5 w-3.5 text-cyan-700" />
+                生成数
+              </div>
+              {STRATEGY_KEYS.map((strategy) => (
+                <label key={strategy} className="flex items-center gap-1 text-xs text-slate-600">
+                  {STRATEGY_LABELS[strategy]}
+                  <input
+                    type="number"
+                    min={0}
+                    max={500}
+                    value={strategyCounts[strategy]}
+                    onChange={(event) =>
+                      setStrategyCounts((current) =>
+                        updateStrategyCount(current, strategy, Number(event.target.value))
+                      )
+                    }
+                    className="h-7 w-14 rounded border border-slate-200 bg-white px-2 text-xs text-slate-800"
+                  />
+                </label>
+              ))}
+              <span className="rounded border border-emerald-100 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-800">
+                total {generationSize}
+              </span>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -194,7 +225,7 @@ export default function ChatPanel() {
               </button>
               <button
                 onClick={handleRunFull}
-                disabled={runPipeline.isPending}
+                disabled={runPipeline.isPending || generationSize < 1}
                 className="primary-action flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors"
               >
                 {runPipeline.isPending ? (

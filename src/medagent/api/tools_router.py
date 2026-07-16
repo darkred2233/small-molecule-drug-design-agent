@@ -23,6 +23,9 @@ from medagent.services.aizynthfinder_adapter import aizynthfinder_tool_status
 from medagent.services.autogrow4_adapter import autogrow4_tool_status
 from medagent.services.docking_adapters import (
     DockingToolRequest,
+    check_diffdock_available,
+    check_gnina_available,
+    check_vina_available,
     run_external_docking,
 )
 from medagent.services.rdkit_enhanced import validate_and_calculate_enhanced
@@ -102,7 +105,7 @@ class DockingRunRequest(BaseModel):
     grid_center: list[float] | None = Field(None, description="网格中心 [x,y,z]")
     grid_size: list[float] | None = Field(None, description="网格大小 [x,y,z]")
     exhaustiveness: int = Field(default=8, description="搜索精度")
-    timeout_seconds: int = Field(default=300, description="超时时间（秒）")
+    timeout_seconds: int = Field(default=900, description="超时时间（秒）")
     molecule_id: str | None = Field(None, description="分子ID")
 
 
@@ -141,10 +144,9 @@ async def get_tools_status():
     # 检查Chemprop
     chemprop_status = check_chemprop_available()
 
-    # 检查对接工具
-    gnina_status = _check_tool_cli("gnina", "--version")
-    vina_status = _check_tool_cli("vina", "--version")
-    diffdock_status = _check_tool_docker("diffdock:latest")
+    gnina_status = check_gnina_available()
+    vina_status = check_vina_available()
+    diffdock_status = check_diffdock_available()
 
     # 检查生成工具
     reinvent4_status = reinvent4_tool_status()
@@ -287,11 +289,10 @@ async def run_docking(request: DockingRunRequest):
 
     系统会自动选择第一个可用的工具
     """
-    # 检查工具状态
     tool_status = {
-        "gnina": _check_tool_cli("gnina", "--version"),
-        "vina": _check_tool_cli("vina", "--version"),
-        "diffdock": _check_tool_docker("diffdock:latest"),
+        "gnina": check_gnina_available(),
+        "vina": check_vina_available(),
+        "diffdock": check_diffdock_available(),
     }
 
     # 创建对接请求

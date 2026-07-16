@@ -411,21 +411,27 @@ def get_llm_client() -> LLMClient:
 
         # 注册千问
         if settings.dashscope_api_key:
-            qwen_provider = QwenProvider(
-                api_key=settings.dashscope_api_key,
-                base_url=settings.dashscope_compatible_base_url,
-                default_model=settings.qwen_task_model,
-            )
-            _global_client.register_provider("qwen", qwen_provider)
+            try:
+                qwen_provider = QwenProvider(
+                    api_key=settings.dashscope_api_key,
+                    base_url=settings.dashscope_compatible_base_url,
+                    default_model=settings.qwen_task_model,
+                )
+                _global_client.register_provider("qwen", qwen_provider)
+            except RuntimeError:
+                pass
 
         # 注册DeepSeek
         deepseek_key = os.getenv("MEDAGENT_DEEPSEEK_API_KEY")
         if deepseek_key:
-            deepseek_provider = DeepSeekProvider(
-                api_key=deepseek_key,
-                base_url=os.getenv("MEDAGENT_DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-                default_model=settings.deepseek_refutation_model,
-            )
-            _global_client.register_provider("deepseek", deepseek_provider)
+            try:
+                deepseek_provider = DeepSeekProvider(
+                    api_key=deepseek_key,
+                    base_url=os.getenv("MEDAGENT_DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+                    default_model=settings.deepseek_refutation_model,
+                )
+                _global_client.register_provider("deepseek", deepseek_provider)
+            except RuntimeError:
+                pass
 
     return _global_client

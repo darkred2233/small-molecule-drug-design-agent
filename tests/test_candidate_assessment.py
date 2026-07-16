@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
+from pathlib import Path
 import pytest
+import subprocess
 from types import SimpleNamespace
 
 import medagent.api.app as api_app
@@ -7,6 +9,10 @@ from medagent.api.app import create_app
 from medagent.core.config import Settings
 from medagent.db.models import Critique
 from medagent.services import candidate_assessment
+from medagent.services.admet_adapter import (
+    ChempropADMETOutput,
+    SingleADMETResult,
+)
 from medagent.services.aizynthfinder_adapter import AiZynthFinderResult
 from medagent.services.docking_adapters import DockingToolResult
 
@@ -23,10 +29,8 @@ def make_client(tmp_path):
 
 @pytest.fixture(autouse=True)
 def disable_external_retrosynthesis_by_default(monkeypatch):
-    original_tool_status = candidate_assessment.candidate_assessment_tool_status
-
     def fake_tool_status():
-        return _disable_external_retrosynthesis(original_tool_status())
+        return _minimal_tool_status_without_external()
 
     monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", fake_tool_status)
 
@@ -72,6 +76,43 @@ def _minimal_tool_status_with_external() -> dict:
     }
 
 
+def _minimal_tool_status_without_external() -> dict:
+    status = _minimal_tool_status_with_external()
+    for tool_name in ("gnina", "vina", "diffdock", "chemprop", "aizynthfinder"):
+        status[tool_name]["available"] = False
+        status[tool_name]["runtime_available"] = False
+    status["aizynthfinder"]["model_configured"] = False
+    return _disable_external_retrosynthesis(status)
+
+
+def _minimal_tool_status_with_vina_only() -> dict:
+    status = _minimal_tool_status_with_external()
+    status["gnina"] = {
+        "available": False,
+        "mode": None,
+        "version": None,
+        "path": None,
+        "docker_image": None,
+    }
+    status["vina"] = {
+        "available": True,
+        "mode": "docker",
+        "version": None,
+        "path": None,
+        "docker_image": "vina:latest",
+    }
+    status["diffdock"] = {"available": False, "mode": None, "version": None, "docker_image": None}
+    status["aizynthfinder"] = {
+        "available": False,
+        "mode": None,
+        "version": None,
+        "path": None,
+        "docker_image": None,
+        "model_configured": False,
+    }
+    return status
+
+
 def _successful_docking_result(tmp_path, request) -> DockingToolResult:
     return DockingToolResult(
         adapter_mode="gnina_docker_docking",
@@ -86,6 +127,21 @@ def _successful_docking_result(tmp_path, request) -> DockingToolResult:
     )
 
 
+def _successful_diffdock_result(tmp_path, request) -> DockingToolResult:
+    return DockingToolResult(
+        adapter_mode="diffdock_docker_docking",
+        tool_name="diffdock",
+        success=True,
+        diffdock_confidence=1.25,
+        pose_file=str(tmp_path / f"{request.molecule_id}.sdf"),
+        selected_pose_rank=1,
+        pose_count=10,
+        pose_selection_method="diffdock_rank_1_by_confidence",
+        labels=["external_docking_adapter_used", "diffdock_adapter"],
+        stdout="rank1_confidence1.25.sdf\n",
+    )
+
+
 def _successful_retrosynthesis_result() -> AiZynthFinderResult:
     return AiZynthFinderResult(
         adapter_mode="aizynthfinder_docker",
@@ -95,6 +151,20 @@ def _successful_retrosynthesis_result() -> AiZynthFinderResult:
         num_steps=2,
         route_score=0.84,
         route_summary="AiZynthFinder found a route in 2 steps; top score=0.84.",
+        route_plan=[
+            {
+                "step": 1,
+                "stage": "AiZynthFinder disconnection",
+                "input": ["CC(C)N", "O=C(Cl)c1ccccc1"],
+                "operation": "Forward reaction from AiZynthFinder template uspto p=0.725.",
+                "output": "CC(C)NC(=O)c1ccccc1",
+                "rationale": "reaction_smiles=amide>>acid chloride.amine",
+            }
+        ],
+        starting_materials=["CC(C)N (zinc)", "O=C(Cl)c1ccccc1 (zinc)"],
+        route_trees=[{"smiles": "CC(C)NC(=O)c1ccccc1", "children": []}],
+        stock_info={"CC(C)N": ["zinc"], "O=C(Cl)c1ccccc1": ["zinc"]},
+        route_metadata={"number_of_precursors_in_stock": 2, "number_of_solved_routes": 1},
         labels=["aizynthfinder_executed", "aizynthfinder_route"],
     )
 
@@ -170,6 +240,7 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
         response = client.post(
             f"/projects/{project_id}/candidate-assessment/run",
             json={
+                "assessment_mode": "fast",
                 "max_molecules": 2,
                 "top_n": 2,
                 "key_residues": ["Met793", "Lys745", "Asp855"],
@@ -187,11 +258,7 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
         assert body["ranking"]["evaluated_count"] == 2
         assert body["tool_status"]["rdkit"]["available"] is True
         assert body["docking"]["adapter_mode"] == "rdkit_surrogate_docking"
-        assert body["admet"]["adapter_mode"] in {
-            "admet_ai_chemprop_admet",
-            "chemprop_with_rdkit_surrogate_admet",
-            "rdkit_surrogate_admet",
-        }
+        assert body["admet"]["adapter_mode"] == "rdkit_surrogate_admet"
         assert body["synthesis"]["adapter_mode"] == "rdkit_surrogate_synthesis"
         assert body["ranking"]["adapter_mode"] == "heuristic_candidate_ranking"
 
@@ -202,7 +269,8 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
 
         docking = client.get(f"/projects/{project_id}/docking-results").json()
         assert len(docking) == 2
-        assert all(item["vina_score"] < 0 for item in docking)
+        assert all(item["vina_score"] is None for item in docking)
+        assert all(item["raw_output"]["status"] == "surrogate_only" for item in docking)
         assert all("external_docking_adapter_pending" in item["labels"] for item in docking)
 
         admet = client.get(f"/projects/{project_id}/admet-results").json()
@@ -220,10 +288,18 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
 
         synthesis = client.get(f"/projects/{project_id}/synthesis-routes").json()
         assert len(synthesis) == 2
-        assert all(item["route_steps"] is not None for item in synthesis)
-        assert all("route_confidence" in item for item in synthesis)
-        assert all(item["route_json"]["route_plan"] for item in synthesis)
-        assert all(item["route_json"]["starting_materials"] for item in synthesis)
+        assert all(item["route_found"] is False for item in synthesis)
+        assert all(item["route_steps"] is None for item in synthesis)
+        assert all(item["route_confidence"] is None for item in synthesis)
+        assert all(item["buyable_building_blocks"] is None for item in synthesis)
+        assert all(item["route_json"]["status"] == "surrogate_only" for item in synthesis)
+        assert all(
+            item["route_json"]["result_kind"] == "non_retrosynthesis_coarse_estimate"
+            for item in synthesis
+        )
+        assert all(item["route_json"]["estimated_route_steps"] is not None for item in synthesis)
+        assert all("route_plan" not in item["route_json"] for item in synthesis)
+        assert all("starting_materials" not in item["route_json"] for item in synthesis)
         assert all(item["route_json"]["route_risks"] for item in synthesis)
 
         rankings = client.get(f"/projects/{project_id}/rankings").json()
@@ -235,6 +311,74 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
         assert all("admet" in item["score_breakdown"] for item in rankings)
         assert all("synthesis" in item["score_breakdown"] for item in rankings)
         assert all("rule_filter" in item["score_breakdown"] for item in rankings)
+
+
+def test_external_assessment_runs_available_admet_model_for_all_candidates(tmp_path, monkeypatch):
+    status = _minimal_tool_status_with_external()
+    status["gnina"]["available"] = False
+    status["aizynthfinder"]["available"] = False
+    status["chemprop"] = {
+        "available": True,
+        "runtime_available": True,
+        "mode": "admet_ai",
+        "version": "2.0.1",
+        "models_dir": "test-models",
+        "model_count": 10,
+        "gpu_available": True,
+        "device": "cuda",
+    }
+    monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", lambda: status)
+
+    requests = []
+
+    def fake_admet(request, tool_status):
+        requests.append((request, tool_status))
+        return ChempropADMETOutput(
+            adapter_mode="admet_ai_chemprop_admet",
+            tool_name="admet-ai",
+            success=True,
+            compute_device="cuda",
+            results=[
+                SingleADMETResult(
+                    molecule_id=molecule_id,
+                    smiles=smiles,
+                    hERG_probability=0.1,
+                    hERG_risk="low_risk",
+                    Ames_probability=0.2,
+                    Ames_risk="low_risk",
+                    admet_risk_score=0.15,
+                    labels=["admet_ai_predicted", "admet_clean"],
+                )
+                for molecule_id, smiles in zip(request.molecule_ids, request.smiles_list)
+            ],
+        )
+
+    monkeypatch.setattr(candidate_assessment, "run_chemprop_admet", fake_admet)
+
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "max_molecules": 2,
+                "top_n": 2,
+                "assessment_mode": "external",
+            },
+        )
+
+        assert response.status_code == 200
+        assert len(requests) == 1
+        assert len(requests[0][0].molecule_ids) == 2
+        assert (
+            response.json()["admet"]["adapter_mode"]
+            == "admet_ai_chemprop_admet_top_n_refinement"
+        )
+
+        stored = client.get(f"/projects/{project_id}/admet-results").json()
+        assert {item["raw_output"]["adapter_mode"] for item in stored} == {
+            "admet_ai_chemprop_admet"
+        }
+        assert {item["raw_output"]["compute_device"] for item in stored} == {"cuda"}
 
 
 def test_candidate_assessment_is_idempotent(tmp_path):
@@ -316,7 +460,7 @@ def test_project_rankings_consume_self_refutation_critiques(tmp_path):
         assert "ranking_reject" in penalized_molecule["labels"]
 
 
-def test_candidate_assessment_marks_route_failures_as_failed_assessment(tmp_path):
+def test_surrogate_route_failure_does_not_hard_reject_candidate(tmp_path):
     with make_client(tmp_path) as client:
         project_id = create_filtered_project(client)
 
@@ -333,8 +477,43 @@ def test_candidate_assessment_marks_route_failures_as_failed_assessment(tmp_path
         molecules = client.get(f"/projects/{project_id}/molecules").json()
         routed_ids = {route["molecule_id"] for route in routes}
         routed_molecules = [molecule for molecule in molecules if molecule["molecule_id"] in routed_ids]
-        assert {molecule["status"] for molecule in routed_molecules} == {"failed_assessment"}
-        assert all("assessment_failed" in molecule["labels"] for molecule in routed_molecules)
+        assert {molecule["status"] for molecule in routed_molecules} == {"candidate_assessed"}
+        assert all("assessment_failed" not in molecule["labels"] for molecule in routed_molecules)
+
+
+def test_external_route_failure_marks_candidate_as_failed_assessment(tmp_path, monkeypatch):
+    status = _minimal_tool_status_without_external()
+    status["aizynthfinder"] = {
+        "available": True,
+        "mode": "docker",
+        "docker_image": "aizynthfinder:latest",
+        "model_configured": True,
+    }
+    monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", lambda: status)
+    monkeypatch.setattr(
+        candidate_assessment,
+        "run_aizynthfinder_retrosynthesis",
+        lambda request, status=None: AiZynthFinderResult(
+            adapter_mode="aizynthfinder_docker",
+            tool_name="aizynthfinder",
+            success=True,
+            route_found=False,
+            labels=["aizynthfinder_executed", "aizynthfinder_no_route"],
+        ),
+    )
+
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={"assessment_mode": "full", "max_molecules": 2, "top_n": 2},
+        )
+
+        assert response.status_code == 200
+        molecules = client.get(f"/projects/{project_id}/molecules").json()
+        assessed = [molecule for molecule in molecules if molecule["status"] == "failed_assessment"]
+        assert len(assessed) == 2
+        assert all("assessment_route_not_found" in molecule["labels"] for molecule in assessed)
 
 
 def test_candidate_assessment_uses_external_gnina_adapter_when_ready(tmp_path, monkeypatch):
@@ -396,6 +575,204 @@ def test_candidate_assessment_uses_external_gnina_adapter_when_ready(tmp_path, m
         assert all(item["vina_score"] == -8.4 for item in docking)
         assert all("external_docking_adapter_used" in item["labels"] for item in docking)
         assert all("external_docking_adapter_pending" not in item["labels"] for item in docking)
+
+
+def test_candidate_assessment_prepares_pdbqt_inputs_for_vina_when_gnina_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    docking_requests = []
+
+    def fake_prepare_vina_receptor_file(pdb_file, output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        receptor_file = output_dir / f"{pdb_file.stem}_prepared.pdbqt"
+        receptor_file.write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+        return str(receptor_file), []
+
+    def fake_prepare_ligand_from_smiles(
+        smiles,
+        output_dir,
+        molecule_id,
+        target_format="pdbqt",
+        **_kwargs,
+    ):
+        assert smiles
+        assert target_format == "pdbqt"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ligand_file = output_dir / f"{molecule_id}_ligand.pdbqt"
+        ligand_file.write_text(
+            "ROOT\n"
+            "ATOM      1  C   LIG     1       0.000   0.000   0.000  0.00  0.00  0.000 C\n"
+            "ENDROOT\n"
+            "TORSDOF 0\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            success=True,
+            ligand_file=str(ligand_file),
+            format="pdbqt",
+            warnings=[],
+        )
+
+    def fake_external_docking(request, tool_status):
+        docking_requests.append((request, tool_status))
+        return DockingToolResult(
+            adapter_mode="vina_docker_docking",
+            tool_name="vina",
+            success=True,
+            vina_score=-6.9,
+            pose_file=str(tmp_path / f"{request.molecule_id}.pdbqt"),
+            labels=["external_docking_adapter_used", "vina_adapter"],
+            stdout="mode | affinity\n1 -6.9\n",
+        )
+
+    monkeypatch.setattr(
+        candidate_assessment,
+        "candidate_assessment_tool_status",
+        _minimal_tool_status_with_vina_only,
+    )
+    monkeypatch.setattr(candidate_assessment, "_prepare_vina_receptor_file", fake_prepare_vina_receptor_file)
+    monkeypatch.setattr(candidate_assessment, "prepare_ligand_from_smiles", fake_prepare_ligand_from_smiles)
+    monkeypatch.setattr(candidate_assessment, "run_external_docking", fake_external_docking)
+
+    receptor_file = tmp_path / "egfr_receptor.pdb"
+    receptor_file.write_text("HEADER    TEST RECEPTOR\n", encoding="utf-8")
+
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "assessment_mode": "full",
+                "max_molecules": 2,
+                "top_n": 2,
+                "protein_file": str(receptor_file),
+                "grid_center": [1.0, 2.0, 3.0],
+                "grid_size": [18.0, 18.0, 18.0],
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["docking"]["adapter_mode"] == "vina_docker_docking"
+        assert "vina_requires_prepared_pdbqt_inputs" not in body["docking"]["warnings"]
+        assert len(docking_requests) == 2
+        assert all(request.receptor_file.endswith(".pdbqt") for request, _ in docking_requests)
+        assert all(request.ligand_file.endswith(".pdbqt") for request, _ in docking_requests)
+        assert all(tool_status["vina"]["available"] for _, tool_status in docking_requests)
+
+
+def test_external_assessment_persists_diffdock_confidence_without_cnn_score(tmp_path, monkeypatch):
+    status = _minimal_tool_status_with_external()
+    status["gnina"]["available"] = False
+    status["diffdock"] = {
+        "available": True,
+        "mode": "docker",
+        "version": "test",
+        "docker_image": "diffdock:test",
+        "model_configured": True,
+    }
+    status["aizynthfinder"]["available"] = False
+    status["aizynthfinder"]["model_configured"] = False
+    monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", lambda: status)
+    monkeypatch.setattr(
+        candidate_assessment,
+        "run_external_docking",
+        lambda request, tool_status: _successful_diffdock_result(tmp_path, request),
+    )
+
+    receptor_file = tmp_path / "egfr_receptor.pdb"
+    receptor_file.write_text("HEADER    TEST RECEPTOR\n", encoding="utf-8")
+
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "assessment_mode": "external",
+                "max_molecules": 2,
+                "top_n": 1,
+                "external_top_n": 1,
+                "protein_file": str(receptor_file),
+                "grid_center": [1.0, 2.0, 3.0],
+                "grid_size": [18.0, 18.0, 18.0],
+            },
+        )
+
+        assert response.status_code == 200
+        results = client.get(f"/projects/{project_id}/docking-results").json()
+        refined = [item for item in results if "diffdock_adapter" in item["labels"]]
+        assert len(refined) == 1
+        assert refined[0]["cnn_score"] is None
+        assert refined[0]["diffdock_confidence"] == 1.25
+        assert refined[0]["raw_output"]["selected_pose_rank"] == 1
+        assert refined[0]["raw_output"]["pose_count"] == 10
+        assert (
+            refined[0]["raw_output"]["pose_selection_method"]
+            == "diffdock_rank_1_by_confidence"
+        )
+
+
+def test_existing_vina_receptor_ignores_flexible_pdbqt_cache(tmp_path):
+    receptor = tmp_path / "protein.pdb"
+    receptor.write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    output_dir = tmp_path / "prepared"
+    output_dir.mkdir()
+    bad_cache = output_dir / "protein.pdbqt"
+    bad_cache.write_text(
+        "ROOT\nATOM      1  C   LIG A   1\nENDROOT\nTORSDOF 0\n",
+        encoding="utf-8",
+    )
+
+    existing = candidate_assessment._existing_vina_receptor_file(receptor, output_dir)
+
+    assert existing is None
+
+
+def test_existing_vina_ligand_ignores_atom_only_pdbqt_cache(tmp_path):
+    molecule = SimpleNamespace(molecule_id="MOL-BAD-LIGAND")
+    output_dir = tmp_path / "prepared"
+    output_dir.mkdir()
+    bad_cache = output_dir / "MOL-BAD-LIGAND_ligand.pdbqt"
+    bad_cache.write_text(
+        "ATOM      1  C   LIG     1       0.000   0.000   0.000  0.00  0.00  0.000 C\n",
+        encoding="utf-8",
+    )
+
+    existing = candidate_assessment._existing_vina_ligand_file(molecule, output_dir)
+
+    assert existing is None
+
+
+def test_prepare_vina_receptor_uses_rigid_output_and_rejects_invalid_result(
+    tmp_path,
+    monkeypatch,
+):
+    receptor = tmp_path / "protein.pdb"
+    receptor.write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        output_path = Path(command[command.index("-O") + 1])
+        output_path.write_text(
+            "ROOT\nATOM      1  C   LIG A   1\nENDROOT\nTORSDOF 0\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(candidate_assessment.shutil, "which", lambda _name: "obabel")
+    monkeypatch.setattr(candidate_assessment.subprocess, "run", fake_run)
+
+    prepared, warnings = candidate_assessment._prepare_vina_receptor_file(
+        receptor,
+        tmp_path / "prepared",
+    )
+
+    assert "-xr" in commands[0]
+    assert prepared is None
+    assert "vina_receptor_pdbqt_preparation_failed:invalid_rigid_receptor_pdbqt" in warnings
 
 
 def test_fast_assessment_mode_skips_external_docking_and_retrosynthesis(tmp_path, monkeypatch):
@@ -647,16 +1024,7 @@ def test_candidate_assessment_uses_aizynthfinder_when_available(tmp_path, monkey
 
     def fake_retrosynthesis(request, status=None):
         retrosynthesis_requests.append((request, status))
-        return AiZynthFinderResult(
-            adapter_mode="aizynthfinder_docker",
-            tool_name="aizynthfinder",
-            success=True,
-            route_found=True,
-            num_steps=2,
-            route_score=0.84,
-            route_summary="AiZynthFinder found a route in 2 steps; top score=0.84.",
-            labels=["aizynthfinder_executed", "aizynthfinder_route"],
-        )
+        return _successful_retrosynthesis_result()
 
     monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", fake_tool_status)
     monkeypatch.setattr(
@@ -688,8 +1056,19 @@ def test_candidate_assessment_uses_aizynthfinder_when_available(tmp_path, monkey
         assert len(synthesis) == 2
         assert all(item["route_found"] is True for item in synthesis)
         assert all(item["route_steps"] == 2 for item in synthesis)
+        assert all(item["buyable_building_blocks"] == 2 for item in synthesis)
         assert all(item["route_json"]["adapter_mode"] == "aizynthfinder_docker" for item in synthesis)
         assert all(item["route_json"]["route_score"] == 0.84 for item in synthesis)
+        assert all(item["route_json"]["result_kind"] == "external_retrosynthesis_route" for item in synthesis)
+        assert all(
+            item["route_json"]["starting_materials"] == [
+                "CC(C)N (zinc)",
+                "O=C(Cl)c1ccccc1 (zinc)",
+            ]
+            for item in synthesis
+        )
+        assert all(item["route_json"]["route_plan"][0]["stage"] == "AiZynthFinder disconnection" for item in synthesis)
+        assert all(item["route_json"]["stock_info"]["CC(C)N"] == ["zinc"] for item in synthesis)
         assert all("external_retrosynthesis_adapter_used" in item["labels"] for item in synthesis)
         assert all("external_retrosynthesis_adapter_pending" not in item["labels"] for item in synthesis)
         assert all("rdkit_surrogate_synthesis" not in item["labels"] for item in synthesis)

@@ -36,7 +36,7 @@ $toolMap = [ordered]@{
     "chemprop" = @{
         Name = "Chemprop"
         Service = "chemprop"
-        Description = "ADMET prediction"
+        Description = "Optional custom-checkpoint ADMET prediction"
         HasBuild = $true
     }
     "diffdock" = @{
@@ -81,7 +81,9 @@ function Resolve-SelectedTools {
     }
 
     if ($normalized -contains "core") {
-        return @("gnina", "vina", "chemprop")
+        # ADMET-AI is installed in the API image. The separate Chemprop image is only
+        # needed when a project supplies its own CHEMPROP_CHECKPOINT_DIR.
+        return @("gnina", "vina")
     }
 
     foreach ($tool in $normalized) {

@@ -1,3 +1,4 @@
+import json
 from collections.abc import Generator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,10 +11,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from medagent.agents.conversation import ConversationAgent
 from medagent.configs.settings import Settings, get_settings
 from medagent.db.models import (
+    ADMETResult,
     AgentRun,
     Base,
+    ConformerResult,
     ConversationMessage,
     DecisionCard,
+    DockingResult,
     EvidenceLink,
     Molecule,
     MoleculeProperty,
@@ -21,9 +25,11 @@ from medagent.db.models import (
     Project,
     RagChunk,
     RagDocument,
+    Ranking,
     ReasoningTrace,
     RuleFilterResult,
     SeedLigand,
+    SynthesisRoute,
     Target,
     UploadedFile as UploadedFileModel,
 )
@@ -72,6 +78,7 @@ from medagent.domain.schemas import (
     ReasoningTraceRead,
     RuleFilterResponse,
     RuleFilterResultRead,
+    RoundCreateRequest,
     RunPipelineRequest,
     SeedLigandRead,
     SynthesisRouteRead,
@@ -96,6 +103,10 @@ from medagent.services.candidate_assessment import (
 from medagent.services.candidate_ranking import generate_project_rankings, list_project_rankings
 from medagent.services.database import database_summary, ensure_relational_schema
 from medagent.services.decision_cards import generate_project_decision_cards
+from medagent.services.docking_adapters import (
+    pose_artifact_available,
+    pose_coordinates_from_file,
+)
 from medagent.services.file_ingestion import (
     parse_pending_project_files,
     parse_single_file,
@@ -914,6 +925,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [_rag_chunk_to_read(chunk) for chunk in chunks]
 
     @app.get(
+        "/projects/{project_id}/rag/chunks/{chunk_id}",
+        response_model=RagChunkRead,
+        tags=["RAG"],
+        summary="Get single RAG chunk detail",
+    )
+    def get_rag_chunk(
+        project_id: str,
+        chunk_id: str,
+        db: Session = Depends(get_db),
+    ):
+        _get_project(db, project_id)
+        # Get all document IDs for this project
+        document_ids = [
+            document_id
+            for (document_id,) in db.query(RagDocument.document_id).filter_by(project_id=project_id).all()
+        ]
+        if not document_ids:
+            raise HTTPException(status_code=404, detail="No documents found for this project")
+
+        # Get the chunk and verify it belongs to this project
+        chunk = (
+            db.query(RagChunk)
+            .filter(RagChunk.chunk_id == chunk_id)
+            .filter(RagChunk.document_id.in_(document_ids))
+            .first()
+        )
+
+        if not chunk:
+            raise HTTPException(status_code=404, detail=f"Chunk {chunk_id} not found")
+
+        return _rag_chunk_to_read(chunk)
+
+    @app.get(
         "/projects/{project_id}/evidence-links",
         response_model=list[EvidenceLinkRead],
         tags=["RAG"],
@@ -940,6 +984,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .all()
         )
         return [_evidence_link_to_read(link) for link in links]
+
+    @app.get(
+        "/projects/{project_id}/evidence-links/{evidence_id}",
+        response_model=EvidenceLinkRead,
+        tags=["RAG"],
+        summary="Get a single evidence link by evidence_id",
+    )
+    def get_evidence_link(project_id: str, evidence_id: str, db: Session = Depends(get_db)):
+        _get_project(db, project_id)
+        link = db.query(EvidenceLink).filter_by(evidence_id=evidence_id).first()
+        if link is not None and _evidence_link_belongs_to_project(db, project_id, link):
+            return _evidence_link_to_read(link)
+
+        if not link:
+            db_evidence = _database_evidence_to_read(db, project_id, evidence_id)
+            if db_evidence is not None:
+                return db_evidence
+        raise HTTPException(status_code=404, detail=f"Evidence link {evidence_id} not found")
 
     @app.post(
         "/projects/{project_id}/files/{file_id}/parse",
@@ -979,6 +1041,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         project = _get_project(db, project_id)
         requested = payload or RunPipelineRequest()
         if requested.mode == "full":
+            _merge_pipeline_config(project, requested.generation_config)
             PipelineOrchestrator(app_settings).run_full(
                 db,
                 project,
@@ -1002,8 +1065,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["项目管理"],
         summary="创建新一轮优化 dry-run",
     )
-    def create_round(project_id: str, db: Session = Depends(get_db)):
+    def create_round(
+        project_id: str,
+        payload: RoundCreateRequest | None = None,
+        db: Session = Depends(get_db),
+    ):
         project = _get_project(db, project_id)
+        requested = payload or RoundCreateRequest()
+        generation_config = _merge_pipeline_config(project, requested.generation_config)
         advisor_apply: dict | None = None
         try:
             advisor_apply = apply_latest_advisor_suggestion(db, project)
@@ -1011,23 +1080,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             advisor_apply = None
 
         runs = PipelineOrchestrator(app_settings).create_dry_run(db, project)
-        if advisor_apply is not None:
-            for run in runs:
-                if run.agent_name != "generator_agent":
-                    continue
+        for run in runs:
+            if run.agent_name != "generator_agent":
+                continue
+            run.input_json = {
+                **(run.input_json or {}),
+                "mode": "next_round_dry_run",
+                "generation_config": generation_config,
+            }
+            run.output_json = {
+                **(run.output_json or {}),
+                "message": "Registered next-round generation configuration.",
+                "generation_config": generation_config,
+            }
+            if advisor_apply is not None:
                 run.input_json = {
                     **(run.input_json or {}),
-                    "mode": "next_round_dry_run",
                     "source": "advisor_apply",
                     "advisor_apply_agent_run_id": advisor_apply["agent_run_id"],
                     "generation_payload": advisor_apply["generation_payload"],
                 }
                 run.output_json = {
+                    **(run.output_json or {}),
                     "message": "Registered next-round generation from Advisor apply.",
                     "applied_constraint_count": advisor_apply["applied_constraint_count"],
                     "generation_payload": advisor_apply["generation_payload"],
                 }
-            db.commit()
+        db.commit()
         db.refresh(project)
         return _project_status(db, project)
 
@@ -1310,6 +1389,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [_docking_result_to_read(result) for result in list_project_docking_results(db, project)]
 
     @app.get(
+        "/projects/{project_id}/molecules/{molecule_id}/docking/pose",
+        tags=["candidate-assessment"],
+        summary="Download best docking pose artifact",
+    )
+    def download_docking_pose(
+        project_id: str,
+        molecule_id: str,
+        db: Session = Depends(get_db),
+    ):
+        _get_project(db, project_id)
+        molecule = _project_molecule(db, project_id, molecule_id)
+        if molecule is None:
+            raise HTTPException(status_code=404, detail="未找到该项目分子")
+
+        docking = (
+            db.query(DockingResult)
+            .filter_by(molecule_id=molecule_id)
+            .order_by(DockingResult.created_at.desc(), DockingResult.id.desc())
+            .first()
+        )
+        if docking is None or not docking.pose_file:
+            raise HTTPException(status_code=404, detail="最佳 Pose 文件尚未生成")
+
+        path = Path(docking.pose_file).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file() or path.stat().st_size == 0:
+            raise HTTPException(status_code=404, detail="最佳 Pose 文件不存在，请重新运行对接")
+
+        filename = f"{_safe_filename(molecule_id)}_best_pose{path.suffix or '.sdf'}"
+        return FileResponse(
+            path,
+            media_type=_pose_media_type(path),
+            filename=filename,
+        )
+
+    @app.get(
         "/projects/{project_id}/admet-results",
         response_model=list[ADMETResultRead],
         tags=["candidate-assessment"],
@@ -1486,6 +1602,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 smiles=item.smiles,
                 activity_value=item.activity_value,
                 activity_unit=item.activity_unit,
+                activity_type=item.activity_type,
                 source=item.source,
             )
             for item in ligands
@@ -1523,7 +1640,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .first()
         )
         if report_run is not None and report_run.output_json:
-            return report_run.output_json
+            technical_appendix = report_run.output_json.get("technical_appendix") or {}
+            if technical_appendix.get("report_schema_version") == "2.0":
+                return report_run.output_json
         return build_project_report(db, project)
 
     @app.get("/projects/{project_id}/report/download", tags=["结果查询"], summary="下载项目报告")
@@ -1588,9 +1707,40 @@ def _merge_project_config(
     return merged
 
 
+def _merge_pipeline_config(
+    project: Project,
+    generation_config: dict[str, object] | None,
+) -> dict[str, object]:
+    constraints_json = dict(project.constraints_json or {})
+    existing = constraints_json.get("pipeline_config")
+    pipeline_config = dict(existing) if isinstance(existing, dict) else {}
+    override = generation_config if isinstance(generation_config, dict) else {}
+    for key, value in override.items():
+        if key in {"strategy_counts", "generation_constraints"} and isinstance(value, dict):
+            previous = pipeline_config.get(key)
+            merged_value = dict(previous) if isinstance(previous, dict) else {}
+            merged_value.update(value)
+            pipeline_config[key] = merged_value
+            continue
+        pipeline_config[key] = value
+    if override:
+        constraints_json["pipeline_config"] = pipeline_config
+        project.constraints_json = constraints_json
+    return pipeline_config
+
+
 def _safe_filename(value: str) -> str:
     safe = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in value)
     return safe.strip("_") or "project"
+
+
+def _pose_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".sdf":
+        return "chemical/x-mdl-sdfile"
+    if suffix in {".pdb", ".pdbqt", ".mol2", ".txt"}:
+        return "text/plain"
+    return "application/octet-stream"
 
 
 def _rag_document_to_read(document: RagDocument) -> RagDocumentRead:
@@ -1618,6 +1768,22 @@ def _rag_chunk_to_read(chunk: RagChunk) -> RagChunkRead:
     )
 
 
+def _evidence_link_belongs_to_project(db: Session, project_id: str, link: EvidenceLink) -> bool:
+    if link.molecule_id and _project_molecule(db, project_id, link.molecule_id) is not None:
+        return True
+
+    document_id = db.query(RagChunk.document_id).filter_by(chunk_id=link.chunk_id).scalar()
+    if not document_id:
+        return False
+
+    return (
+        db.query(RagDocument.id)
+        .filter_by(document_id=document_id, project_id=project_id)
+        .first()
+        is not None
+    )
+
+
 def _evidence_link_to_read(link: EvidenceLink) -> EvidenceLinkRead:
     return EvidenceLinkRead(
         evidence_id=link.evidence_id,
@@ -1627,6 +1793,319 @@ def _evidence_link_to_read(link: EvidenceLink) -> EvidenceLinkRead:
         confidence=link.confidence,
         rationale=link.rationale,
     )
+
+
+def _database_evidence_to_read(
+    db: Session,
+    project_id: str,
+    evidence_id: str,
+) -> EvidenceLinkRead | None:
+    parts = evidence_id.split(":", 2)
+    if len(parts) != 3 or parts[0] != "DB":
+        return None
+
+    evidence_type = parts[1].upper()
+    record_id = parts[2]
+    if not record_id:
+        return None
+
+    if evidence_type == "FILTER":
+        rule_filter = db.query(RuleFilterResult).filter_by(filter_result_id=record_id).one_or_none()
+        if rule_filter is None:
+            return None
+        molecule = _project_molecule(db, project_id, rule_filter.molecule_id)
+        if molecule is None:
+            return None
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_rule_filter",
+            rationale=_rule_filter_evidence_summary(rule_filter),
+        )
+
+    molecule = _project_molecule(db, project_id, record_id)
+    if molecule is None:
+        return None
+
+    if evidence_type == "MOL":
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_molecule",
+            rationale=_molecule_evidence_summary(molecule),
+        )
+    if evidence_type == "PROP":
+        properties = (
+            db.query(MoleculeProperty)
+            .filter_by(molecule_id=molecule.molecule_id)
+            .order_by(MoleculeProperty.created_at.desc(), MoleculeProperty.id.desc())
+            .first()
+        )
+        if properties is None:
+            return None
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_properties",
+            rationale=_properties_evidence_summary(properties),
+        )
+    if evidence_type == "RULE_FILTER":
+        rule_filter = (
+            db.query(RuleFilterResult)
+            .filter_by(project_id=project_id, molecule_id=molecule.molecule_id)
+            .order_by(RuleFilterResult.created_at.desc(), RuleFilterResult.id.desc())
+            .first()
+        )
+        if rule_filter is None:
+            return None
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_rule_filter",
+            rationale=_rule_filter_evidence_summary(rule_filter),
+        )
+    if evidence_type == "CONFORMER":
+        conformer = (
+            db.query(ConformerResult)
+            .filter_by(molecule_id=molecule.molecule_id)
+            .order_by(ConformerResult.created_at.desc(), ConformerResult.id.desc())
+            .first()
+        )
+        if conformer is None:
+            return None
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_conformer",
+            rationale=_conformer_evidence_summary(conformer),
+        )
+    if evidence_type in {"DOCKING", "DOCK"}:
+        docking = (
+            db.query(DockingResult)
+            .filter_by(molecule_id=molecule.molecule_id)
+            .order_by(DockingResult.created_at.desc(), DockingResult.id.desc())
+            .first()
+        )
+        if docking is None:
+            return None
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_docking",
+            rationale=_docking_evidence_summary(docking),
+        )
+    if evidence_type == "ADMET":
+        admet = (
+            db.query(ADMETResult)
+            .filter_by(molecule_id=molecule.molecule_id)
+            .order_by(ADMETResult.created_at.desc(), ADMETResult.id.desc())
+            .first()
+        )
+        if admet is None:
+            return None
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_admet",
+            rationale=_admet_evidence_summary(admet),
+        )
+    if evidence_type in {"SYNTHESIS", "SYNTH"}:
+        synthesis = (
+            db.query(SynthesisRoute)
+            .filter_by(molecule_id=molecule.molecule_id)
+            .order_by(SynthesisRoute.created_at.desc(), SynthesisRoute.id.desc())
+            .first()
+        )
+        if synthesis is None:
+            return None
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_synthesis",
+            confidence=synthesis.route_confidence,
+            rationale=_synthesis_evidence_summary(synthesis),
+        )
+    if evidence_type == "RANK":
+        ranking = (
+            db.query(Ranking)
+            .filter_by(project_id=project_id, molecule_id=molecule.molecule_id)
+            .order_by(Ranking.created_at.desc(), Ranking.id.desc())
+            .first()
+        )
+        if ranking is None:
+            return None
+        return _synthetic_evidence_link(
+            evidence_id=evidence_id,
+            molecule_id=molecule.molecule_id,
+            claim_type="database_ranking",
+            confidence=ranking.evidence_confidence,
+            rationale=_ranking_evidence_summary(ranking),
+        )
+    return None
+
+
+def _project_molecule(db: Session, project_id: str, molecule_id: str) -> Molecule | None:
+    return db.query(Molecule).filter_by(project_id=project_id, molecule_id=molecule_id).one_or_none()
+
+
+def _synthetic_evidence_link(
+    *,
+    evidence_id: str,
+    molecule_id: str,
+    claim_type: str,
+    rationale: str,
+    confidence: float | None = None,
+) -> EvidenceLinkRead:
+    return EvidenceLinkRead(
+        evidence_id=evidence_id,
+        molecule_id=molecule_id,
+        chunk_id=None,
+        claim_type=claim_type,
+        confidence=confidence,
+        rationale=rationale,
+    )
+
+
+def _molecule_evidence_summary(molecule: Molecule) -> str:
+    return _compact_evidence_summary(
+        {
+            "table": "molecules",
+            "molecule_id": molecule.molecule_id,
+            "smiles": molecule.smiles,
+            "status": molecule.status,
+            "source_agent": molecule.source_agent,
+            "scaffold": molecule.scaffold,
+            "labels": molecule.labels or [],
+        }
+    )
+
+
+def _properties_evidence_summary(properties: MoleculeProperty) -> str:
+    return _compact_evidence_summary(
+        {
+            "table": "molecule_properties",
+            "molecule_id": properties.molecule_id,
+            "mw": properties.mw,
+            "logp": properties.logp,
+            "tpsa": properties.tpsa,
+            "hbd": properties.hbd,
+            "hba": properties.hba,
+            "sa_score": properties.sa_score,
+            "tool_metadata": properties.tool_metadata or {},
+        }
+    )
+
+
+def _rule_filter_evidence_summary(result: RuleFilterResult) -> str:
+    return _compact_evidence_summary(
+        {
+            "table": "rule_filter_results",
+            "filter_result_id": result.filter_result_id,
+            "molecule_id": result.molecule_id,
+            "rule_set": result.rule_set,
+            "decision": result.decision,
+            "failed_rules": result.failed_rules or [],
+            "warnings": result.warnings or [],
+            "labels": result.labels or [],
+            "properties_snapshot": result.properties_snapshot or {},
+            "raw_output": result.raw_output or {},
+        }
+    )
+
+
+def _conformer_evidence_summary(result: ConformerResult) -> str:
+    return _compact_evidence_summary(
+        {
+            "table": "conformer_results",
+            "molecule_id": result.molecule_id,
+            "conformer_generated": result.conformer_generated,
+            "conformer_count": result.conformer_count,
+            "lowest_energy": result.lowest_energy,
+            "strain_energy": result.strain_energy,
+            "rmsd_between_conformers": result.rmsd_between_conformers,
+            "labels": result.labels or [],
+            "raw_output": result.raw_output or {},
+        }
+    )
+
+
+def _docking_evidence_summary(result: DockingResult) -> str:
+    raw_output = result.raw_output or {}
+    pose_available = pose_artifact_available(result.pose_file)
+    return _compact_evidence_summary(
+        {
+            "table": "docking_results",
+            "molecule_id": result.molecule_id,
+            "tool_run_id": result.tool_run_id,
+            "vina_score": result.vina_score,
+            "cnn_score": result.cnn_score,
+            "diffdock_confidence": result.diffdock_confidence,
+            "key_hbond_count": result.key_hbond_count,
+            "clash_count": result.clash_count,
+            "pose_file": result.pose_file,
+            "pose_artifact_available": pose_available,
+            "pose_coordinates": pose_coordinates_from_file(result.pose_file) if pose_available else None,
+            "selected_pose_rank": raw_output.get("selected_pose_rank"),
+            "pose_count": raw_output.get("pose_count"),
+            "pose_selection_method": raw_output.get("pose_selection_method"),
+            "best_pose_confirmed": raw_output.get("best_pose_confirmed"),
+            "labels": result.labels or [],
+            "raw_output": raw_output,
+        }
+    )
+
+
+def _admet_evidence_summary(result: ADMETResult) -> str:
+    return _compact_evidence_summary(
+        {
+            "table": "admet_results",
+            "molecule_id": result.molecule_id,
+            "hERG_probability": result.hERG_probability,
+            "hERG_risk": result.hERG_risk,
+            "Ames_probability": result.Ames_probability,
+            "Ames_risk": result.Ames_risk,
+            "solubility": result.solubility,
+            "permeability": result.permeability,
+            "admet_risk_score": result.admet_risk_score,
+            "labels": result.labels or [],
+            "raw_output": result.raw_output or {},
+        }
+    )
+
+
+def _synthesis_evidence_summary(result: SynthesisRoute) -> str:
+    return _compact_evidence_summary(
+        {
+            "table": "synthesis_routes",
+            "molecule_id": result.molecule_id,
+            "route_found": result.route_found,
+            "route_steps": result.route_steps,
+            "route_confidence": result.route_confidence,
+            "buyable_building_blocks": result.buyable_building_blocks,
+            "labels": result.labels or [],
+            "route_json": result.route_json or {},
+        }
+    )
+
+
+def _ranking_evidence_summary(result: Ranking) -> str:
+    return _compact_evidence_summary(
+        {
+            "table": "rankings",
+            "molecule_id": result.molecule_id,
+            "rank": result.rank,
+            "pro_score": result.pro_score,
+            "con_score": result.con_score,
+            "evidence_confidence": result.evidence_confidence,
+            "overall_score": result.overall_score,
+            "final_decision": result.final_decision,
+            "score_breakdown": result.score_breakdown or {},
+        }
+    )
+
+
+def _compact_evidence_summary(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
 def _reasoning_trace_to_read(trace: ReasoningTrace) -> ReasoningTraceRead:
@@ -1702,10 +2181,12 @@ def _docking_result_to_read(result) -> DockingResultRead:
         molecule_id=result.molecule_id,
         vina_score=result.vina_score,
         cnn_score=result.cnn_score,
+        diffdock_confidence=result.diffdock_confidence,
         key_hbond_count=result.key_hbond_count,
         clash_count=result.clash_count,
         pose_file=result.pose_file,
         labels=result.labels or [],
+        raw_output=result.raw_output or {},
     )
 
 

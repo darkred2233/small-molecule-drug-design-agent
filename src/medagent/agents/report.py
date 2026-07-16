@@ -18,15 +18,16 @@ from sqlalchemy.orm import Session
 
 from medagent.agents.advisor import AdvisorReport
 from medagent.agents.ranker import MoleculeScore, RankingResult
-from medagent.agents.self_refutation import RefutationResult
 from medagent.db.models import (
     ADMETResult,
+    Critique,
     DockingResult,
     Molecule,
     MoleculeProperty,
     Project,
     SynthesisRoute,
 )
+from medagent.services.docking_adapters import pose_artifact_available
 
 
 @dataclass
@@ -39,7 +40,8 @@ class ExecutiveSummary:
     recommended_candidates: list[str]
     key_achievements: list[str]
     main_challenges: list[str]
-    success_probability: float
+    candidate_readiness_score: float
+    score_semantics: str
     next_steps: list[str]
 
 
@@ -94,7 +96,6 @@ class ReportAgent:
         project: Project,
         ranking_result: RankingResult | None = None,
         advisor_report: AdvisorReport | None = None,
-        refutation_results: list[RefutationResult] | None = None,
         include_details: bool = True,
     ) -> ProjectReport:
         """
@@ -104,7 +105,6 @@ class ReportAgent:
             project: 项目
             ranking_result: 排序结果
             advisor_report: 建议报告
-            refutation_results: 反驳结果列表
             include_details: 是否包含详细分子报告
 
         Returns:
@@ -125,7 +125,8 @@ class ReportAgent:
         detailed_molecules = []
         if include_details and ranking_result:
             detailed_molecules = self._generate_detailed_reports(
-                ranking_result, refutation_results
+                ranking_result,
+                self._get_critiques_for_ranking(ranking_result),
             )
 
         visualization_data = self._generate_visualization_data(
@@ -197,20 +198,23 @@ class ReportAgent:
                 for action in advisor_report.action_plan[:3]
             ]
 
-        # 成功概率
-        success_prob = 0.0
+        # 候选成熟度启发式评分；不得解释为项目成功概率
+        candidate_readiness_score = 0.0
+        score_semantics = "heuristic_not_probability"
         if advisor_report:
-            success_prob = advisor_report.success_probability
+            candidate_readiness_score = advisor_report.candidate_readiness_score
+            score_semantics = advisor_report.score_semantics
 
         return ExecutiveSummary(
-            project_name=project.project_name,
+            project_name=self._project_name(project),
             report_date=datetime.utcnow().strftime("%Y-%m-%d"),
             total_candidates=len(molecules),
             excellent_candidates=excellent_count,
             recommended_candidates=recommended,
             key_achievements=achievements,
             main_challenges=challenges,
-            success_probability=success_prob,
+            candidate_readiness_score=candidate_readiness_score,
+            score_semantics=score_semantics,
             next_steps=next_steps,
         )
 
@@ -229,9 +233,9 @@ class ReportAgent:
 
         return {
             "project_id": project.project_id,
-            "project_name": project.project_name,
-            "target_protein": project.target_protein,
-            "disease_area": project.disease_area,
+            "project_name": self._project_name(project),
+            "target_protein": getattr(project, "target_protein", None) or project.target_id,
+            "disease_area": getattr(project, "disease_area", None) or project.objective,
             "status": project.status,
             "total_molecules": len(molecules),
             "evaluation_completeness": {
@@ -258,10 +262,49 @@ class ReportAgent:
             },
         }
 
+    def _get_critiques_for_ranking(self, ranking_result: RankingResult) -> list[Critique]:
+        molecule_ids = [
+            mol_score.molecule_id
+            for mol_score in ranking_result.ranked_molecules[:10]
+        ]
+        if not molecule_ids:
+            return []
+        return (
+            self.db.query(Critique)
+            .filter(Critique.molecule_id.in_(molecule_ids))
+            .all()
+        )
+
+    def _analyze_critique(self, critique: Critique) -> dict[str, Any]:
+        llm_critique = critique.llm_critique_json or {}
+        if not isinstance(llm_critique, dict):
+            llm_critique = {}
+        verdict = llm_critique.get("verdict") or {}
+        decision = critique.refutation_decision or "unknown"
+        assessment_map = {
+            "pass": "recommended",
+            "reserve": "questionable",
+            "reject": "rejected",
+        }
+        return {
+            "assessment": assessment_map.get(decision, decision),
+            "decision": decision,
+            "con_score": critique.con_score,
+            "risk_level": critique.risk_level,
+            "reason": critique.reason,
+            "evidence_ids": critique.evidence_ids or [],
+            "llm_provider": critique.llm_provider,
+            "analysis_method": critique.analysis_method,
+            "hidden_risks": llm_critique.get("hidden_risks", []),
+            "evidence_concerns": llm_critique.get("evidence_concerns", []),
+            "analogy_failures": llm_critique.get("analogy_failures", []),
+            "verdict": verdict,
+        }
+
     def _generate_detailed_reports(
         self,
         ranking_result: RankingResult,
-        refutation_results: list[RefutationResult] | None,
+        refutation_results: list[Critique] | None = None,
     ) -> list[MoleculeDetailedReport]:
         """生成详细分子报告"""
 
@@ -303,14 +346,7 @@ class ReportAgent:
             refutation_summary = None
             refutation = refutation_dict.get(mol_score.molecule_id)
             if refutation:
-                refutation_summary = {
-                    "assessment": refutation.overall_assessment,
-                    "confidence": refutation.confidence_score,
-                    "critical_issues": len([p for p in refutation.refutation_points if p.severity == "critical"]),
-                    "high_issues": len([p for p in refutation.refutation_points if p.severity == "high"]),
-                    "strengths": refutation.strengths,
-                    "weaknesses": refutation.weaknesses,
-                }
+                refutation_summary = self._analyze_critique(refutation)
 
             # 推荐意见
             recommendation = self._generate_molecule_recommendation(
@@ -319,7 +355,7 @@ class ReportAgent:
 
             detailed_reports.append(MoleculeDetailedReport(
                 molecule_id=molecule.molecule_id,
-                mol_name=molecule.mol_name or f"Molecule-{mol_score.rank}",
+                mol_name=getattr(molecule, "mol_name", None) or f"Molecule-{mol_score.rank}",
                 smiles=molecule.smiles,
                 rank=mol_score.rank,
                 tier=mol_score.tier,
@@ -336,21 +372,25 @@ class ReportAgent:
 
     def _analyze_structure(self, mol_property: MoleculeProperty) -> dict[str, Any]:
         """分析结构"""
+        metadata = mol_property.tool_metadata or {}
+        lipinski_violations = self._lipinski_violations(mol_property)
+        labels = metadata.get("labels") or []
         return {
             "molecular_weight": mol_property.mw,
             "logp": mol_property.logp,
             "tpsa": mol_property.tpsa,
             "hbd": mol_property.hbd,
             "hba": mol_property.hba,
-            "rotatable_bonds": mol_property.tool_metadata.get("rotatable_bond_count"),
-            "qed": mol_property.qed,
-            "lipinski_compliant": mol_property.lipinski_compliant,
-            "lipinski_violations": mol_property.lipinski_violations,
-            "structural_alerts": "pains_alert" in mol_property.labels,
+            "rotatable_bonds": metadata.get("rotatable_bond_count"),
+            "qed": metadata.get("qed"),
+            "lipinski_compliant": lipinski_violations == 0,
+            "lipinski_violations": lipinski_violations,
+            "structural_alerts": any("alert" in label for label in labels),
         }
 
     def _analyze_admet(self, admet_result: ADMETResult) -> dict[str, Any]:
         """分析ADMET"""
+        raw_output = admet_result.raw_output or {}
         return {
             "hERG": {
                 "probability": admet_result.hERG_probability,
@@ -361,48 +401,74 @@ class ReportAgent:
                 "risk": admet_result.Ames_risk,
             },
             "cyp3a4": {
-                "inhibition": admet_result.CYP3A4_inhibition,
-                "risk": admet_result.CYP3A4_risk,
+                "inhibition": raw_output.get("CYP3A4_inhibition"),
+                "risk": raw_output.get("CYP3A4_risk"),
             },
             "solubility": admet_result.solubility,
             "permeability": admet_result.permeability,
             "dili": {
-                "probability": admet_result.DILI_probability,
-                "risk": admet_result.DILI_risk,
+                "probability": raw_output.get("DILI_probability"),
+                "risk": raw_output.get("DILI_risk"),
             },
         }
 
     def _analyze_docking(self, docking_result: DockingResult) -> dict[str, Any]:
         """分析对接"""
+        raw_output = docking_result.raw_output or {}
+        selected_pose_rank = raw_output.get("selected_pose_rank")
+        pose_selection_method = raw_output.get("pose_selection_method")
+        pose_available = pose_artifact_available(docking_result.pose_file)
+        best_pose_confirmed = raw_output.get("best_pose_confirmed")
+        if best_pose_confirmed is None:
+            best_pose_confirmed = bool(
+                selected_pose_rank == 1
+                and pose_selection_method
+                and "not_confirmed" not in pose_selection_method
+            )
+        best_pose_confirmed = bool(best_pose_confirmed and pose_available)
         return {
-            "tool": docking_result.tool_name,
+            "tool": getattr(docking_result, "tool_name", None) or docking_result.tool_run_id,
             "vina_score": docking_result.vina_score,
             "cnn_score": docking_result.cnn_score,
-            "cnn_affinity": docking_result.cnn_affinity,
-            "pose_file": docking_result.pose_file,
+            "diffdock_confidence": docking_result.diffdock_confidence,
+            "cnn_affinity": getattr(docking_result, "cnn_affinity", None),
+            "pose_file": docking_result.pose_file if pose_available else None,
+            "pose_artifact_available": pose_available,
+            "selected_pose_rank": selected_pose_rank,
+            "pose_count": raw_output.get("pose_count"),
+            "pose_selection_method": pose_selection_method,
+            "best_pose_confirmed": best_pose_confirmed,
+            "raw_output": raw_output,
         }
 
     def _analyze_synthesis(self, synthesis_route: SynthesisRoute) -> dict[str, Any]:
         """分析合成"""
+        route_json = synthesis_route.route_json or {}
         return {
-            "sa_score": synthesis_route.sa_score,
-            "complexity_level": synthesis_route.complexity_level,
+            "sa_score": route_json.get("sa_score"),
+            "complexity_level": route_json.get("complexity_level"),
             "route_found": synthesis_route.route_found,
-            "num_steps": synthesis_route.num_steps,
+            "num_steps": synthesis_route.route_steps,
         }
 
     def _generate_molecule_recommendation(
         self,
         mol_score: MoleculeScore,
-        refutation: RefutationResult | None,
+        refutation: Critique | None,
     ) -> str:
         """生成分子推荐意见"""
 
-        if mol_score.tier == "excellent" and (not refutation or refutation.overall_assessment == "recommended"):
+        decision = refutation.refutation_decision if refutation else "pass"
+        risk_level = refutation.risk_level if refutation else "low"
+
+        if decision == "reject" or risk_level == "high":
+            return "不推荐：自我反驳发现高风险或淘汰建议，不建议继续投入资源"
+
+        if mol_score.tier == "excellent" and decision == "pass":
             return "强烈推荐：该分子表现优异，建议优先推进合成和测试"
 
         elif mol_score.tier == "excellent" or mol_score.tier == "good":
-            if refutation and refutation.overall_assessment == "questionable":
+            if decision == "reserve" or risk_level == "medium":
                 return "谨慎推荐：分子整体良好但存在一些问题，建议优化后再推进"
             else:
                 return "推荐：该分子表现良好，可列入候选清单"
@@ -459,7 +525,7 @@ class ReportAgent:
         for mol_score in ranking_result.ranked_molecules:
             score = mol_score.final_score
             for i in range(len(bins) - 1):
-                if bins[i] <= score < bins[i + 1]:
+                if bins[i] <= score < bins[i + 1] or (i == len(bins) - 2 and score >= bins[i + 1]):
                     distribution[labels[i]] += 1
                     break
 
@@ -546,19 +612,23 @@ class ReportAgent:
             admet = self._get_admet(molecule.molecule_id)
             if not admet:
                 continue
+            raw_output = admet.raw_output or {}
 
             # 转换为0-1分数
             row = [
                 self._risk_to_score(admet.hERG_risk),
                 self._risk_to_score(admet.Ames_risk),
-                self._risk_to_score(admet.CYP3A4_risk),
+                self._risk_to_score(raw_output.get("CYP3A4_risk")),
                 self._solubility_to_score(admet.solubility),
-                self._risk_to_score(admet.DILI_risk),
+                self._risk_to_score(raw_output.get("DILI_risk")),
             ]
             heatmap_data.append(row)
 
         return {
-            "molecules": [m.mol_name or m.molecule_id[:8] for m in top_molecules[:len(heatmap_data)]],
+            "molecules": [
+                getattr(m, "mol_name", None) or m.molecule_id[:8]
+                for m in top_molecules[:len(heatmap_data)]
+            ],
             "properties": properties,
             "data": heatmap_data,
         }
@@ -614,6 +684,21 @@ class ReportAgent:
         }
 
     # 辅助方法
+    def _project_name(self, project: Project) -> str:
+        return getattr(project, "project_name", None) or getattr(project, "name", project.project_id)
+
+    def _lipinski_violations(self, mol_property: MoleculeProperty) -> int:
+        violations = 0
+        if mol_property.mw is not None and mol_property.mw > 500:
+            violations += 1
+        if mol_property.logp is not None and mol_property.logp > 5:
+            violations += 1
+        if mol_property.hbd is not None and mol_property.hbd > 5:
+            violations += 1
+        if mol_property.hba is not None and mol_property.hba > 10:
+            violations += 1
+        return violations
+
     def _get_property(self, molecule_id: str) -> MoleculeProperty | None:
         return self.db.query(MoleculeProperty).filter_by(molecule_id=molecule_id).first()
 

@@ -1,9 +1,9 @@
-FROM python:3.11-slim
+ARG PYTORCH_BASE_IMAGE=m.daocloud.io/docker.io/pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+FROM ${PYTORCH_BASE_IMAGE}
 
 WORKDIR /app
 
-ARG DEBIAN_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
-ARG DEBIAN_SECURITY_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian-security
+ARG UBUNTU_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
@@ -11,18 +11,12 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_RETRIES=20 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Use China-friendly package mirrors. The sed block supports both old and new
-# Debian slim image source-list formats.
+# Use China-friendly package mirrors for Ubuntu
 RUN set -eux; \
-    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+    if [ -f /etc/apt/sources.list ]; then \
         sed -i \
-            -e "s|http://deb.debian.org/debian|${DEBIAN_APT_MIRROR}|g" \
-            -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
-            /etc/apt/sources.list.d/debian.sources; \
-    elif [ -f /etc/apt/sources.list ]; then \
-        sed -i \
-            -e "s|http://deb.debian.org/debian|${DEBIAN_APT_MIRROR}|g" \
-            -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+            -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_APT_MIRROR}|g" \
+            -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_APT_MIRROR}|g" \
             /etc/apt/sources.list; \
     fi
 
@@ -35,9 +29,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     build-essential \
     ca-certificates
 
-# Install Chemprop
+# Install the Chemprop version validated with the project's ADMET-AI environment.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install chemprop
+    pip install chemprop==2.2.4
 
 # Create directories for I/O
 RUN mkdir -p /data/input /data/output /data/models

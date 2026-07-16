@@ -1,3 +1,5 @@
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +17,7 @@ from medagent.db.models import (
     RuleFilterResult,
     SynthesisRoute,
 )
+from medagent.llm import LLMMessage, get_llm_client
 from medagent.services.ids import new_id
 from medagent.services.rag import query_project_rag
 
@@ -30,6 +33,9 @@ class CritiqueBlueprint:
     evidence_ids: list[str]
     refutation_decision: str
     warnings: list[str]
+    llm_critique_json: dict | None = None
+    llm_provider: str | None = None
+    analysis_method: str = "heuristic_self_refutation"
 
 
 def generate_project_critiques(
@@ -45,6 +51,7 @@ def generate_project_critiques(
     decision_counts = {"pass": 0, "reserve": 0, "reject": 0}
     evidence_ids: list[str] = []
     warnings: list[str] = []
+    llm_critique_count = 0
 
     for molecule, ranking in candidates:
         blueprint = _build_critique_blueprint(db, project, settings, molecule, ranking)
@@ -55,6 +62,8 @@ def generate_project_critiques(
         decision_counts[blueprint.refutation_decision] += 1
         evidence_ids.extend(blueprint.evidence_ids)
         warnings.extend(blueprint.warnings)
+        if blueprint.llm_critique_json is not None:
+            llm_critique_count += 1
 
     db.commit()
     return {
@@ -67,6 +76,16 @@ def generate_project_critiques(
         "decision_counts": decision_counts,
         "evidence_ids": _dedupe(evidence_ids),
         "warnings": _dedupe(warnings),
+        "llm_requested": bool(
+            settings and getattr(settings, "self_refutation_use_llm", False)
+        ),
+        "llm_critique_count": llm_critique_count,
+        "heuristic_critique_count": len(candidates) - llm_critique_count,
+        "execution_method": (
+            "llm_assisted_self_refutation"
+            if llm_critique_count
+            else "heuristic_self_refutation"
+        ),
     }
 
 
@@ -177,7 +196,38 @@ def _build_critique_blueprint(
         existing_links,
         rag_evidence_ids,
     )
+
+    # LLM 质询（如果启用）
+    llm_critique_json = None
+    llm_provider = None
+    llm_con_adjustment = 0.0
+    analysis_method = "heuristic_self_refutation"
+
+    use_llm = settings and getattr(settings, 'self_refutation_use_llm', False)
+    if use_llm:
+        llm_result = _llm_critique(
+            settings,
+            project,
+            molecule,
+            ranking,
+            admet,
+            docking,
+            risk_factors,
+            blockers,
+            warnings,
+        )
+        if llm_result:
+            llm_critique_json = llm_result["critique"]
+            llm_provider = llm_result["provider"]
+            llm_con_adjustment = llm_result["con_adjustment"]
+            analysis_method = "llm_assisted_self_refutation"
+        else:
+            analysis_method = "heuristic_fallback_after_llm_failure"
+            warnings.append("llm_self_refutation_failed_using_heuristic")
+
     con_score = _con_score(ranking, risk_factors, blockers, warnings, rag_evidence_ids)
+    con_score = min(100.0, con_score + llm_con_adjustment)  # 叠加 LLM 调整
+
     risk_level = _risk_level(con_score)
     refutation_decision = _refutation_decision(ranking, con_score, blockers, warnings)
     reason = _reason(molecule, ranking, con_score, refutation_decision, risk_factors, blockers, warnings)
@@ -189,7 +239,155 @@ def _build_critique_blueprint(
         evidence_ids=evidence_ids,
         refutation_decision=refutation_decision,
         warnings=warnings,
+        llm_critique_json=llm_critique_json,
+        llm_provider=llm_provider,
+        analysis_method=analysis_method,
     )
+
+
+def _llm_critique(
+    settings: Settings,
+    project: Project,
+    molecule: Molecule,
+    ranking: Ranking | None,
+    admet: ADMETResult | None,
+    docking: DockingResult | None,
+    risk_factors: list[str],
+    blockers: list[str],
+    warnings: list[str],
+) -> dict | None:
+    """使用 LLM 进行深度质询，识别隐藏风险"""
+
+    # 构建分子摘要
+    summary = _build_molecule_summary(
+        molecule, ranking, admet, docking, risk_factors, blockers, warnings
+    )
+
+    prompt = f"""你是药物开发风险评估专家。请对以下候选分子进行严格的自我反驳质询。
+
+## 项目背景
+靶点: {project.target_protein or 'unknown'}
+疾病领域: {project.disease_area or 'unknown'}
+
+## 候选分子信息
+{summary}
+
+## 任务
+请从以下角度质询这个分子：
+
+1. **隐藏风险** (hidden_risks): 数据中未明显体现但可能存在的风险
+   - 结构特异性毒性（如反应性官能团）
+   - 代谢不稳定性
+   - 脱靶效应
+   - 专利侵权风险
+
+2. **证据质疑** (evidence_concerns): 现有评估数据的可靠性问题
+   - 预测模型的局限性
+   - 对接姿态的合理性
+   - ADMET 预测的置信度
+
+3. **类比失效** (analogy_failures): 与已知化合物类比可能误导的情况
+   - 结构相似但活性/毒性差异大的案例
+   - 看似安全但实际有问题的骨架
+
+4. **综合判断** (verdict): 基于以上分析，给出风险等级调整建议
+   - risk_adjustment: "increase" / "maintain" / "decrease"
+   - confidence: 0.0-1.0
+   - key_concern: 最关键的风险点
+
+请以 JSON 格式返回：
+{{
+  "hidden_risks": ["风险1", "风险2"],
+  "evidence_concerns": ["质疑1", "质疑2"],
+  "analogy_failures": ["案例1"],
+  "verdict": {{
+    "risk_adjustment": "increase/maintain/decrease",
+    "confidence": 0.0-1.0,
+    "key_concern": "最关键风险"
+  }}
+}}
+"""
+
+    try:
+        llm_client = get_llm_client()
+        response = llm_client.complete(
+            messages=[LLMMessage(role="user", content=prompt)],
+            provider=getattr(settings, 'self_refutation_provider', 'deepseek'),
+            model=getattr(settings, 'self_refutation_model', 'deepseek-chat'),
+            temperature=0.3,
+            max_tokens=1500,
+        )
+
+        # 解析 JSON 响应
+        content = response.content
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            return None
+
+        critique = json.loads(json_match.group())
+
+        # 计算 con_score 调整值
+        con_adjustment = 0.0
+        verdict = critique.get("verdict", {})
+
+        if verdict.get("risk_adjustment") == "increase":
+            con_adjustment = min(len(critique.get("hidden_risks", [])) * 5, 20)
+        elif verdict.get("risk_adjustment") == "decrease":
+            con_adjustment = -10
+
+        # 增加证据质疑的权重
+        con_adjustment += min(len(critique.get("evidence_concerns", [])) * 3, 12)
+
+        return {
+            "critique": critique,
+            "provider": getattr(settings, 'self_refutation_provider', 'deepseek'),
+            "con_adjustment": round(con_adjustment, 3),
+        }
+
+    except Exception as e:
+        print(f"LLM 质询失败: {e}")
+        return None
+
+
+def _build_molecule_summary(
+    molecule: Molecule,
+    ranking: Ranking | None,
+    admet: ADMETResult | None,
+    docking: DockingResult | None,
+    risk_factors: list[str],
+    blockers: list[str],
+    warnings: list[str],
+) -> str:
+    """构建分子数据摘要"""
+    lines = [
+        f"分子ID: {molecule.molecule_id}",
+        f"SMILES: {molecule.smiles}",
+    ]
+
+    if ranking:
+        lines.append(f"排名评分: overall_score={ranking.overall_score}, con_score={ranking.con_score}")
+        lines.append(f"决策: {ranking.final_decision}")
+
+    if admet:
+        lines.append(f"ADMET: hERG={admet.hERG_risk}, Ames={admet.Ames_risk}, 溶解度={admet.solubility}")
+
+    if docking:
+        lines.append(
+            "对接: "
+            f"Vina={docking.vina_score}, GNINA_CNN={docking.cnn_score}, "
+            f"DiffDock_confidence={docking.diffdock_confidence}, 冲突数={docking.clash_count}"
+        )
+
+    if risk_factors:
+        lines.append(f"风险因素: {', '.join(risk_factors[:5])}")
+
+    if blockers:
+        lines.append(f"阻断因素: {', '.join(blockers)}")
+
+    if warnings:
+        lines.append(f"警告: {', '.join(warnings[:3])}")
+
+    return "\n".join(lines)
 
 
 def _retrieve_counter_evidence(
@@ -259,6 +457,9 @@ def _upsert_critique(
     critique.reason = blueprint.reason
     critique.evidence_ids = blueprint.evidence_ids
     critique.refutation_decision = blueprint.refutation_decision
+    critique.llm_critique_json = blueprint.llm_critique_json
+    critique.llm_provider = blueprint.llm_provider
+    critique.analysis_method = blueprint.analysis_method
     return critique
 
 

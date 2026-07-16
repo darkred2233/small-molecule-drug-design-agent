@@ -34,12 +34,12 @@ type RunProgress = {
 };
 
 export default function AgentTimeline({ projectId }: AgentTimelineProps) {
-  // Poll status while pipeline is running
+  // Poll status while pipeline is running - increased frequency for better responsiveness
   const { data: status } = useQuery({
     queryKey: ['project-status', projectId],
     queryFn: () => projectsApi.getStatus(projectId),
     refetchInterval: (query) =>
-      query.state.data?.status === 'pipeline_running' ? 2000 : false,
+      query.state.data?.status === 'pipeline_running' ? 1000 : false, // Changed from 2000ms to 1000ms
   });
 
   if (!status || !status.agent_runs || status.agent_runs.length === 0) {
@@ -49,6 +49,20 @@ export default function AgentTimeline({ projectId }: AgentTimelineProps) {
       </div>
     );
   }
+
+  // Group runs by iteration for better multi-round display
+  const runsByIteration = status.agent_runs.reduce((acc, run) => {
+    const iteration = run.iteration ?? 1;
+    if (!acc[iteration]) {
+      acc[iteration] = [];
+    }
+    acc[iteration].push(run);
+    return acc;
+  }, {} as Record<number, typeof status.agent_runs>);
+
+  const iterations = Object.keys(runsByIteration)
+    .map(Number)
+    .sort((a, b) => b - a); // Sort descending to show latest first
 
   const successfulStatuses = new Set(['completed', 'success', 'succeeded']);
   const failedStatuses = new Set(['failed', 'error']);
@@ -180,39 +194,50 @@ export default function AgentTimeline({ projectId }: AgentTimelineProps) {
     return duration.toFixed(1) + 's';
   };
 
-  const timelineRuns = aggregateTimelineRuns(status.agent_runs);
-
   return (
-    <div className="space-y-1">
-      {timelineRuns.map((run, index) => {
-        const statusMeta = getStatusMeta(run.status);
-        const duration = getDuration(run);
-        const progress = getRunProgress(run);
+    <div className="space-y-4">
+      {iterations.map((iteration) => {
+        const iterationRuns = aggregateTimelineRuns(runsByIteration[iteration]);
 
         return (
-          <div
-            key={run.agent_run_id}
-            className={cn(
-              'agent-timeline-item relative',
-              index === status.agent_runs.length - 1 && 'pb-0'
+          <div key={iteration} className="space-y-1">
+            {iterations.length > 1 && (
+              <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-slate-600">
+                <div className="h-px flex-1 bg-slate-200"></div>
+                <span>第 {iteration} 轮</span>
+                <div className="h-px flex-1 bg-slate-200"></div>
+              </div>
             )}
-          >
-            {/* Timeline dot */}
-            <div className={cn('agent-timeline-dot', getTimelineStatusClass(run.status))}>
-              {getStatusIcon(run.status)}
-            </div>
 
-            {/* Content */}
-            <div className="ml-8">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="font-medium text-sm">
-                  {getAgentLabel(run.agent_name)}
-                  {run.aggregate_count && run.aggregate_count > 1 && (
-                    <span className="ml-2 rounded-full bg-cyan-50 px-2 py-0.5 text-[11px] font-medium text-cyan-700">
-                      {run.aggregate_count} 次
-                    </span>
+            {iterationRuns.map((run, index) => {
+              const statusMeta = getStatusMeta(run.status);
+              const duration = getDuration(run);
+              const progress = getRunProgress(run);
+
+              return (
+                <div
+                  key={run.agent_run_id}
+                  className={cn(
+                    'agent-timeline-item relative',
+                    index === iterationRuns.length - 1 && 'pb-0'
                   )}
-                </div>
+                >
+                  {/* Timeline dot */}
+                  <div className={cn('agent-timeline-dot', getTimelineStatusClass(run.status))}>
+                    {getStatusIcon(run.status)}
+                  </div>
+
+                  {/* Content */}
+                  <div className="ml-8">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="font-medium text-sm">
+                        {getAgentLabel(run.agent_name)}
+                        {run.aggregate_count && run.aggregate_count > 1 && (
+                          <span className="ml-2 rounded-full bg-cyan-50 px-2 py-0.5 text-[11px] font-medium text-cyan-700">
+                            {run.aggregate_count} 次
+                          </span>
+                        )}
+                      </div>
                 <div className="flex items-center gap-2">
                   <span
                     className={cn(
@@ -308,6 +333,9 @@ export default function AgentTimeline({ projectId }: AgentTimelineProps) {
               )}
             </div>
           </div>
+        );
+      })}
+    </div>
         );
       })}
     </div>

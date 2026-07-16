@@ -8,6 +8,7 @@ Ranker Agent
 2. 权重配置：根据项目目标调整权重
 3. 综合排序：生成最终排名
 4. 分层推荐：优秀/良好/可接受/淘汰
+5. 集成 LLM 质询结果（从 Critique 表）
 """
 
 from dataclasses import dataclass, field
@@ -15,9 +16,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from medagent.agents.self_refutation import RefutationResult, SelfRefutationAgent
 from medagent.db.models import (
     ADMETResult,
+    Critique,
     DockingResult,
     Molecule,
     MoleculeProperty,
@@ -58,10 +59,11 @@ class MoleculeScore:
     docking_score: float = 0.0
     synthesis_score: float = 0.0
     weighted_score: float = 0.0
-    refutation_score: float = 0.0
+    critique_con_score: float = 0.0  # 从 Critique 表读取
     final_score: float = 0.0
     rank: int = 0
     tier: str = "unranked"  # excellent, good, acceptable, poor
+    critique_decision: str | None = None  # pass, reserve, reject
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -80,19 +82,18 @@ class RankingResult:
 
 
 class RankerAgent:
-    """排序Agent"""
+    """排序Agent - 直接读取 Critique 表"""
 
     def __init__(self, db: Session):
         self.db = db
-        self.refutation_agent = SelfRefutationAgent(db)
 
     def rank_molecules(
         self,
         project: Project,
         molecules: list[Molecule],
         weights: RankingWeights | None = None,
-        use_refutation: bool = True,
-        strict_mode: bool = False,
+        use_critique: bool = True,
+        use_refutation: bool | None = None,
     ) -> RankingResult:
         """
         对分子进行综合排序
@@ -101,12 +102,15 @@ class RankerAgent:
             project: 项目
             molecules: 待排序的分子列表
             weights: 权重配置（None使用默认）
-            use_refutation: 是否使用反驳评分
-            strict_mode: 严格模式
+            use_critique: 是否使用 Critique 表的反驳评分
+            use_refutation: 旧参数名，保留为 use_critique 的兼容别名
 
         Returns:
             RankingResult
         """
+        if use_refutation is not None:
+            use_critique = use_refutation
+
         if not molecules:
             return RankingResult(
                 project_id=project.project_id,
@@ -120,22 +124,20 @@ class RankerAgent:
         else:
             weights.normalize()
 
-        # 获取反驳结果
-        refutation_results: dict[str, RefutationResult] = {}
-        if use_refutation:
-            refutations = self.refutation_agent.batch_refute(
-                project, molecules, strict_mode
-            )
-            refutation_results = {r.molecule_id: r for r in refutations}
+        # 从 Critique 表读取反驳结果（包含 LLM 质询）
+        critique_map: dict[str, Critique] = {}
+        if use_critique:
+            molecule_ids = [m.molecule_id for m in molecules]
+            critiques = self.db.query(Critique).filter(
+                Critique.molecule_id.in_(molecule_ids)
+            ).all()
+            critique_map = {c.molecule_id: c for c in critiques}
 
         # 计算每个分子的评分
         molecule_scores: list[MoleculeScore] = []
         for molecule in molecules:
-            score = self._calculate_molecule_score(
-                molecule,
-                weights,
-                refutation_results.get(molecule.molecule_id),
-            )
+            critique = critique_map.get(molecule.molecule_id)
+            score = self._calculate_molecule_score(molecule, weights, critique)
             molecule_scores.append(score)
 
         # 排序
@@ -189,7 +191,7 @@ class RankerAgent:
         self,
         molecule: Molecule,
         weights: RankingWeights,
-        refutation_result: RefutationResult | None,
+        critique: Critique | None,
     ) -> MoleculeScore:
         """计算单个分子的综合评分"""
 
@@ -224,23 +226,33 @@ class RankerAgent:
             synthesis_score * weights.synthesis_weight
         )
 
-        # 反驳评分影响
-        refutation_score = 0.0
-        if refutation_result:
-            refutation_score = refutation_result.confidence_score * 100
+        # 使用 Critique 表的 con_score（包含 LLM 质询结果）
+        critique_con_score = 0.0
+        critique_decision = None
+        final_score = weighted_score
 
-            # 根据反驳评估调整最终分数
-            if refutation_result.overall_assessment == "rejected":
-                final_score = min(weighted_score * 0.3, 40)  # 严重惩罚
-            elif refutation_result.overall_assessment == "questionable":
-                final_score = weighted_score * 0.7  # 中度惩罚
-            elif refutation_result.overall_assessment == "acceptable":
-                final_score = weighted_score * 0.9  # 轻度惩罚
-            else:  # recommended
-                final_score = weighted_score * 1.1  # 奖励
-                final_score = min(final_score, 100)  # 上限100
-        else:
-            final_score = weighted_score
+        if critique:
+            critique_con_score = critique.con_score or 0.0
+            critique_decision = critique.refutation_decision
+
+            # 根据 con_score 和 refutation_decision 调整最终分数
+            # con_score 越高，扣分越多
+            if critique_decision == "reject":
+                # 强烈建议淘汰
+                final_score = min(weighted_score * 0.3, 40)
+            elif critique_decision == "reserve":
+                # 进入备选，适度惩罚
+                penalty = min(critique_con_score * 0.5, 30)
+                final_score = weighted_score - penalty
+            elif critique_decision == "pass":
+                # 通过，轻度或不惩罚
+                if critique_con_score > 20:
+                    penalty = (critique_con_score - 20) * 0.3
+                    final_score = weighted_score - penalty
+                # 否则不扣分
+
+            # 确保最终分数在合理范围
+            final_score = max(0.0, min(100.0, final_score))
 
         return MoleculeScore(
             molecule_id=molecule.molecule_id,
@@ -249,12 +261,15 @@ class RankerAgent:
             docking_score=round(docking_score, 2),
             synthesis_score=round(synthesis_score, 2),
             weighted_score=round(weighted_score, 2),
-            refutation_score=round(refutation_score, 2),
+            critique_con_score=round(critique_con_score, 2),
             final_score=round(final_score, 2),
+            critique_decision=critique_decision,
             details={
                 "smiles": molecule.smiles,
                 "mol_name": molecule.mol_name,
-                "refutation_assessment": refutation_result.overall_assessment if refutation_result else None,
+                "critique_risk_level": critique.risk_level if critique else None,
+                "critique_reason": critique.reason if critique else None,
+                "llm_provider": critique.llm_provider if critique else None,
             },
         )
 

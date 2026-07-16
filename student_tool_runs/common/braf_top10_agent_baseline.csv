@@ -1,0 +1,12 @@
+rank,molecule_id,smiles,overall_score,final_decision,mw,logp,tpsa,hbd,hba,sa_score,rotb,qed,vina_score,cnn_score,key_hbond_count,clash_count,route_found,route_steps,route_confidence,buyable_building_blocks
+1,MOL-D87CC67DED,O=C(NCCO)c1ccccc1,69.340,watch,165.192,0.409,49.33,2,2,2.130,3,0.681,-3.41,,4,0,1,1,0.99,3
+2,MOL-450DC51730,CCCS(=O)(=O)Nc1ccc(F)c(C(=O)c2c[nH]c3ncc(SCC(=O)O)cc23)c1F,59.461,watch,469.491,3.401,129.22,3,6,4.715,9,0.324,-3.52,,5,0,1,3,0.987,6
+3,MOL-14EA0E2E97,NC(=O)c1ccccc1,37.521,deprioritize,121.139,0.786,43.09,1,1,1.885,1,0.586,-5.77,0.71,2,0,1,2,0.862,2
+4,MOL-74243C4ADE,O=C(O)c1ccccc1,37.521,deprioritize,122.123,1.385,37.30,1,1,1.885,1,0.611,-5.77,0.71,2,0,1,2,0.862,2
+5,MOL-657EB271C8,CCOC(=O)c1ccc(F)cc1,37.006,deprioritize,168.167,2.002,26.30,0,2,2.130,2,0.631,-5.95,0.71,2,0,1,3,0.837,3
+6,MOL-1294D2A393,CCNc1ccc(F)cc1,36.598,deprioritize,139.173,2.258,12.03,1,1,1.940,2,0.662,-5.85,0.71,2,0,1,2,0.856,2
+7,MOL-1484D1B68C,CCNc1ccccc1,36.271,deprioritize,121.183,2.118,12.03,1,1,1.805,2,0.632,-5.77,0.71,2,0,1,2,0.870,2
+8,MOL-2E79BDA8AA,CCN(CC)C(=O)c1ccccc1,35.116,deprioritize,177.247,2.169,20.31,0,1,2.105,3,0.693,-5.91,0.63,1,0,1,3,0.840,2
+9,MOL-9F0D6669C1,COc1ccccc1,34.732,deprioritize,108.140,1.695,9.23,0,1,1.750,1,0.532,-5.51,0.63,1,0,1,2,0.875,2
+10,MOL-908DD17F4D,CCOc1ccc(F)cc1,34.136,deprioritize,140.157,2.224,9.23,0,1,1.940,2,0.612,-5.67,0.63,1,0,1,2,0.856,2
+

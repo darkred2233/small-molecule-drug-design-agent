@@ -161,6 +161,27 @@ export interface RagChunk {
   section?: string;
 }
 
+export interface RagChunkRead {
+  chunk_id: string;
+  document_id: string;
+  page_number?: number;
+  section?: string;
+  content: string;
+  embedding_model?: string;
+  embedding_ref?: string;
+  token_count?: number;
+  metadata?: Record<string, any>;
+}
+
+export interface EvidenceLink {
+  evidence_id: string;
+  molecule_id: string | null;
+  chunk_id: string | null;
+  claim_type: string;
+  confidence: number | null;
+  rationale: string | null;
+}
+
 export interface RagQueryRequest {
   query: string;
   query_type?: string;
@@ -175,12 +196,19 @@ export interface RagQueryResponse {
   query_type: string;
   retrieved_chunks: RagRetrievedChunk[];
   evidence_ids: string[];
-  confidence: number;
+  confidence: number | null;
+  confidence_semantics: string;
+  retrieval_support_score: number;
+  retrieval_support_score_semantics: string;
+  embedding_model: string;
+  rerank_model: string | null;
+  retrieval_method: string;
   missing_information: string[];
   adapter_mode: string;
 }
 
 export interface RagRetrievedChunk {
+  retrieval_rank: number;
   chunk_id: string;
   document_id: string;
   source_type: string;
@@ -188,8 +216,17 @@ export interface RagRetrievedChunk {
   source: string | null;
   page: number | null;
   section: string | null;
+  vector_score: number;
+  keyword_score: number;
   combined_score: number;
+  rerank_score: number | null;
+  retrieval_method: string;
+  score_semantics: string;
+  embedding_model: string;
+  rerank_model: string | null;
   evidence_id: string | null;
+  evidence_confidence: number | null;
+  evidence_confidence_semantics: string;
   evidence_summary: string;
   content: string;
 }
@@ -277,6 +314,7 @@ export interface CandidateAssessmentRunResponse {
 export interface DockingResult {
   docking_score?: number;
   cnn_score?: number;
+  diffdock_confidence?: number;
   pose_file?: string;
   key_interactions?: string[];
 }
@@ -372,6 +410,7 @@ export interface AgentRun {
   agent_name: string;
   model_name: string | null;
   status: string;
+  iteration?: number | null;
   output_json?: Record<string, any>;
   started_at?: string;
   ended_at?: string;
@@ -519,6 +558,12 @@ export interface AdmetSummary {
   BBB?: unknown;
   labels?: string[];
   adapter_mode?: string | null;
+  tool_name?: string | null;
+  tool_version?: string | null;
+  model_name?: string | null;
+  model_count?: number | null;
+  compute_device?: string | null;
+  result_kind?: string | null;
 }
 
 export interface SynthesisOverview {
@@ -539,6 +584,10 @@ export interface SynthesisSummary {
   buyable_building_blocks?: number | null;
   SA_score?: number | null;
   SCScore?: number | null;
+  estimated_route_feasible?: boolean | null;
+  estimated_route_steps?: number | null;
+  estimated_route_confidence?: number | null;
+  estimated_buyable_building_blocks?: number | null;
   hazardous_reaction_count?: number | null;
   protecting_group_count?: number | null;
   route_summary?: string | null;
@@ -547,23 +596,57 @@ export interface SynthesisSummary {
   route_risks?: string[];
   route_note?: string | null;
   adapter_mode?: string | null;
+  result_kind?: string | null;
+  route_metadata?: Record<string, any> | null;
+  has_reaction_tree?: boolean;
   labels?: string[];
+}
+
+export interface PoseAtomCoordinate {
+  index: number;
+  element: string;
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface PoseCoordinates {
+  format: string;
+  atom_count: number;
+  returned_atom_count: number;
+  truncated: boolean;
+  atoms: PoseAtomCoordinate[];
 }
 
 export interface DockingSummary {
   vina_score?: number | null;
   cnn_score?: number | null;
+  diffdock_confidence?: number | null;
   key_hbond_count?: number | null;
   clash_count?: number | null;
   pose_file?: string | null;
+  pose_artifact_available?: boolean;
+  pose_coordinates?: PoseCoordinates | null;
+  selected_pose_rank?: number | null;
+  pose_count?: number | null;
+  pose_selection_method?: string | null;
+  best_pose_confirmed?: boolean;
   labels?: string[];
+  raw_output?: Record<string, any>;
 }
 
 export interface ReportCandidate {
   rank: number;
   molecule_id: string;
   smiles: string | null;
+  generation_source_agent?: string | null;
+  generation_method?: string | null;
   overall_score: number | null;
+  pro_score?: number | null;
+  con_score?: number | null;
+  evidence_confidence?: number | null;
+  ranking_score_semantics?: string;
+  evidence_confidence_semantics?: string;
   final_decision: string;
   risk_level?: string | null;
   refutation_decision?: string | null;
@@ -571,8 +654,26 @@ export interface ReportCandidate {
   docking?: DockingSummary | null;
   admet?: AdmetSummary | null;
   synthesis?: SynthesisSummary | null;
-  evidence_chain?: Array<Record<string, any>>;
+  evidence_chain?: ReportEvidenceLink[];
   refutation_chain?: Record<string, any> | null;
+}
+
+export interface ReportEvidenceLink {
+  evidence_id: string;
+  chunk_id: string | null;
+  document_id?: string | null;
+  document_title?: string | null;
+  document_source?: string | null;
+  document_type?: string | null;
+  filename?: string | null;
+  page_number?: number | null;
+  section?: string | null;
+  chunk_index?: number | null;
+  claim_type: string;
+  evidence_confidence: number | null;
+  evidence_confidence_semantics: string;
+  rationale: string | null;
+  content?: string | null;
 }
 
 // Pipeline Status

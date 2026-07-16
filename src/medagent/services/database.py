@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from sqlalchemy import func, inspect, text
@@ -9,6 +10,11 @@ from medagent.core.config import Settings
 from medagent.db.models import Base, Molecule, Project, Target, TargetDrugLibrary
 from medagent.db.session import build_engine, build_session_factory
 from medagent.services.bootstrap import seed_builtin_targets
+
+logger = logging.getLogger(__name__)
+
+RAG_EMBEDDING_DIMENSIONS = 2048
+PGVECTOR_IVFFLAT_MAX_DIMENSIONS = 2000
 
 
 def initialize_database(settings: Settings) -> dict:
@@ -57,6 +63,13 @@ def ensure_relational_schema(engine: Engine) -> None:
             _binding_site_columns(engine.dialect.name),
         )
 
+    if "seed_ligands" in table_names:
+        _ensure_missing_columns(
+            engine,
+            "seed_ligands",
+            [("activity_type", "VARCHAR(40)")],
+        )
+
     if "rankings" in table_names:
         _ensure_missing_columns(
             engine,
@@ -64,11 +77,18 @@ def ensure_relational_schema(engine: Engine) -> None:
             _ranking_columns(),
         )
 
+    if "docking_results" in table_names:
+        _ensure_missing_columns(
+            engine,
+            "docking_results",
+            _docking_result_columns(engine.dialect.name),
+        )
+
     if "critiques" in table_names:
         _ensure_missing_columns(
             engine,
             "critiques",
-            _critique_columns(),
+            _critique_columns(engine.dialect.name),
         )
 
     if "advisor_suggestions" in table_names:
@@ -142,8 +162,22 @@ def _ranking_columns() -> list[tuple[str, str]]:
     return [("project_id", "VARCHAR(80)")]
 
 
-def _critique_columns() -> list[tuple[str, str]]:
-    return [("con_score", "FLOAT")]
+def _docking_result_columns(dialect_name: str) -> list[tuple[str, str]]:
+    json_type = "JSONB DEFAULT '{}'::jsonb" if dialect_name == "postgresql" else "JSON DEFAULT '{}'"
+    return [
+        ("diffdock_confidence", "FLOAT"),
+        ("raw_output", json_type),
+    ]
+
+
+def _critique_columns(dialect_name: str) -> list[tuple[str, str]]:
+    json_type = "JSONB DEFAULT NULL" if dialect_name == "postgresql" else "JSON DEFAULT NULL"
+    return [
+        ("con_score", "FLOAT"),
+        ("llm_critique_json", json_type),
+        ("llm_provider", "VARCHAR(80)"),
+        ("analysis_method", "VARCHAR(80) DEFAULT 'heuristic_self_refutation'"),
+    ]
 
 
 def _advisor_suggestion_columns(dialect_name: str) -> list[tuple[str, str]]:
@@ -169,7 +203,26 @@ def _ensure_pgvector_columns(engine: Engine) -> None:
     try:
         with engine.begin() as connection:
             connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            connection.execute(text("ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS embedding_vector vector(2048)"))
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE rag_chunks "
+                    f"ADD COLUMN IF NOT EXISTS embedding_vector vector({RAG_EMBEDDING_DIMENSIONS})"
+                )
+            )
+
+        if RAG_EMBEDDING_DIMENSIONS > PGVECTOR_IVFFLAT_MAX_DIMENSIONS:
+            logger.info(
+                "Skipping rag_chunks.embedding_vector IVFFlat index because pgvector "
+                "limits IVFFlat vector dimensions to %s and the configured embedding "
+                "dimension is %s.",
+                PGVECTOR_IVFFLAT_MAX_DIMENSIONS,
+                RAG_EMBEDDING_DIMENSIONS,
+            )
+            return
+
+        with engine.begin() as connection:
             connection.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_rag_chunks_embedding_vector "
@@ -177,4 +230,5 @@ def _ensure_pgvector_columns(engine: Engine) -> None:
                 )
             )
     except SQLAlchemyError:
-        return
+        logger.exception("Failed to initialize pgvector columns for rag_chunks")
+        raise

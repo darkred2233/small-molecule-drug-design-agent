@@ -18,6 +18,7 @@ class ParsedLigand:
     name: str | None = None
     activity_value: float | None = None
     activity_unit: str | None = None
+    activity_type: str | None = None
 
 
 @dataclass
@@ -210,13 +211,22 @@ def parse_csv_ligands(text: str) -> list[ParsedLigand]:
         smiles = first_present(row, ["smiles", "SMILES", "canonical_smiles", "CanonicalSMILES"])
         if not smiles:
             continue
-        activity_value = parse_float(first_present(row, ["activity_value", "activity", "IC50", "Ki", "Kd"]))
+        activity_value = parse_float(first_present(row, ["activity_value", "activity"]))
+        activity_type = first_present(row, ["activity_type", "assay_type", "endpoint"])
+        if activity_value is None:
+            for endpoint in ["IC50", "EC50", "Ki", "Kd"]:
+                endpoint_value = parse_float(first_present(row, [endpoint, endpoint.lower()]))
+                if endpoint_value is not None:
+                    activity_value = endpoint_value
+                    activity_type = activity_type or endpoint
+                    break
         ligands.append(
             ParsedLigand(
                 smiles=smiles,
                 name=first_present(row, ["name", "Name", "compound", "compound_id"]),
                 activity_value=activity_value,
                 activity_unit=first_present(row, ["activity_unit", "unit", "Unit"]),
+                activity_type=activity_type,
             )
         )
     return ligands
@@ -237,7 +247,32 @@ def parse_sdf_ligands(text: str) -> list[ParsedLigand]:
             or properties.get("canonical_smiles")
         )
         if smiles:
-            ligands.append(ParsedLigand(smiles=smiles, name=name))
+            activity_value = parse_float(
+                first_present(properties, ["activity_value", "activity"])
+            )
+            activity_type = first_present(
+                properties, ["activity_type", "assay_type", "endpoint"]
+            )
+            if activity_value is None:
+                for endpoint in ["IC50", "EC50", "Ki", "Kd"]:
+                    endpoint_value = parse_float(
+                        first_present(properties, [endpoint, endpoint.lower()])
+                    )
+                    if endpoint_value is not None:
+                        activity_value = endpoint_value
+                        activity_type = activity_type or endpoint
+                        break
+            ligands.append(
+                ParsedLigand(
+                    smiles=smiles,
+                    name=name,
+                    activity_value=activity_value,
+                    activity_unit=first_present(
+                        properties, ["activity_unit", "unit", "Unit"]
+                    ),
+                    activity_type=activity_type,
+                )
+            )
     return ligands
 
 
@@ -297,6 +332,7 @@ def create_seed_ligands(
                 smiles=ligand.smiles,
                 activity_value=ligand.activity_value,
                 activity_unit=ligand.activity_unit,
+                activity_type=ligand.activity_type,
                 source=uploaded_file.file_id,
             )
         )

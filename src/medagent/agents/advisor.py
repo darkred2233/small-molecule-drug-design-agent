@@ -59,7 +59,8 @@ class AdvisorReport:
     optimization_advice: list[OptimizationAdvice] = field(default_factory=list)
     action_plan: list[ActionItem] = field(default_factory=list)
     risk_warnings: list[str] = field(default_factory=list)
-    success_probability: float = 0.0
+    candidate_readiness_score: float = 0.0
+    score_semantics: str = "heuristic_not_probability"
     next_milestone: str = ""
 
 
@@ -104,8 +105,10 @@ class AdvisorAgent:
         # 风险警告
         risk_warnings = self._identify_risks(molecules, ranking_result)
 
-        # 成功概率
-        success_probability = self._estimate_success_probability(molecules, ranking_result)
+        # 候选成熟度启发式评分；不是项目成功概率
+        candidate_readiness_score = self._estimate_candidate_readiness_score(
+            molecules, ranking_result
+        )
 
         # 下一个里程碑
         next_milestone = self._determine_next_milestone(project, molecules, ranking_result)
@@ -117,7 +120,7 @@ class AdvisorAgent:
             optimization_advice=optimization_advice,
             action_plan=action_plan,
             risk_warnings=risk_warnings,
-            success_probability=success_probability,
+            candidate_readiness_score=candidate_readiness_score,
             next_milestone=next_milestone,
         )
 
@@ -545,17 +548,17 @@ class AdvisorAgent:
 
         return risks
 
-    def _estimate_success_probability(
+    def _estimate_candidate_readiness_score(
         self,
         molecules: list[Molecule],
         ranking_result: RankingResult | None,
     ) -> float:
-        """估计成功概率"""
+        """计算候选成熟度启发式评分；该值不是校准概率。"""
         if not molecules:
             return 0.0
 
         if not ranking_result:
-            return 0.3  # 基础概率
+            return 0.3  # 未排序候选的低成熟度基线，不代表成功概率
 
         # 基于排序结果计算
         score = 0.0

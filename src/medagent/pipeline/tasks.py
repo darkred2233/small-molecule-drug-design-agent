@@ -171,7 +171,8 @@ def self_refutation_task(
     """
     Self-Refutation Agent task.
 
-    Generates critiques using deepseek-v4-pro model.
+    Generates heuristic critiques by default and uses the configured LLM only
+    when self_refutation_use_llm is enabled.
     Retry: 2 times.
     """
     from medagent.services.self_refutation import generate_project_critiques
@@ -261,7 +262,34 @@ def batch_molecule_task(
     Process a batch of molecules with the specified operation.
 
     This allows parallel processing of large molecule sets.
+
+    Args:
+        db: Database session
+        project: Project object
+        molecule_ids: List of molecule IDs to process
+        operation: Operation to perform (validate/filter/delete/reassess)
+        **kwargs: Additional operation-specific arguments
+
+    Returns:
+        Dictionary with operation results
     """
+    from medagent.db.models import Molecule, MoleculeProperty
+    from medagent.services.candidate_assessment import run_project_candidate_assessment
+    from medagent.services.molecule_validation import (
+        merge_labels,
+        update_molecule_structure_fields,
+        upsert_molecule_property,
+        validate_smiles,
+    )
+    from medagent.services.rule_filtering import (
+        evaluate_molecule_rules,
+        upsert_rule_filter_result,
+    )
+
+    allowed_operations = {"validate", "filter", "delete", "reassess"}
+    if operation not in allowed_operations:
+        raise ValueError(f"Unknown operation: {operation}")
+
     results = {
         "operation": operation,
         "total": len(molecule_ids),
@@ -270,13 +298,87 @@ def batch_molecule_task(
         "errors": [],
     }
 
+    molecules = (
+        db.query(Molecule)
+        .filter(
+            Molecule.project_id == project.project_id,
+            Molecule.molecule_id.in_(molecule_ids),
+        )
+        .all()
+    )
+    molecule_by_id = {molecule.molecule_id: molecule for molecule in molecules}
+
+    if operation == "reassess":
+        existing_ids = [
+            molecule_id
+            for molecule_id in molecule_ids
+            if molecule_id in molecule_by_id
+        ]
+        for molecule_id in molecule_ids:
+            if molecule_id not in molecule_by_id:
+                results["failed"] += 1
+                results["errors"].append(
+                    {"molecule_id": molecule_id, "error": "molecule_not_found"}
+                )
+
+        if existing_ids:
+            assessment = run_project_candidate_assessment(
+                db,
+                project,
+                molecule_ids=existing_ids,
+                max_molecules=len(existing_ids),
+                top_n=kwargs.get("top_n", len(existing_ids)),
+                assessment_mode=kwargs.get("assessment_mode", "fast"),
+                external_top_n=kwargs.get("external_top_n", min(10, len(existing_ids))),
+            )
+            results["succeeded"] += len(existing_ids)
+            results["assessment"] = assessment
+        return results
+
     for molecule_id in molecule_ids:
         try:
-            # Operation-specific logic would go here
+            molecule = molecule_by_id.get(molecule_id)
+            if molecule is None:
+                raise ValueError("molecule_not_found")
+
+            if operation == "validate":
+                validation = validate_smiles(molecule.smiles)
+                molecule.labels = merge_labels(molecule.labels, validation.labels)
+                if validation.valid:
+                    molecule.status = "structure_validated"
+                    descriptors = validation.descriptors or {}
+                    update_molecule_structure_fields(molecule, descriptors)
+                    upsert_molecule_property(db, molecule, descriptors)
+                else:
+                    molecule.status = "invalid_structure"
+            elif operation == "filter":
+                properties = (
+                    db.query(MoleculeProperty)
+                    .filter_by(molecule_id=molecule.molecule_id)
+                    .one_or_none()
+                )
+                evaluation = evaluate_molecule_rules(molecule, properties, project)
+                upsert_rule_filter_result(db, project, molecule, evaluation)
+                if evaluation.decision in {"passed", "passed_with_warnings"}:
+                    molecule.status = "passed_filter"
+                    molecule.labels = merge_labels(molecule.labels, evaluation.labels)
+                elif evaluation.decision == "failed":
+                    molecule.status = "failed_filter"
+                    molecule.labels = merge_labels(
+                        molecule.labels,
+                        evaluation.labels + evaluation.failed_rules,
+                    )
+                else:
+                    molecule.labels = merge_labels(molecule.labels, evaluation.labels)
+            elif operation == "delete":
+                db.delete(molecule)
+
             results["succeeded"] += 1
         except Exception as exc:
             results["failed"] += 1
             results["errors"].append({"molecule_id": molecule_id, "error": str(exc)})
+
+    db.commit()
 
     return results
 

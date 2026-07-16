@@ -108,6 +108,7 @@ class SeedLigand(TimestampMixin, Base):
     smiles: Mapped[str] = mapped_column(Text)
     activity_value: Mapped[float | None] = mapped_column(Float)
     activity_unit: Mapped[str | None] = mapped_column(String(40))
+    activity_type: Mapped[str | None] = mapped_column(String(40))
     source: Mapped[str | None] = mapped_column(String(240))
 
 
@@ -226,10 +227,12 @@ class DockingResult(TimestampMixin, Base):
     tool_run_id: Mapped[str | None] = mapped_column(String(80))
     vina_score: Mapped[float | None] = mapped_column(Float)
     cnn_score: Mapped[float | None] = mapped_column(Float)
+    diffdock_confidence: Mapped[float | None] = mapped_column(Float)
     key_hbond_count: Mapped[int | None] = mapped_column(Integer)
     clash_count: Mapped[int | None] = mapped_column(Integer)
     pose_file: Mapped[str | None] = mapped_column(Text)
     labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    raw_output: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class ADMETResult(TimestampMixin, Base):
@@ -330,6 +333,11 @@ class Critique(TimestampMixin, Base):
     reason: Mapped[str] = mapped_column(Text)
     evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     refutation_decision: Mapped[str | None] = mapped_column(String(80))
+    llm_critique_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    llm_provider: Mapped[str | None] = mapped_column(String(80))
+    analysis_method: Mapped[str] = mapped_column(
+        String(80), default="heuristic_self_refutation"
+    )
 
 
 class ReasoningTrace(TimestampMixin, Base):

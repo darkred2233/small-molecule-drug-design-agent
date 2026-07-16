@@ -48,7 +48,7 @@ class DecisionBlueprint:
     risk: list[str]
     next_steps: list[str]
     uncertainty: str
-    confidence: float
+    confidence: float | None
     evidence_ids: list[str]
     provenance: dict
 
@@ -77,6 +77,7 @@ def generate_project_decision_cards(db: Session, project: Project) -> dict:
     for molecule in molecules:
         evidence = load_decision_evidence(db, project, molecule)
         blueprint = build_decision_blueprint(project, molecule, evidence)
+        apply_evidence_semantics(blueprint, molecule, evidence)
         trace = upsert_reasoning_trace(db, project, molecule, blueprint)
         db.flush()
         card = upsert_decision_card(db, project, molecule, trace, blueprint)
@@ -106,6 +107,44 @@ def load_decision_evidence(db: Session, project: Project, molecule: Molecule) ->
             .one_or_none()
         ),
     )
+
+
+def apply_evidence_semantics(
+    blueprint: DecisionBlueprint,
+    molecule: Molecule,
+    evidence: DecisionEvidence,
+) -> None:
+    substantive_records = [
+        evidence.properties,
+        evidence.rule_filter,
+        evidence.conformer,
+        evidence.docking,
+        evidence.admet,
+        evidence.synthesis,
+        evidence.ranking,
+    ]
+    has_validation_result = bool(
+        molecule.status in VALIDATED_OR_LATER_STATUSES
+        or molecule.status == "invalid_structure"
+        or set(molecule.labels or []).intersection(VALIDATION_COMPLETE_LABELS)
+    )
+    evidence_supported = has_validation_result or any(
+        record is not None for record in substantive_records
+    )
+    claim_status = "evidence_supported" if evidence_supported else "hypothesis"
+    blueprint.provenance = {
+        **blueprint.provenance,
+        "claim_status": claim_status,
+        "confidence_semantics": (
+            "heuristic_not_probability" if evidence_supported else "not_calibrated"
+        ),
+        "evidence_scope": "computational_or_database_records_not_experimental",
+        "substantive_evidence_count": sum(
+            record is not None for record in substantive_records
+        ),
+    }
+    if not evidence_supported:
+        blueprint.confidence = None
 
 
 def build_decision_blueprint(
@@ -356,7 +395,11 @@ def _assessment_support_factors(molecule: Molecule, evidence: DecisionEvidence) 
         if evidence.docking.vina_score is not None:
             docking_parts.append(f"Vina {_fmt_number(evidence.docking.vina_score)}")
         if evidence.docking.cnn_score is not None:
-            docking_parts.append(f"CNN {_fmt_number(evidence.docking.cnn_score)}")
+            docking_parts.append(f"GNINA CNN {_fmt_number(evidence.docking.cnn_score)}")
+        if evidence.docking.diffdock_confidence is not None:
+            docking_parts.append(
+                f"DiffDock confidence {_fmt_number(evidence.docking.diffdock_confidence)}"
+            )
         if evidence.docking.key_hbond_count is not None:
             docking_parts.append(f"关键氢键 {evidence.docking.key_hbond_count} 个")
     if docking_parts:

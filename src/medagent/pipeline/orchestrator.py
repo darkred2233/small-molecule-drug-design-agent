@@ -1,9 +1,12 @@
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from medagent.configs.settings import Settings
+from medagent.agents.sar import SARAgent
+from medagent.agents.target import TargetAgent
 from medagent.db.models import AgentRun, Molecule, Project
 from medagent.pipeline.graph import PIPELINE_AGENTS
 from medagent.pipeline.state import (
@@ -23,13 +26,14 @@ from medagent.services.molecule_import import import_seed_ligands_as_molecules
 from medagent.services.molecule_validation import validate_project_molecules
 from medagent.services.rag import build_project_rag_index
 from medagent.reporting.project_report import build_project_report
+from medagent.services.receptor_preparation import project_docking_config
 from medagent.services.self_refutation import generate_project_critiques
 from medagent.services.rule_filtering import filter_project_molecules
 
 
 DEFAULT_PIPELINE_CONFIG = {
-    "strategy_counts": {"reinvent4": 5, "crem": 5, "autogrow4": 5},
-    "top_n": 10,
+    "strategy_counts": {"reinvent4": 10, "crem": 10, "autogrow4": 10},
+    "top_n": 20,
     "max_assessment_molecules": 50,
     "assessment_mode": "external",
     "external_top_n": 10,
@@ -115,6 +119,35 @@ class PipelineOrchestrator:
                 lambda: record_output(
                     "molecule_import_agent",
                     import_seed_ligands_as_molecules(db, project),
+                ),
+            )
+        )
+        runs.append(
+            self._run_step(
+                db,
+                project,
+                "target_agent",
+                "qwen3.7-plus",
+                {"mode": "full", "target_id": project.target_id},
+                lambda: record_output(
+                    "target_agent",
+                    self._run_target_analysis(db, project),
+                ),
+            )
+        )
+        runs.append(
+            self._run_step(
+                db,
+                project,
+                "sar_agent",
+                "qwen3.7-plus",
+                {
+                    "mode": "full",
+                    "seed_molecule_count": self._molecule_count(db, project),
+                },
+                lambda: record_output(
+                    "sar_agent",
+                    self._run_sar_analysis(db, project),
                 ),
             )
         )
@@ -275,6 +308,8 @@ class PipelineOrchestrator:
         return runs
 
     def _resolve_model(self, default_model: str) -> str:
+        if default_model == "deepseek-v4-pro" and not self.settings.self_refutation_use_llm:
+            return "heuristic_self_refutation"
         model_map = {
             "qwen3.7-max": self.settings.qwen_reasoning_model,
             "qwen3.7-plus": self.settings.qwen_task_model,
@@ -307,10 +342,13 @@ class PipelineOrchestrator:
         try:
             output = operation()
         except Exception as exc:
+            db.rollback()
             run.status = "failed"
             run.error_message = str(exc)
             run.output_json = {"error": str(exc)}
             project.status = PIPELINE_FAILED
+            db.add(run)
+            db.add(project)
             db.commit()
             raise
 
@@ -333,6 +371,22 @@ class PipelineOrchestrator:
         return {
             "file_ingestion": file_ingestion,
             "rag_index": rag_index,
+        }
+
+    def _run_target_analysis(self, db: Session, project: Project) -> dict[str, Any]:
+        use_llm = bool(self.settings.dashscope_api_key)
+        report = TargetAgent(db).analyze_target(project, use_llm=use_llm)
+        return {
+            **asdict(report),
+            "analysis_mode": "llm_with_rule_fallback" if use_llm else "rule_based",
+        }
+
+    def _run_sar_analysis(self, db: Session, project: Project) -> dict[str, Any]:
+        use_llm = bool(self.settings.dashscope_api_key)
+        report = SARAgent(db).analyze_sar(project, use_llm=use_llm)
+        return {
+            **asdict(report),
+            "analysis_mode": "llm_with_rule_fallback" if use_llm else "rule_based",
         }
 
     def _run_generation_if_needed(
@@ -362,13 +416,29 @@ class PipelineOrchestrator:
                 "strategy_counts": strategy_counts,
             }
         try:
+            generation_constraints = dict(
+                config.get("generation_constraints") or DEFAULT_GENERATION_CONSTRAINTS
+            )
+            docking_config = project_docking_config(
+                db,
+                project,
+                generation_constraints.get("binding_site_id"),
+            )
+            if docking_config.get("protein_file"):
+                generation_constraints.setdefault(
+                    "receptor_file",
+                    docking_config["protein_file"],
+                )
+            for key in ("grid_center", "grid_size", "key_residues"):
+                if docking_config.get(key):
+                    generation_constraints.setdefault(key, docking_config[key])
             return generate_project_molecules(
                 db,
                 project,
                 generation_size=requested_size,
                 strategies=selected_strategies,
                 strategy_counts=strategy_counts,
-                constraints=config.get("generation_constraints") or dict(DEFAULT_GENERATION_CONSTRAINTS),
+                constraints=generation_constraints,
                 include_target_library_seeds=True,
                 agent_run_name="molecule_generation_tool_agent",
             )

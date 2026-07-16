@@ -289,6 +289,7 @@ class RdkitGrowLinkAutoGrow4Strategy:
                             output_dir=tmp_dir,
                             num_generations=5,
                             population_size=requested_count,
+                            constraints=constraints,
                         )
                         result = run_autogrow4_generation(request, autogrow4_status)
 

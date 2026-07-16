@@ -25,7 +25,10 @@ from medagent.services.docking_adapters import (
     DockingToolRequest,
     run_external_docking,
 )
-from medagent.services.ids import new_id
+from medagent.services.pdbqt_validation import (
+    is_valid_vina_ligand_pdbqt,
+    is_valid_vina_receptor_pdbqt,
+)
 
 
 @dataclass
@@ -55,9 +58,10 @@ class DockingWorkflowResult:
     """对接工作流完整结果"""
     success: bool
     molecule_id: str
-    docking_result_id: str | None
+    docking_result_id: int | None
     vina_score: float | None
     cnn_score: float | None
+    diffdock_confidence: float | None
     pose_file: str | None
     ligand_prep: LigandPreparationResult | None
     receptor_prep: ReceptorPreparationResult | None
@@ -354,45 +358,68 @@ def _convert_to_pdbqt(input_file: Path, is_ligand: bool = True) -> Path | None:
     import subprocess
 
     output_file = input_file.with_suffix(".pdbqt")
+    validator = is_valid_vina_ligand_pdbqt if is_ligand else is_valid_vina_receptor_pdbqt
+    temp_handle = tempfile.NamedTemporaryFile(
+        prefix=f".{input_file.stem}.",
+        suffix=".pdbqt",
+        dir=input_file.parent,
+        delete=False,
+    )
+    temp_file = Path(temp_handle.name)
+    temp_handle.close()
+    temp_file.unlink(missing_ok=True)
 
-    # 尝试OpenBabel
-    try:
-        cmd = [
-            "obabel",
-            str(input_file),
-            "-O",
-            str(output_file),
-            "-xh",  # 添加氢
-        ]
-
-        if is_ligand:
-            cmd.append("-xr")  # 可旋转键
-
-        proc = subprocess.run(cmd, capture_output=True, timeout=30)
-        if proc.returncode == 0 and output_file.exists():
-            return output_file
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # 尝试Meeko（仅用于配体）
+    # Meeko is the reference ligand preparation path used by AutoDock Vina.
     if is_ligand:
         try:
             from meeko import MoleculePreparation, PDBQTWriterLegacy
             from rdkit import Chem
 
-            mol = Chem.SDMolSupplier(str(input_file))[0]
-            if mol:
-                preparator = MoleculePreparation()
-                mol_setups = preparator.prepare(mol)
-
-                for setup in mol_setups:
-                    pdbqt_string = PDBQTWriterLegacy.write_string(setup)
-                    with open(output_file, "w") as f:
-                        f.write(pdbqt_string)
-                    return output_file
-        except (ImportError, Exception):
+            supplier = Chem.SDMolSupplier(str(input_file), removeHs=False)
+            mol = next((item for item in supplier if item is not None), None)
+            if mol is not None:
+                setups = MoleculePreparation().prepare(mol)
+                if setups:
+                    writer_result = PDBQTWriterLegacy.write_string(setups[0])
+                    if isinstance(writer_result, tuple):
+                        pdbqt_string, success, _error = writer_result
+                    else:
+                        pdbqt_string, success = writer_result, True
+                    if success:
+                        temp_file.write_text(pdbqt_string, encoding="utf-8")
+                        if validator(temp_file):
+                            temp_file.replace(output_file)
+                            return output_file
+        except Exception:
             pass
+        finally:
+            temp_file.unlink(missing_ok=True)
 
+    # 尝试OpenBabel
+    try:
+        cmd = [
+            "obabel",
+            f"-i{input_file.suffix.lstrip('.')}",
+            str(input_file),
+            "-opdbqt",
+            "-O",
+            str(temp_file),
+            "-xh",  # 添加氢
+        ]
+
+        if not is_ligand:
+            cmd.append("-xr")  # 可旋转键
+
+        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        if proc.returncode == 0 and validator(temp_file):
+            temp_file.replace(output_file)
+            return output_file
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+    # 尝试Meeko（仅用于配体）
     return None
 
 
@@ -444,6 +471,7 @@ def run_docking_workflow(
                 docking_result_id=None,
                 vina_score=None,
                 cnn_score=None,
+                diffdock_confidence=None,
                 pose_file=None,
                 ligand_prep=ligand_prep,
                 receptor_prep=None,
@@ -469,6 +497,7 @@ def run_docking_workflow(
                 docking_result_id=None,
                 vina_score=None,
                 cnn_score=None,
+                diffdock_confidence=None,
                 pose_file=None,
                 ligand_prep=ligand_prep,
                 receptor_prep=receptor_prep,
@@ -499,6 +528,9 @@ def run_docking_workflow(
                 docking_result_id=None,
                 vina_score=docking_result.vina_score if docking_result else None,
                 cnn_score=docking_result.cnn_score if docking_result else None,
+                diffdock_confidence=(
+                    docking_result.diffdock_confidence if docking_result else None
+                ),
                 pose_file=None,
                 ligand_prep=ligand_prep,
                 receptor_prep=receptor_prep,
@@ -510,18 +542,33 @@ def run_docking_workflow(
             )
 
         # 步骤4: 保存结果到数据库
-        docking_db_result = DockingResult(
-            docking_result_id=new_id("DOCK"),
-            project_id=project.project_id,
-            molecule_id=molecule.molecule_id,
-            tool_name=docking_result.tool_name,
-            vina_score=docking_result.vina_score,
-            cnn_score=docking_result.cnn_score,
-            cnn_affinity=docking_result.cnn_affinity,
-            pose_file=docking_result.pose_file,
-            labels=docking_result.labels,
-            warnings=docking_result.warnings,
-            tool_metadata={
+        docking_db_result = (
+            db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+        )
+        if docking_db_result is None:
+            docking_db_result = DockingResult(molecule_id=molecule.molecule_id)
+            db.add(docking_db_result)
+        docking_db_result.tool_run_id = docking_result.adapter_mode
+        docking_db_result.vina_score = docking_result.vina_score
+        docking_db_result.cnn_score = docking_result.cnn_score
+        docking_db_result.diffdock_confidence = docking_result.diffdock_confidence
+        docking_db_result.pose_file = docking_result.pose_file
+        docking_db_result.labels = docking_result.labels
+        docking_db_result.raw_output = {
+            "status": "success",
+            "result_kind": "external_docking",
+            "adapter_mode": docking_result.adapter_mode,
+            "tool_name": docking_result.tool_name,
+            "cnn_affinity": docking_result.cnn_affinity,
+            "diffdock_confidence": docking_result.diffdock_confidence,
+            "selected_pose_rank": docking_result.selected_pose_rank,
+            "pose_count": docking_result.pose_count,
+            "pose_selection_method": docking_result.pose_selection_method,
+            "best_pose_confirmed": docking_result.best_pose_confirmed,
+            "warnings": docking_result.warnings,
+            "runtime_seconds": docking_result.runtime_seconds,
+            "project_id": project.project_id,
+            "preparation": {
                 "ligand_prep": {
                     "conformers": ligand_prep.conformers_generated,
                     "energy": ligand_prep.energy,
@@ -532,17 +579,18 @@ def run_docking_workflow(
                 "grid_center": binding_site_center,
                 "grid_size": binding_site_size,
             },
-        )
+        }
 
-        db.add(docking_db_result)
+        db.flush()
         db.commit()
 
         return DockingWorkflowResult(
             success=True,
             molecule_id=molecule.molecule_id,
-            docking_result_id=docking_db_result.docking_result_id,
+            docking_result_id=docking_db_result.id,
             vina_score=docking_result.vina_score,
             cnn_score=docking_result.cnn_score,
+            diffdock_confidence=docking_result.diffdock_confidence,
             pose_file=docking_result.pose_file,
             ligand_prep=ligand_prep,
             receptor_prep=receptor_prep,

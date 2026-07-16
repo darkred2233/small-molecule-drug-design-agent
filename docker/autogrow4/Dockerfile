@@ -35,6 +35,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     build-essential \
     git \
     openbabel \
+    autodock-vina \
     ca-certificates
 
 # Install RDKit and dependencies

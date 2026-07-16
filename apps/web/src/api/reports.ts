@@ -19,4 +19,9 @@ export const reportsApi = {
 
   downloadUrl: (projectId: string) =>
     `${API_BASE_URL.replace(/\/$/, '')}/projects/${projectId}/report/download`,
+
+  poseDownloadUrl: (projectId: string, moleculeId: string) =>
+    `${API_BASE_URL.replace(/\/$/, '')}/projects/${encodeURIComponent(projectId)}/molecules/${encodeURIComponent(
+      moleculeId
+    )}/docking/pose`,
 };

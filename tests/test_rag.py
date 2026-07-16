@@ -2,6 +2,8 @@ from fastapi.testclient import TestClient
 
 from medagent.api.app import create_app
 from medagent.core.config import Settings
+from medagent.rag.rerank import LocalScoreReranker
+from medagent.services.rag import retrieval_support_score
 
 
 def make_client(tmp_path):
@@ -11,6 +13,8 @@ def make_client(tmp_path):
             storage_local_root=str(tmp_path / "uploads"),
             rag_chunk_size=240,
             rag_chunk_overlap=30,
+            rag_use_remote_embeddings=False,
+            rag_use_remote_rerank=False,
         )
     )
     return TestClient(app)
@@ -64,11 +68,26 @@ def test_ingest_text_file_builds_rag_index_and_query_creates_evidence(tmp_path):
         query_body = query_response.json()
         assert query_body["retrieved_chunks"]
         assert query_body["evidence_ids"]
+        assert query_body["confidence"] is None
+        assert query_body["confidence_semantics"] == "not_calibrated"
+        assert query_body["retrieval_support_score_semantics"] == "heuristic_not_probability"
+        assert 0.0 <= query_body["retrieval_support_score"] <= 1.0
+        assert query_body["embedding_model"] == "local-hash-embedding"
+        assert query_body["rerank_model"] is None
+        assert query_body["retrieved_chunks"][0]["retrieval_rank"] == 1
+        assert all(item["rerank_score"] is None for item in query_body["retrieved_chunks"])
+        assert all(
+            item["evidence_confidence"] is None
+            and item["evidence_confidence_semantics"] == "not_calibrated"
+            and item["score_semantics"] == "heuristic_retrieval_score_not_probability"
+            for item in query_body["retrieved_chunks"]
+        )
         assert any("hERG" in chunk["content"] for chunk in query_body["retrieved_chunks"])
 
         links_response = client.get(f"/projects/{project_id}/evidence-links")
         assert links_response.status_code == 200
         assert {link["evidence_id"] for link in links_response.json()} >= set(query_body["evidence_ids"])
+        assert all(link["confidence"] is None for link in links_response.json())
 
 
 def test_rag_build_indexes_builtin_target_without_uploads(tmp_path):
@@ -116,3 +135,19 @@ def test_rag_crawl_indexes_url_text(tmp_path, monkeypatch):
 
         assert query_response.status_code == 200
         assert any("acrylamide" in item["content"] for item in query_response.json()["retrieved_chunks"])
+
+
+def test_local_reranker_does_not_fabricate_relevance_scores():
+    reranker = LocalScoreReranker()
+
+    assert reranker.rerank("query", ["first", "second"], top_n=2) == []
+
+
+def test_retrieval_support_score_has_no_result_count_bonus():
+    chunks = [
+        {"combined_score": 0.42, "rerank_score": None},
+        {"combined_score": 0.31, "rerank_score": None},
+        {"combined_score": 0.18, "rerank_score": None},
+    ]
+
+    assert retrieval_support_score(chunks) == 0.42

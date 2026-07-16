@@ -4,6 +4,19 @@
 创建时间：2026-07-07
 项目路径：`C:\Users\34471\Desktop\small-molecule-drug-design-agent`
 
+## 当前版本数据库升级
+
+现有数据库升级到当前代码版本时，先备份数据库，再设置连接串并运行统一迁移入口：
+
+```powershell
+$env:MEDAGENT_DATABASE_URL="postgresql+psycopg://medagent:medagent@localhost:5432/medagent"
+.\.venv\Scripts\python.exe migrations\run_all.py
+```
+
+该入口按顺序补齐 docking 原始输出、DiffDock confidence、实验活性终点类型，以及
+自我反驳的 LLM/分析方法字段。所有迁移均为幂等操作，可重复执行。不要仅运行其中一个脚本后
+就假设数据库已经与当前 ORM 对齐。
+
 ## 1. 项目定位
 
 本项目根据《小分子药物设计 Agent 开发文档 v2.1》构建，当前交付目标是 MVP M1 的可运行后端基础设施：

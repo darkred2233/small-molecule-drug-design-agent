@@ -33,7 +33,7 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
   const [projectName, setProjectName] = useState('');
   const [objective, setObjective] = useState('');
   const [strategyCounts, setStrategyCounts] = useState(DEFAULT_STRATEGY_COUNTS);
-  const [topN, setTopN] = useState(10);
+  const [topN, setTopN] = useState(20);
 
   const selectedTargetId = selection?.kind === 'builtin' ? selection.target.target_id : selection?.target_id;
   const selectedBuiltin = selection?.kind === 'builtin' ? selection.target : null;
@@ -74,7 +74,7 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
     setProjectName('');
     setObjective('');
     setStrategyCounts(DEFAULT_STRATEGY_COUNTS);
-    setTopN(10);
+    setTopN(20);
   };
 
   const handleClose = () => {
@@ -192,10 +192,20 @@ export default function CreateProjectModal({ isOpen, onClose }: CreateProjectMod
                   strategyCounts={strategyCounts}
                   topN={topN}
                   generationSize={generationSize}
-                  maxAssessmentMolecules={Math.min(Math.max(maxAssessmentMolecules, topN), 500)}
+                  maxAssessmentMolecules={maxAssessmentMolecules}
                   onStrategyCountChange={updateStrategyCount}
                   onTopNChange={(value) => setTopN(clampInteger(value, 1, 500))}
                 />
+
+                <div className="rounded-lg border border-cyan-100 bg-cyan-50/30 p-4">
+                  <div className="text-sm text-slate-700">
+                    <p className="font-medium">💡 生成策略配置说明</p>
+                    <p className="mt-2 text-slate-600">
+                      生成策略和分子数量将在项目创建后，通过界面顶部的配置面板进行调整。
+                      每次生成时会使用当前的配置参数。
+                    </p>
+                  </div>
+                </div>
 
                 {createProject.error && (
                   <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">

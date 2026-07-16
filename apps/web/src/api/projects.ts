@@ -103,6 +103,8 @@ export const projectsApi = {
     }),
 
   // Create new round
-  createRound: (projectId: string) =>
-    apiClient.post(`/projects/${projectId}/rounds`, {}),
+  createRound: (projectId: string, generationConfig?: Record<string, any>) =>
+    apiClient.post(`/projects/${projectId}/rounds`, {
+      generation_config: generationConfig ?? {},
+    }),
 };

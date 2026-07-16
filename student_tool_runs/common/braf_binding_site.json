@@ -1,0 +1,34 @@
+{
+  "project_id": "PROJ-8A2756E8CB",
+  "target_id": "TGT-BRAF",
+  "target_name": "BRAF",
+  "pdb_id": "3OG7",
+  "receptor_file": "student_tool_runs/data/3OG7_BRAF_receptor.pdb",
+  "grid_center": [1.869, -2.638, -19.918],
+  "grid_size": [24.305, 13.133, 14.396],
+  "key_residues": [
+    "ALA481:A",
+    "ASP594:A",
+    "CYS532:A",
+    "GLN530:A",
+    "GLY534:A",
+    "GLY593:A",
+    "GLY596:A",
+    "ILE463:A",
+    "ILE527:A",
+    "LEU505:A",
+    "LEU514:A",
+    "LEU515:A",
+    "LYS483:A",
+    "PHE516:A",
+    "PHE583:A",
+    "PHE595:A",
+    "SER535:A",
+    "SER536:A",
+    "THR529:A",
+    "TRP531:A",
+    "VAL471:A",
+    "VAL482:A"
+  ]
+}
+

@@ -124,13 +124,14 @@ class RagChunkRead(BaseModel):
 class EvidenceLinkRead(BaseModel):
     evidence_id: str = Field(title="Evidence id")
     molecule_id: str | None = Field(default=None, title="Molecule id")
-    chunk_id: str = Field(title="RAG chunk id")
+    chunk_id: str | None = Field(default=None, title="RAG chunk id")
     claim_type: str = Field(title="Claim type")
     confidence: float | None = Field(default=None, title="Evidence confidence")
     rationale: str | None = Field(default=None, title="Evidence rationale")
 
 
 class RagRetrievedChunkRead(BaseModel):
+    retrieval_rank: int = Field(title="Retrieval rank")
     chunk_id: str = Field(title="RAG chunk id")
     document_id: str = Field(title="RAG document id")
     source_type: str = Field(title="Source type")
@@ -142,7 +143,13 @@ class RagRetrievedChunkRead(BaseModel):
     keyword_score: float = Field(title="BM25 keyword score")
     combined_score: float = Field(title="Hybrid recall score")
     rerank_score: float | None = Field(default=None, title="Rerank score")
+    retrieval_method: str = Field(title="Retrieval method")
+    score_semantics: str = Field(title="Retrieval score semantics")
+    embedding_model: str = Field(title="Embedding model actually used")
+    rerank_model: str | None = Field(default=None, title="Rerank model actually used")
     evidence_id: str | None = Field(default=None, title="Evidence id")
+    evidence_confidence: float | None = Field(default=None, title="Calibrated evidence confidence")
+    evidence_confidence_semantics: str = Field(title="Evidence confidence semantics")
     evidence_summary: str = Field(title="Evidence summary")
     content: str = Field(title="Chunk content")
 
@@ -172,7 +179,13 @@ class RagQueryResponse(BaseModel):
     query_type: str = Field(title="Query type")
     retrieved_chunks: list[RagRetrievedChunkRead] = Field(title="Retrieved chunks")
     evidence_ids: list[str] = Field(title="Evidence ids")
-    confidence: float = Field(title="Retrieval confidence")
+    confidence: float | None = Field(default=None, title="Calibrated evidence confidence")
+    confidence_semantics: str = Field(title="Confidence semantics")
+    retrieval_support_score: float = Field(title="Heuristic retrieval support score")
+    retrieval_support_score_semantics: str = Field(title="Retrieval support score semantics")
+    embedding_model: str = Field(title="Embedding model actually used")
+    rerank_model: str | None = Field(default=None, title="Rerank model actually used")
+    retrieval_method: str = Field(title="Retrieval method")
     missing_information: list[str] = Field(title="Missing information")
     adapter_mode: str = Field(title="RAG adapter mode")
 
@@ -213,6 +226,7 @@ class SeedLigandRead(BaseModel):
     smiles: str = Field(title="SMILES")
     activity_value: float | None = Field(title="活性值")
     activity_unit: str | None = Field(title="活性单位")
+    activity_type: str | None = Field(title="实验活性终点类型，如 IC50、Ki 或 Kd")
     source: str | None = Field(title="来源文件编号")
 
 
@@ -235,6 +249,13 @@ class RunPipelineRequest(BaseModel):
     generation_config: dict[str, Any] = Field(
         default_factory=dict,
         title="Optional molecule generation and ranking configuration override",
+    )
+
+
+class RoundCreateRequest(BaseModel):
+    generation_config: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Optional next-round molecule generation and ranking configuration",
     )
 
 
@@ -466,11 +487,13 @@ class ConformerResultRead(BaseModel):
 class DockingResultRead(BaseModel):
     molecule_id: str = Field(title="Molecule id")
     vina_score: float | None = Field(title="Vina score")
-    cnn_score: float | None = Field(title="CNN score")
+    cnn_score: float | None = Field(title="GNINA CNN score")
+    diffdock_confidence: float | None = Field(title="DiffDock pose confidence")
     key_hbond_count: int | None = Field(title="Key hydrogen bond count")
     clash_count: int | None = Field(title="Clash count")
     pose_file: str | None = Field(title="Pose file")
     labels: list[str] = Field(title="Docking labels")
+    raw_output: dict[str, Any] = Field(title="Raw docking output and provenance")
 
 
 class ADMETResultRead(BaseModel):

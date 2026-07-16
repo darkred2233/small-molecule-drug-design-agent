@@ -12,7 +12,6 @@ import ProjectSidebar from '@/components/ProjectSidebar';
 import ChatPanel from '@/components/ChatPanel';
 import WorkspacePanel from '@/components/WorkspacePanel';
 import CreateProjectModal from '@/components/CreateProjectModal';
-import EvidenceDrawer from '@/components/EvidenceDrawer';
 
 export default function WorkspacePage() {
   const { projectId } = useParams();
@@ -58,9 +57,6 @@ export default function WorkspacePage() {
         isOpen={showCreateModal}
         onClose={() => setShowCreateModal(false)}
       />
-
-      {/* Evidence Drawer */}
-      <EvidenceDrawer />
     </>
   );
 }

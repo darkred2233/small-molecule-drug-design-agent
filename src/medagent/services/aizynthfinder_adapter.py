@@ -5,12 +5,13 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from importlib import metadata, util
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+from medagent.services.docker_runtime import DockerMountBuilder, docker_temporary_directory
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,11 @@ class AiZynthFinderResult:
     num_steps: int | None = None
     route_score: float | None = None
     route_summary: str | None = None
+    route_plan: list[dict[str, Any]] = field(default_factory=list)
+    starting_materials: list[str] = field(default_factory=list)
+    route_trees: list[dict[str, Any]] = field(default_factory=list)
+    stock_info: dict[str, Any] = field(default_factory=dict)
+    route_metadata: dict[str, Any] = field(default_factory=dict)
     labels: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     stdout: str = ""
@@ -74,6 +80,9 @@ def aizynthfinder_tool_status() -> dict[str, Any]:
         "path": status.get("path"),
         "docker_image": status.get("docker_image"),
         "model_configured": status.get("model_configured", False),
+        "runtime_available": status.get("runtime_available", status["available"]),
+        "gpu_available": status.get("gpu_available", False),
+        "warning": status.get("warning"),
     }
 
 
@@ -178,11 +187,32 @@ def _docker_status() -> dict[str, Any] | None:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
         if proc.returncode == 0:
+            runtime_probe = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--entrypoint",
+                    "aizynthcli",
+                    image,
+                    "--help",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            runtime_available = runtime_probe.returncode == 0
             return {
-                "available": True,
+                "available": runtime_available,
+                "runtime_available": runtime_available,
                 "mode": "docker",
                 "docker_image": image,
                 "model_configured": _default_config_available(),
+                "gpu_available": _check_gpu_available(image),
+                "warning": None
+                if runtime_available
+                else "aizynthfinder_runtime_probe_failed",
             }
     return None
 
@@ -229,7 +259,7 @@ def _run_aizynthfinder_local(
     output_file = output_dir / "aizynthfinder_routes.json"
     _remove_stale_output(output_file)
 
-    with tempfile.TemporaryDirectory(prefix="aizynthfinder_") as tmp_dir:
+    with docker_temporary_directory(prefix="aizynthfinder_") as tmp_dir:
         smiles_file = Path(tmp_dir) / "targets.smi"
         _write_smiles_input(smiles_file, request.smiles)
         command = _build_aizynthfinder_local_command(
@@ -265,7 +295,7 @@ def _run_aizynthfinder_docker(
     output_file = output_dir / "aizynthfinder_routes.json"
     _remove_stale_output(output_file)
 
-    with tempfile.TemporaryDirectory(prefix="aizynthfinder_") as tmp_dir:
+    with docker_temporary_directory(prefix="aizynthfinder_") as tmp_dir:
         smiles_file = Path(tmp_dir) / "targets.smi"
         _write_smiles_input(smiles_file, request.smiles)
         command = _build_aizynthfinder_docker_command(
@@ -324,34 +354,45 @@ def _build_aizynthfinder_docker_command(
     smiles_file: Path,
     output_dir: Path,
 ) -> list[str]:
+    import time
     image = status.get("docker_image") or request.docker_image
+    container_name = f"aizynthfinder_{int(time.time() * 1000)}"
+
+    has_gpu = bool(status.get("gpu_available"))
+    mounts = DockerMountBuilder()
+    input_path = mounts.bind(smiles_file.parent.resolve(), "/data/input", read_only=True)
+    output_path = mounts.bind(output_dir.resolve(), "/data/output")
+    config_path = mounts.bind(config_file.parent.resolve(), "/data/config", read_only=True)
+
     command = [
         "docker",
         "run",
         "--rm",
-        "-v",
-        f"{smiles_file.parent.resolve()}:/data/input:ro",
-        "-v",
-        f"{output_dir.resolve()}:/data/output",
-        "-v",
-        f"{config_file.parent.resolve()}:/data/config:ro",
+        "--name",
+        container_name,
     ]
+
+    # Add GPU support if available (AiZynthFinder can benefit from GPU)
+    if has_gpu:
+        command.extend(["--gpus", "all"])
+
     data_dir = _resolve_data_dir(config_file)
     if data_dir is not None:
-        command += ["-v", f"{data_dir}:/data/aizynthfinder:ro"]
+        mounts.bind(data_dir, "/data/aizynthfinder", read_only=True)
 
     command += [
+        *mounts.arguments,
         "-w",
-        "/data/config",
+        config_path,
         "--entrypoint",
         "aizynthcli",
         image,
         "--config",
-        f"/data/config/{config_file.name}",
+        str(PurePosixPath(config_path, config_file.name)),
         "--smiles",
-        f"/data/input/{smiles_file.name}",
+        str(PurePosixPath(input_path, smiles_file.name)),
         "--output",
-        "/data/output/aizynthfinder_routes.json",
+        str(PurePosixPath(output_path, "aizynthfinder_routes.json")),
     ]
     return command
 
@@ -382,6 +423,7 @@ def _run_command(
     max_steps: int,
     cwd: Path | None = None,
 ) -> AiZynthFinderResult:
+    container_name = _extract_container_name(command)
     try:
         proc = subprocess.run(
             command,
@@ -391,6 +433,9 @@ def _run_command(
             cwd=str(cwd) if cwd else None,
         )
     except subprocess.TimeoutExpired:
+        # Clean up Docker container on timeout
+        if container_name:
+            _cleanup_docker_container(container_name)
         return AiZynthFinderResult(
             adapter_mode=f"{adapter_mode}_timeout",
             tool_name="aizynthfinder",
@@ -432,6 +477,11 @@ def _run_command(
         num_steps=parsed.get("num_steps"),
         route_score=parsed.get("route_score"),
         route_summary=parsed.get("route_summary"),
+        route_plan=parsed.get("route_plan") or [],
+        starting_materials=parsed.get("starting_materials") or [],
+        route_trees=parsed.get("route_trees") or [],
+        stock_info=parsed.get("stock_info") or {},
+        route_metadata=parsed.get("route_metadata") or {},
         labels=labels if success else [],
         warnings=warnings,
         stdout=proc.stdout[:2000],
@@ -461,6 +511,17 @@ def _parse_aizynthfinder_output(output_file: Path, max_steps: int) -> dict[str, 
 
     num_steps = _coerce_int(record.get("number_of_steps"))
     route_score = _coerce_float(record.get("top_score"))
+    trees = _coerce_list(record.get("trees"))
+    stock_info = _coerce_dict(record.get("stock_info"))
+    selected_tree = _select_representative_tree(trees)
+    route_plan = _route_plan_from_tree(selected_tree) if selected_tree else []
+    starting_materials = _starting_materials_from_tree(
+        selected_tree,
+        stock_info=stock_info,
+        availability_by_material=_availability_from_record(record),
+    )
+    if not starting_materials:
+        starting_materials = _starting_materials_from_record(record, stock_info)
 
     warnings: list[str] = []
     route_found = is_solved
@@ -483,6 +544,23 @@ def _parse_aizynthfinder_output(output_file: Path, max_steps: int) -> dict[str, 
         "num_steps": num_steps,
         "route_score": route_score,
         "route_summary": route_summary,
+        "route_plan": route_plan,
+        "starting_materials": starting_materials,
+        "route_trees": trees[:10],
+        "stock_info": stock_info,
+        "route_metadata": {
+            "target": record.get("target"),
+            "number_of_routes": _coerce_int(record.get("number_of_routes")),
+            "number_of_solved_routes": solved_routes,
+            "number_of_precursors": _coerce_int(record.get("number_of_precursors")),
+            "number_of_precursors_in_stock": _coerce_int(
+                record.get("number_of_precursors_in_stock")
+            ),
+            "precursors_in_stock": record.get("precursors_in_stock"),
+            "precursors_not_in_stock": record.get("precursors_not_in_stock"),
+            "precursors_availability": record.get("precursors_availability"),
+            "selected_tree_index": trees.index(selected_tree) if selected_tree in trees else None,
+        },
         "warnings": warnings,
     }
 
@@ -506,6 +584,237 @@ def _route_found_summary(num_steps: int | None, route_score: float | None) -> st
     if route_score is not None:
         return f"AiZynthFinder found a route; top score={route_score:.3g}."
     return "AiZynthFinder found a retrosynthesis route."
+
+
+def _coerce_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _coerce_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _select_representative_tree(trees: list[Any]) -> dict[str, Any] | None:
+    candidates = [tree for tree in trees if isinstance(tree, dict)]
+    if not candidates:
+        return None
+
+    def score(tree: dict[str, Any]) -> tuple[bool, int, int, float, float]:
+        scores = _coerce_dict(tree.get("scores"))
+        metadata = _coerce_dict(tree.get("metadata"))
+        precursor_count = _coerce_int(scores.get("number of pre-cursors")) or 0
+        stock_count = _coerce_int(scores.get("number of pre-cursors in stock")) or 0
+        state_score = _coerce_float(scores.get("state score")) or 0.0
+        policy_probability = max(
+            [_reaction_policy_probability(reaction) for reaction in _reaction_nodes(tree)]
+            or [0.0]
+        )
+        return (
+            _coerce_bool(metadata.get("is_solved")),
+            stock_count,
+            -max(precursor_count - stock_count, 0),
+            policy_probability,
+            state_score,
+        )
+
+    return max(candidates, key=score)
+
+
+def _route_plan_from_tree(tree: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(tree, dict):
+        return []
+    steps: list[dict[str, Any]] = []
+    _append_route_steps(tree, steps)
+    for index, step in enumerate(steps, start=1):
+        step["step"] = index
+    return steps
+
+
+def _append_route_steps(mol_node: dict[str, Any], steps: list[dict[str, Any]]) -> None:
+    if not isinstance(mol_node, dict):
+        return
+    parent_smiles = str(mol_node.get("smiles") or "").strip()
+    for reaction in _reaction_children(mol_node):
+        precursor_nodes = _mol_children(reaction)
+        for precursor in precursor_nodes:
+            if _reaction_children(precursor):
+                _append_route_steps(precursor, steps)
+        precursor_smiles = [
+            str(precursor.get("smiles") or "").strip()
+            for precursor in precursor_nodes
+            if str(precursor.get("smiles") or "").strip()
+        ]
+        metadata = _coerce_dict(reaction.get("metadata"))
+        policy = str(metadata.get("policy_name") or "unknown").strip() or "unknown"
+        policy_probability = _coerce_float(metadata.get("policy_probability"))
+        probability_text = (
+            f" p={policy_probability:.3f}" if policy_probability is not None else ""
+        )
+        reaction_smiles = str(reaction.get("smiles") or "").strip()
+        steps.append(
+            {
+                "step": 0,
+                "stage": "AiZynthFinder disconnection",
+                "input": precursor_smiles,
+                "operation": (
+                    f"Forward reaction from AiZynthFinder template {policy}"
+                    f"{probability_text}."
+                ),
+                "output": parent_smiles,
+                "rationale": f"reaction_smiles={reaction_smiles}" if reaction_smiles else None,
+            }
+        )
+
+
+def _starting_materials_from_tree(
+    tree: dict[str, Any] | None,
+    *,
+    stock_info: dict[str, Any],
+    availability_by_material: dict[str, str],
+) -> list[str]:
+    if not isinstance(tree, dict):
+        return []
+    materials: list[str] = []
+    for node in _leaf_mol_nodes(tree):
+        smiles = str(node.get("smiles") or "").strip()
+        if not smiles:
+            continue
+        materials.append(
+            _format_starting_material(smiles, stock_info, availability_by_material)
+        )
+    return _dedupe_strings(materials)
+
+
+def _starting_materials_from_record(
+    record: dict[str, Any],
+    stock_info: dict[str, Any],
+) -> list[str]:
+    availability_by_material = _availability_from_record(record)
+    materials = [
+        _format_starting_material(smiles, stock_info, availability_by_material)
+        for smiles in _split_precursors(record.get("precursors_in_stock"))
+    ]
+    return _dedupe_strings(materials)
+
+
+def _availability_from_record(record: dict[str, Any]) -> dict[str, str]:
+    precursors = _split_precursors(record.get("precursors_in_stock"))
+    availability = [
+        item.strip()
+        for item in str(record.get("precursors_availability") or "").split(";")
+        if item.strip()
+    ]
+    return {
+        precursor: availability[index]
+        for index, precursor in enumerate(precursors)
+        if index < len(availability)
+    }
+
+
+def _format_starting_material(
+    smiles: str,
+    stock_info: dict[str, Any],
+    availability_by_material: dict[str, str],
+) -> str:
+    availability = stock_info.get(smiles)
+    if isinstance(availability, list):
+        sources = ", ".join(str(item) for item in availability if str(item).strip())
+    elif isinstance(availability, str):
+        sources = availability.strip()
+    else:
+        sources = availability_by_material.get(smiles, "")
+    return f"{smiles} ({sources})" if sources else smiles
+
+
+def _split_precursors(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [
+        item.strip()
+        for item in str(value or "").split(",")
+        if item.strip()
+    ]
+
+
+def _leaf_mol_nodes(node: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(node, dict):
+        return []
+    reactions = _reaction_children(node)
+    if not reactions:
+        return [node] if node.get("type") == "mol" or node.get("is_chemical") else []
+    leaves: list[dict[str, Any]] = []
+    for reaction in reactions:
+        for child in _mol_children(reaction):
+            leaves.extend(_leaf_mol_nodes(child))
+    return leaves
+
+
+def _reaction_nodes(node: dict[str, Any]) -> list[dict[str, Any]]:
+    reactions = _reaction_children(node)
+    for child in _mol_children_from_reactions(reactions):
+        reactions.extend(_reaction_nodes(child))
+    return reactions
+
+
+def _mol_children_from_reactions(reactions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    children: list[dict[str, Any]] = []
+    for reaction in reactions:
+        children.extend(_mol_children(reaction))
+    return children
+
+
+def _reaction_children(node: dict[str, Any]) -> list[dict[str, Any]]:
+    children = node.get("children")
+    if not isinstance(children, list):
+        return []
+    return [
+        child
+        for child in children
+        if isinstance(child, dict) and (child.get("type") == "reaction" or child.get("is_reaction"))
+    ]
+
+
+def _mol_children(node: dict[str, Any]) -> list[dict[str, Any]]:
+    children = node.get("children")
+    if not isinstance(children, list):
+        return []
+    return [
+        child
+        for child in children
+        if isinstance(child, dict) and (child.get("type") == "mol" or child.get("is_chemical"))
+    ]
+
+
+def _reaction_policy_probability(reaction: dict[str, Any]) -> float:
+    metadata = _coerce_dict(reaction.get("metadata"))
+    return _coerce_float(metadata.get("policy_probability")) or 0.0
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -541,3 +850,61 @@ def _first_scalar(value: Any) -> Any:
     if isinstance(value, list):
         return value[0] if value else None
     return value
+
+
+def _extract_container_name(command: list[str]) -> str | None:
+    """Extract container name from Docker command if present."""
+    try:
+        if "docker" in command and "run" in command:
+            # Look for --name flag
+            if "--name" in command:
+                name_index = command.index("--name")
+                if name_index + 1 < len(command):
+                    return command[name_index + 1]
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _cleanup_docker_container(container_name: str) -> None:
+    """Force remove a Docker container."""
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # Best effort cleanup, don't fail if it doesn't work
+        pass
+
+
+def _check_gpu_available(docker_image: str = "aizynthfinder:latest") -> bool:
+    """Check whether this image can actually use ONNX Runtime's CUDA provider."""
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--gpus",
+                "all",
+                "--entrypoint",
+                "python",
+                docker_image,
+                "-c",
+                (
+                    "import onnxruntime as ort; "
+                    "raise SystemExit(0 if 'CUDAExecutionProvider' "
+                    "in ort.get_available_providers() else 2)"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False

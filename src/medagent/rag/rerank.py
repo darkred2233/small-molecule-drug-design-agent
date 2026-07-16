@@ -8,6 +8,7 @@ from medagent.core.config import Settings
 
 class Reranker(Protocol):
     model_name: str
+    produces_scores: bool
 
     def rerank(self, query: str, documents: list[str], *, top_n: int) -> list[tuple[int, float]]:
         ...
@@ -15,10 +16,13 @@ class Reranker(Protocol):
 
 @dataclass
 class LocalScoreReranker:
-    model_name: str = "local-score-rerank"
+    model_name: str = "not_applied"
+    produces_scores: bool = False
 
     def rerank(self, query: str, documents: list[str], *, top_n: int) -> list[tuple[int, float]]:
-        return [(index, 1.0 - index * 0.001) for index, _ in enumerate(documents[:top_n])]
+        # Hybrid recall order is already deterministic. A local fallback must not invent
+        # model-like relevance scores from list positions.
+        return []
 
 
 @dataclass
@@ -27,6 +31,7 @@ class DashScopeReranker:
     model_name: str
     endpoint_url: str
     timeout_seconds: float = 30.0
+    produces_scores: bool = True
 
     def rerank(self, query: str, documents: list[str], *, top_n: int) -> list[tuple[int, float]]:
         if not documents:

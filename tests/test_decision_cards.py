@@ -2,6 +2,8 @@ from fastapi.testclient import TestClient
 
 from medagent.api.app import create_app
 from medagent.core.config import Settings
+from medagent.db.models import Molecule
+from medagent.api import app as api_app
 
 
 def make_client(tmp_path):
@@ -115,6 +117,32 @@ def test_decision_cards_are_generated_from_validation_results(tmp_path):
         assert {trace["source_agent"] for trace in traces} == {"decision_card_generator"}
 
 
+def test_unvalidated_decision_card_is_marked_as_hypothesis(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Hypothesis card"}).json()[
+            "project_id"
+        ]
+        with api_app.SessionLocal() as db:
+            db.add(
+                Molecule(
+                    molecule_id="MOL-HYPOTHESIS",
+                    project_id=project_id,
+                    smiles="CCO",
+                    status="generated",
+                    labels=[],
+                )
+            )
+            db.commit()
+
+        response = client.post(f"/projects/{project_id}/decision-cards/generate")
+
+        assert response.status_code == 201
+        card = client.get(f"/projects/{project_id}/decision-cards").json()[0]
+        assert card["provenance"]["claim_status"] == "hypothesis"
+        assert card["provenance"]["confidence_semantics"] == "not_calibrated"
+        assert card["confidence"] is None
+
+
 def test_assessed_molecules_do_not_regress_to_validation_cards(tmp_path):
     with make_client(tmp_path) as client:
         project_id = create_assessed_project(client)
@@ -149,21 +177,21 @@ def test_assessed_decision_cards_are_condensed_in_chinese(tmp_path):
 
         assert response.status_code == 201
         cards = client.get(f"/projects/{project_id}/decision-cards").json()
-        advanced_card = next(card for card in cards if card["decision"] == "advance_ranked_candidate")
+        watch_card = next(card for card in cards if card["decision"] == "watch_ranked_candidate")
 
-        assert advanced_card["title"] == "推进优化候选物"
-        assert "下一轮优化" in advanced_card["summary"]
-        assert advanced_card["support"]
-        assert advanced_card["risk"]
-        assert advanced_card["next_steps"]
-        assert all(not item.startswith("label=") for item in advanced_card["support"])
-        assert all(not item.startswith("label=") for item in advanced_card["risk"])
-        assert all("No major surrogate route risk detected" not in item for item in advanced_card["risk"])
-        assert all("No major AiZynthFinder route risk detected" not in item for item in advanced_card["risk"])
-        assert len(advanced_card["risk"]) == len(set(advanced_card["risk"]))
-        assert any(item.startswith("结构与理化性质：") for item in advanced_card["support"])
-        assert any(item.startswith("综合排名：") for item in advanced_card["support"])
-        assert any("外部对接" in item for item in advanced_card["risk"])
+        assert watch_card["title"] == "观察候选物"
+        assert "保留观察" in watch_card["summary"]
+        assert watch_card["support"]
+        assert watch_card["risk"]
+        assert watch_card["next_steps"]
+        assert all(not item.startswith("label=") for item in watch_card["support"])
+        assert all(not item.startswith("label=") for item in watch_card["risk"])
+        assert all("No major surrogate route risk detected" not in item for item in watch_card["risk"])
+        assert all("No major AiZynthFinder route risk detected" not in item for item in watch_card["risk"])
+        assert len(watch_card["risk"]) == len(set(watch_card["risk"]))
+        assert any(item.startswith("结构与理化性质：") for item in watch_card["support"])
+        assert any(item.startswith("综合排名：") for item in watch_card["support"])
+        assert any("外部对接" in item for item in watch_card["risk"])
 
 
 def test_molecule_decision_cards_can_be_read_and_regenerated_idempotently(tmp_path):

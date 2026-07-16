@@ -2,10 +2,14 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+from medagent.core.config import get_settings
+from medagent.services.docker_runtime import DockerMountBuilder, docker_temporary_directory
 
 
 _FLOAT_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
@@ -31,7 +35,12 @@ class DockingToolResult:
     vina_score: float | None = None
     cnn_score: float | None = None
     cnn_affinity: float | None = None
+    diffdock_confidence: float | None = None
     pose_file: str | None = None
+    selected_pose_rank: int | None = None
+    pose_count: int | None = None
+    pose_selection_method: str | None = None
+    best_pose_confirmed: bool = False
     labels: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     stdout: str = ""
@@ -120,32 +129,48 @@ def build_gnina_command(
 def build_gnina_docker_command(
     docker_image: str,
     request: DockingToolRequest,
+    use_gpu: bool = True,
+    cpu_mode: bool = False,
 ) -> tuple[list[str], str]:
     receptor_file = Path(request.receptor_file).resolve()
     ligand_file = Path(request.ligand_file).resolve()
     output_dir = Path(request.output_dir).resolve()
     pose_file = output_dir / f"{_safe_pose_prefix(request.molecule_id)}_gnina_pose.sdf"
+    container_name = f"gnina_{_safe_pose_prefix(request.molecule_id)}_{int(time.time() * 1000)}"
+    mounts = DockerMountBuilder()
+    receptor_dir = mounts.bind(receptor_file.parent, "/data/receptor", read_only=True)
+    ligand_dir = mounts.bind(ligand_file.parent, "/data/ligand", read_only=True)
+    output_path = mounts.bind(output_dir, "/data/output")
+
     command = [
         "docker",
         "run",
         "--rm",
-        "-v",
-        f"{receptor_file.parent}:/data/receptor:ro",
-        "-v",
-        f"{ligand_file.parent}:/data/ligand:ro",
-        "-v",
-        f"{output_dir}:/data/output",
+        "--name",
+        container_name,
+    ]
+
+    # Add GPU support if available and requested
+    if use_gpu and not cpu_mode:
+        command.extend(["--gpus", "all"])
+
+    command.extend([*mounts.arguments,
         docker_image,
         "gnina",
         "-r",
-        f"/data/receptor/{receptor_file.name}",
+        str(PurePosixPath(receptor_dir, receptor_file.name)),
         "-l",
-        f"/data/ligand/{ligand_file.name}",
+        str(PurePosixPath(ligand_dir, ligand_file.name)),
         "-o",
-        f"/data/output/{pose_file.name}",
+        str(PurePosixPath(output_path, pose_file.name)),
         "--exhaustiveness",
         str(request.exhaustiveness),
-    ]
+    ])
+
+    # Add CPU-friendly parameters if in CPU mode
+    if cpu_mode:
+        command.extend(["--cnn_scoring", "none"])
+
     command.extend(_grid_args(request))
     return command, str(pose_file)
 
@@ -175,31 +200,41 @@ def build_vina_command(
 def build_vina_docker_command(
     docker_image: str,
     request: DockingToolRequest,
+    use_gpu: bool = False,
 ) -> tuple[list[str], str]:
     receptor_file = Path(request.receptor_file).resolve()
     ligand_file = Path(request.ligand_file).resolve()
     output_dir = Path(request.output_dir).resolve()
     pose_file = output_dir / f"{_safe_pose_prefix(request.molecule_id)}_vina_pose.pdbqt"
+    container_name = f"vina_{_safe_pose_prefix(request.molecule_id)}_{int(time.time() * 1000)}"
+    mounts = DockerMountBuilder()
+    receptor_dir = mounts.bind(receptor_file.parent, "/data/receptor", read_only=True)
+    ligand_dir = mounts.bind(ligand_file.parent, "/data/ligand", read_only=True)
+    output_path = mounts.bind(output_dir, "/data/output")
+
     script = _vina_docker_python_script(
-        receptor_path=f"/data/receptor/{receptor_file.name}",
-        ligand_path=f"/data/ligand/{ligand_file.name}",
-        pose_path=f"/data/output/{pose_file.name}",
+        receptor_path=str(PurePosixPath(receptor_dir, receptor_file.name)),
+        ligand_path=str(PurePosixPath(ligand_dir, ligand_file.name)),
+        pose_path=str(PurePosixPath(output_path, pose_file.name)),
         request=request,
     )
     command = [
         "docker",
         "run",
         "--rm",
-        "-v",
-        f"{receptor_file.parent}:/data/receptor:ro",
-        "-v",
-        f"{ligand_file.parent}:/data/ligand:ro",
-        "-v",
-        f"{output_dir}:/data/output",
+        "--name",
+        container_name,
+    ]
+
+    # Vina doesn't typically need GPU, but allow it if requested
+    if use_gpu:
+        command.extend(["--gpus", "all"])
+
+    command.extend([*mounts.arguments,
         docker_image,
         "-c",
         script,
-    ]
+    ])
     return command, str(pose_file)
 
 
@@ -207,9 +242,12 @@ def run_gnina_docking(executable: str, request: DockingToolRequest) -> DockingTo
     Path(request.output_dir).mkdir(parents=True, exist_ok=True)
     command, pose_file = build_gnina_command(executable, request)
     exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
-    parsed = parse_gnina_output(stdout)
-    success = exit_code == 0 and parsed["vina_score"] is not None
+    parsed = parse_gnina_output(_combined_output(stdout, stderr))
+    pose_exists = pose_artifact_available(pose_file)
+    success = exit_code == 0 and parsed["vina_score"] is not None and pose_exists
     warnings = _tool_warnings(exit_code, parsed["vina_score"], stderr)
+    if exit_code == 0 and parsed["vina_score"] is not None and not pose_exists:
+        warnings.append("external_docking_pose_file_missing")
     return DockingToolResult(
         adapter_mode="gnina_external_docking",
         tool_name="gnina",
@@ -218,6 +256,10 @@ def run_gnina_docking(executable: str, request: DockingToolRequest) -> DockingTo
         cnn_score=parsed["cnn_score"],
         cnn_affinity=parsed["cnn_affinity"],
         pose_file=pose_file if success else None,
+        selected_pose_rank=parsed["selected_pose_rank"],
+        pose_count=parsed["pose_count"],
+        pose_selection_method=parsed["pose_selection_method"],
+        best_pose_confirmed=bool(parsed["best_pose_confirmed"] and pose_exists),
         labels=_result_labels("gnina", success),
         warnings=warnings,
         stdout=stdout,
@@ -234,11 +276,29 @@ def run_gnina_docker_docking(
 ) -> DockingToolResult:
     Path(request.output_dir).mkdir(parents=True, exist_ok=True)
     docker_image = gnina_status.get("docker_image") or "gnina/gnina:latest"
-    command, pose_file = build_gnina_docker_command(docker_image, request)
+
+    has_gpu = bool(gnina_status.get("gpu_available"))
+    if "gpu_available" not in gnina_status:
+        has_gpu = _check_gpu_available()
+    cpu_mode = not has_gpu
+
+    command, pose_file = build_gnina_docker_command(
+        docker_image,
+        request,
+        use_gpu=has_gpu,
+        cpu_mode=cpu_mode,
+    )
     exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
-    parsed = parse_gnina_output(stdout)
-    success = exit_code == 0 and parsed["vina_score"] is not None
+    parsed = parse_gnina_output(_combined_output(stdout, stderr))
+    pose_exists = pose_artifact_available(pose_file)
+    success = exit_code == 0 and parsed["vina_score"] is not None and pose_exists
     warnings = _tool_warnings(exit_code, parsed["vina_score"], stderr)
+    if exit_code == 0 and parsed["vina_score"] is not None and not pose_exists:
+        warnings.append("external_docking_pose_file_missing")
+
+    if cpu_mode:
+        warnings.append("gnina_running_in_cpu_mode")
+
     return DockingToolResult(
         adapter_mode="gnina_docker_docking",
         tool_name="gnina",
@@ -247,6 +307,10 @@ def run_gnina_docker_docking(
         cnn_score=parsed["cnn_score"],
         cnn_affinity=parsed["cnn_affinity"],
         pose_file=pose_file if success else None,
+        selected_pose_rank=parsed["selected_pose_rank"],
+        pose_count=parsed["pose_count"],
+        pose_selection_method=parsed["pose_selection_method"],
+        best_pose_confirmed=bool(parsed["best_pose_confirmed"] and pose_exists),
         labels=_result_labels("gnina", success),
         warnings=warnings,
         stdout=stdout,
@@ -261,15 +325,22 @@ def run_vina_docking(executable: str, request: DockingToolRequest) -> DockingToo
     Path(request.output_dir).mkdir(parents=True, exist_ok=True)
     command, pose_file = build_vina_command(executable, request)
     exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
-    parsed = parse_vina_output(stdout)
-    success = exit_code == 0 and parsed["vina_score"] is not None
+    parsed = parse_vina_output(_combined_output(stdout, stderr))
+    pose_exists = pose_artifact_available(pose_file)
+    success = exit_code == 0 and parsed["vina_score"] is not None and pose_exists
     warnings = _tool_warnings(exit_code, parsed["vina_score"], stderr)
+    if exit_code == 0 and parsed["vina_score"] is not None and not pose_exists:
+        warnings.append("external_docking_pose_file_missing")
     return DockingToolResult(
         adapter_mode="vina_external_docking",
         tool_name="vina",
         success=success,
         vina_score=parsed["vina_score"],
         pose_file=pose_file if success else None,
+        selected_pose_rank=parsed["selected_pose_rank"],
+        pose_count=parsed["pose_count"],
+        pose_selection_method=parsed["pose_selection_method"],
+        best_pose_confirmed=bool(parsed["best_pose_confirmed"] and pose_exists),
         labels=_result_labels("vina", success),
         warnings=warnings,
         stdout=stdout,
@@ -288,15 +359,22 @@ def run_vina_docker_docking(
     docker_image = vina_status.get("docker_image") or "vina:latest"
     command, pose_file = build_vina_docker_command(docker_image, request)
     exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
-    parsed = parse_vina_output(stdout)
-    success = exit_code == 0 and parsed["vina_score"] is not None
+    parsed = parse_vina_output(_combined_output(stdout, stderr))
+    pose_exists = pose_artifact_available(pose_file)
+    success = exit_code == 0 and parsed["vina_score"] is not None and pose_exists
     warnings = _tool_warnings(exit_code, parsed["vina_score"], stderr)
+    if exit_code == 0 and parsed["vina_score"] is not None and not pose_exists:
+        warnings.append("external_docking_pose_file_missing")
     return DockingToolResult(
         adapter_mode="vina_docker_docking",
         tool_name="vina",
         success=success,
         vina_score=parsed["vina_score"],
         pose_file=pose_file if success else None,
+        selected_pose_rank=parsed["selected_pose_rank"],
+        pose_count=parsed["pose_count"],
+        pose_selection_method=parsed["pose_selection_method"],
+        best_pose_confirmed=bool(parsed["best_pose_confirmed"] and pose_exists),
         labels=_result_labels("vina", success),
         warnings=warnings,
         stdout=stdout,
@@ -340,9 +418,16 @@ def _run_diffdock_local(
     command = [
         "python", "-m", "diffdock",
         "--protein_path", request.receptor_file,
-        "--ligand_path", request.ligand_file,
-        "--output_dir", str(output_dir),
+        "--ligand_description", request.ligand_file,
+        "--out_dir", str(output_dir),
     ]
+
+    model_dir = _configured_directory("DIFFDOCK_MODEL_DIR")
+    confidence_dir = _configured_directory("DIFFDOCK_CONFIDENCE_MODEL_DIR")
+    if model_dir:
+        command.extend(["--model_dir", str(model_dir)])
+    if confidence_dir:
+        command.extend(["--confidence_model_dir", str(confidence_dir)])
 
     # Add complex_id if molecule_id provided
     if request.molecule_id:
@@ -365,8 +450,12 @@ def _run_diffdock_local(
         tool_name="diffdock",
         success=success,
         vina_score=parsed.get("vina_score"),
-        cnn_score=parsed.get("confidence_score"),
+        diffdock_confidence=parsed.get("confidence_score"),
         pose_file=parsed.get("pose_file") if success else None,
+        selected_pose_rank=parsed.get("selected_pose_rank"),
+        pose_count=parsed.get("pose_count"),
+        pose_selection_method=parsed.get("pose_selection_method"),
+        best_pose_confirmed=bool(parsed.get("best_pose_confirmed")),
         labels=_result_labels("diffdock", success),
         warnings=warnings,
         stdout=stdout,
@@ -384,10 +473,10 @@ def _run_diffdock_docker(
     """Run DiffDock via Docker container."""
     output_dir = Path(request.output_dir)
     docker_image = diffdock_status.get("docker_image", "diffdock:latest")
+    container_name = f"diffdock_{_safe_pose_prefix(request.molecule_id)}_{int(time.time() * 1000)}"
 
-    # Create temp directories for Docker mounts
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix="diffdock_") as tmp_dir:
+    # Keep Docker inputs on a shared API volume when running inside the API container.
+    with docker_temporary_directory(prefix="diffdock_") as tmp_dir:
         tmp_path = Path(tmp_dir)
         protein_link = tmp_path / "protein.pdb"
         ligand_link = tmp_path / "ligand.sdf"
@@ -399,26 +488,23 @@ def _run_diffdock_docker(
         shutil.copy2(request.ligand_file, ligand_link)
         out_dir.mkdir()
 
-        command = [
-            "docker", "run", "--rm",
-            "-v", f"{tmp_path}:/data",
-            "--entrypoint", "python",
-            docker_image,
-            "-m", "diffdock",
-            "--protein_path", "/data/protein.pdb",
-            "--ligand_path", "/data/ligand.sdf",
-            "--output_dir", "/data/output",
-        ]
+        has_gpu = bool(diffdock_status.get("gpu_available"))
+        if "gpu_available" not in diffdock_status:
+            has_gpu = _check_gpu_available(docker_image)
 
-        if request.molecule_id:
-            command.extend(["--complex_id", request.molecule_id])
+        command = build_diffdock_docker_command(
+            docker_image,
+            request,
+            data_dir=tmp_path,
+            use_gpu=has_gpu,
+            container_name=container_name,
+        )
 
         exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
 
         # Copy results back
         if out_dir.exists():
-            for f in out_dir.glob("*"):
-                shutil.copy2(f, output_dir / f.name)
+            shutil.copytree(out_dir, output_dir, dirs_exist_ok=True)
 
         parsed = parse_diffdock_output(stdout, output_dir, request.molecule_id)
         success = exit_code == 0 and parsed.get("confidence_score") is not None
@@ -428,14 +514,20 @@ def _run_diffdock_docker(
             warnings.append("diffdock_docker_failed")
         if not parsed.get("confidence_score"):
             warnings.append("diffdock_confidence_not_found")
+        if not has_gpu:
+            warnings.append("diffdock_running_without_gpu")
 
         return DockingToolResult(
             adapter_mode="diffdock_docker_docking",
             tool_name="diffdock",
             success=success,
             vina_score=parsed.get("vina_score"),
-            cnn_score=parsed.get("confidence_score"),
+            diffdock_confidence=parsed.get("confidence_score"),
             pose_file=parsed.get("pose_file") if success else None,
+            selected_pose_rank=parsed.get("selected_pose_rank"),
+            pose_count=parsed.get("pose_count"),
+            pose_selection_method=parsed.get("pose_selection_method"),
+            best_pose_confirmed=bool(parsed.get("best_pose_confirmed")),
             labels=_result_labels("diffdock", success),
             warnings=warnings,
             stdout=stdout,
@@ -454,13 +546,17 @@ def parse_diffdock_output(
     """Parse DiffDock output to extract confidence score and pose file.
 
     DiffDock outputs:
-    - confidence_score: 0-1, higher is better
+    - confidence_score: model-specific uncalibrated score; higher is better
     - pose file in SDF format
     """
     result: dict[str, Any] = {
         "confidence_score": None,
         "vina_score": None,
         "pose_file": None,
+        "selected_pose_rank": None,
+        "pose_count": None,
+        "pose_selection_method": None,
+        "best_pose_confirmed": False,
     }
 
     # Parse confidence score from stdout
@@ -475,17 +571,137 @@ def parse_diffdock_output(
     if match and result["confidence_score"] is None:
         result["confidence_score"] = _rounded(float(match.group(1)))
 
-    # Find pose file
+    # Find the tool-ranked best pose. Do not infer "best" from filesystem order.
     prefix = _safe_pose_prefix(molecule_id)
-    pose_candidates = list(Path(output_dir).glob(f"*{prefix}*rank1*.sdf"))
-    if not pose_candidates:
-        pose_candidates = list(Path(output_dir).glob(f"*{prefix}*.sdf"))
-    if not pose_candidates:
-        pose_candidates = list(Path(output_dir).glob("rank1*.sdf"))
-    if pose_candidates:
-        result["pose_file"] = str(pose_candidates[0])
+    all_pose_files = sorted(Path(output_dir).rglob("*.sdf"))
+    ranked_pose_files: list[tuple[int, Path]] = []
+    for pose_path in all_pose_files:
+        rank_match = re.search(r"(?:^|[_-])rank(?P<rank>\d+)(?:[_-]|$)", pose_path.stem, re.IGNORECASE)
+        if rank_match:
+            ranked_pose_files.append((int(rank_match.group("rank")), pose_path))
+    matching_ranked = [item for item in ranked_pose_files if prefix in item[1].stem]
+    if matching_ranked:
+        ranked_pose_files = matching_ranked
+    ranked_pose_files.sort(key=lambda item: (item[0], str(item[1])))
+
+    selected_pose: Path | None = None
+    if ranked_pose_files:
+        selected_rank, selected_pose = ranked_pose_files[0]
+        result["selected_pose_rank"] = selected_rank
+        result["pose_count"] = len(ranked_pose_files)
+        if selected_rank == 1:
+            result["pose_selection_method"] = "diffdock_rank_1_by_confidence"
+            result["best_pose_confirmed"] = True
+        else:
+            result["pose_selection_method"] = (
+                "lowest_available_diffdock_rank_best_not_confirmed"
+            )
+    else:
+        matching_files = [path for path in all_pose_files if prefix in path.stem]
+        fallback_files = matching_files or all_pose_files
+        if fallback_files:
+            selected_pose = fallback_files[0]
+            result["pose_count"] = len(fallback_files)
+            result["pose_selection_method"] = "unranked_pose_output_best_not_confirmed"
+
+    if selected_pose is not None:
+        result["pose_file"] = str(selected_pose)
+        confidence_match = re.search(
+            rf"confidence(?P<score>{_FLOAT_PATTERN})",
+            selected_pose.stem,
+            re.IGNORECASE,
+        )
+        if confidence_match:
+            # Prefer the score encoded for the selected pose over an unrelated
+            # confidence line that may appear earlier in stdout.
+            result["confidence_score"] = _rounded(float(confidence_match.group("score")))
 
     return result
+
+
+def build_diffdock_docker_command(
+    docker_image: str,
+    request: DockingToolRequest,
+    *,
+    data_dir: Path,
+    use_gpu: bool,
+    container_name: str | None = None,
+) -> list[str]:
+    mounts = DockerMountBuilder()
+    data_path = mounts.bind(data_dir.resolve(), "/data")
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        container_name
+        or f"diffdock_{_safe_pose_prefix(request.molecule_id)}_{int(time.time() * 1000)}",
+    ]
+    if use_gpu:
+        command.extend(["--gpus", "all"])
+    model_dir = _configured_directory("DIFFDOCK_MODEL_DIR")
+    confidence_dir = _configured_directory("DIFFDOCK_CONFIDENCE_MODEL_DIR")
+    model_path = mounts.bind(model_dir, "/models/score", read_only=True) if model_dir else None
+    confidence_path = (
+        mounts.bind(confidence_dir, "/models/confidence", read_only=True)
+        if confidence_dir
+        else None
+    )
+    command.extend([*mounts.arguments, "-w", "/app/diffdock"])
+    command.extend(
+        [
+            "--entrypoint",
+            "python",
+            docker_image,
+            "/app/diffdock/inference.py",
+            "--protein_path",
+            str(PurePosixPath(data_path, "protein.pdb")),
+            "--ligand_description",
+            str(PurePosixPath(data_path, "ligand.sdf")),
+            "--out_dir",
+            str(PurePosixPath(data_path, "output")),
+        ]
+    )
+    if request.molecule_id:
+        command.extend(["--complex_name", request.molecule_id])
+    if model_path:
+        command.extend(["--model_dir", model_path])
+    if confidence_path:
+        command.extend(
+            [
+                "--confidence_model_dir",
+                confidence_path,
+                "--confidence_ckpt",
+                "best_model_epoch75.pt",
+            ]
+        )
+    return command
+
+
+def _configured_directory(env_name: str) -> Path | None:
+    configured = os.environ.get(env_name)
+    if not configured:
+        setting_name = {
+            "DIFFDOCK_MODEL_DIR": "diffdock_model_dir",
+            "DIFFDOCK_CONFIDENCE_MODEL_DIR": "diffdock_confidence_model_dir",
+        }.get(env_name)
+        if setting_name:
+            configured = getattr(get_settings(), setting_name, None)
+    if not configured:
+        return None
+    path = Path(configured).expanduser().resolve()
+    return path if path.is_dir() else None
+
+
+def _diffdock_models_configured() -> bool:
+    model_dir = _configured_directory("DIFFDOCK_MODEL_DIR")
+    confidence_dir = _configured_directory("DIFFDOCK_CONFIDENCE_MODEL_DIR")
+    return bool(
+        model_dir
+        and (model_dir / "best_ema_inference_epoch_model.pt").is_file()
+        and confidence_dir
+        and (confidence_dir / "best_model_epoch75.pt").is_file()
+    )
 
 
 def check_diffdock_available() -> dict[str, Any]:
@@ -495,31 +711,74 @@ def check_diffdock_available() -> dict[str, Any]:
         "mode": None,
         "version": None,
         "docker_image": None,
+        "runtime_available": False,
+        "model_configured": _diffdock_models_configured(),
+        "gpu_available": False,
+        "warning": None,
     }
 
-    # Check local Python package
-    try:
-        import diffdock
-        result["available"] = True
+    local_probe = _run_probe([sys.executable, "-m", "diffdock", "--help"])
+    if local_probe is not None and local_probe.returncode == 0:
+        result["runtime_available"] = True
         result["mode"] = "python_package"
-        result["version"] = getattr(diffdock, "__version__", "unknown")
+        result["version"] = "source"
+        result["model_configured"] = _diffdock_models_configured()
+        result["available"] = result["model_configured"]
+        if not result["model_configured"]:
+            result["warning"] = "diffdock_model_not_configured"
         return result
-    except ImportError:
-        pass
 
-    # Check Docker
-    try:
-        proc = subprocess.run(
-            ["docker", "image", "inspect", "diffdock:latest"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if proc.returncode == 0:
-            result["available"] = True
-            result["mode"] = "docker"
-            result["docker_image"] = "diffdock:latest"
-            return result
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    image = _first_existing_docker_image(
+        [os.environ.get("DIFFDOCK_IMAGE", "diffdock:latest"), "diffdock:latest"]
+    )
+    if image is None:
+        return result
+
+    result["mode"] = "docker"
+    result["docker_image"] = image
+    runtime_probe = _run_probe(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "python",
+            image,
+            "/app/diffdock/inference.py",
+            "--help",
+        ],
+        timeout=30,
+    )
+    result["runtime_available"] = bool(runtime_probe and runtime_probe.returncode == 0)
+    if not result["runtime_available"]:
+        result["warning"] = "diffdock_runtime_probe_failed"
+        return result
+
+    model_probe = _run_probe(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "python",
+            image,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "root=Path('/app/diffdock'); "
+                "files=[*root.rglob('*.pt'),*root.rglob('*.ckpt'),*root.rglob('*.pth')]; "
+                "raise SystemExit(0 if files else 2)"
+            ),
+        ],
+        timeout=20,
+    )
+    result["model_configured"] = _diffdock_models_configured() or bool(
+        model_probe and model_probe.returncode == 0
+    )
+    result["gpu_available"] = _check_gpu_available(image)
+    result["available"] = result["runtime_available"] and result["model_configured"]
+    if not result["model_configured"]:
+        result["warning"] = "diffdock_model_not_configured"
 
     return result
 
@@ -531,10 +790,22 @@ def check_gnina_available() -> dict[str, Any]:
         "version": None,
         "path": None,
         "docker_image": None,
+        "runtime_available": False,
+        "gpu_available": False,
+        "warning": None,
     }
     path = shutil.which("gnina")
     if path is not None:
-        return {**result, "available": True, "mode": "local_cli", "path": path}
+        probe = _run_probe([path, "--version"])
+        if probe is not None and probe.returncode == 0:
+            return {
+                **result,
+                "available": True,
+                "runtime_available": True,
+                "mode": "local_cli",
+                "path": path,
+                "version": _probe_version(probe),
+            }
 
     docker_image = _first_existing_docker_image(
         [
@@ -545,7 +816,26 @@ def check_gnina_available() -> dict[str, Any]:
         ]
     )
     if docker_image is not None:
-        return {**result, "available": True, "mode": "docker", "docker_image": docker_image}
+        probe = _run_probe(
+            ["docker", "run", "--rm", docker_image, "gnina", "--version"],
+            timeout=20,
+        )
+        if probe is not None and probe.returncode == 0:
+            return {
+                **result,
+                "available": True,
+                "runtime_available": True,
+                "mode": "docker",
+                "docker_image": docker_image,
+                "version": _probe_version(probe),
+                "gpu_available": _check_gpu_available(docker_image),
+            }
+        return {
+            **result,
+            "mode": "docker",
+            "docker_image": docker_image,
+            "warning": "gnina_runtime_probe_failed",
+        }
     return result
 
 
@@ -556,47 +846,101 @@ def check_vina_available() -> dict[str, Any]:
         "version": None,
         "path": None,
         "docker_image": None,
+        "runtime_available": False,
+        "warning": None,
     }
     for command in ["vina", "autodock_vina", "vina_1_1_2"]:
         path = shutil.which(command)
         if path is not None:
-            return {**result, "available": True, "mode": "local_cli", "path": path}
+            probe = _run_probe([path, "--version"])
+            if probe is not None and probe.returncode == 0:
+                return {
+                    **result,
+                    "available": True,
+                    "runtime_available": True,
+                    "mode": "local_cli",
+                    "path": path,
+                    "version": _probe_version(probe),
+                }
 
     docker_image = _first_existing_docker_image(["vina:latest"])
     if docker_image is not None:
-        return {**result, "available": True, "mode": "docker", "docker_image": docker_image}
+        probe = _run_probe(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "python",
+                docker_image,
+                "-c",
+                "from vina import Vina; print('vina-python-ok')",
+            ],
+            timeout=20,
+        )
+        if probe is not None and probe.returncode == 0:
+            return {
+                **result,
+                "available": True,
+                "runtime_available": True,
+                "mode": "docker",
+                "docker_image": docker_image,
+                "version": _probe_version(probe),
+            }
+        return {
+            **result,
+            "mode": "docker",
+            "docker_image": docker_image,
+            "warning": "vina_runtime_probe_failed",
+        }
     return result
 
 
-def parse_gnina_output(stdout: str) -> dict[str, float | None]:
+def parse_gnina_output(stdout: str) -> dict[str, Any]:
     affinity = _valid_affinity(_find_named_float(stdout, "Affinity"))
     cnn_score = _valid_cnn_score(_find_named_float(stdout, "CNNscore"))
     cnn_affinity = _valid_affinity(_find_named_float(stdout, "CNNaffinity"))
+    mode_values = _mode_values(stdout)
     if affinity is None or cnn_score is None or cnn_affinity is None:
-        table_values = _first_mode_values(stdout)
+        table_values = mode_values[0] if mode_values else None
         if table_values:
             affinity = affinity if affinity is not None else table_values.get("affinity")
             cnn_score = cnn_score if cnn_score is not None else table_values.get("cnn_score")
             cnn_affinity = (
                 cnn_affinity if cnn_affinity is not None else table_values.get("cnn_affinity")
             )
+    selected = affinity is not None or cnn_score is not None or cnn_affinity is not None
     return {
         "vina_score": _rounded(affinity),
         "cnn_score": _rounded(cnn_score),
         "cnn_affinity": _rounded(cnn_affinity),
+        "selected_pose_rank": 1 if selected else None,
+        "pose_count": len(mode_values) if mode_values else (1 if selected else None),
+        "pose_selection_method": "gnina_output_mode_1" if selected else None,
+        "best_pose_confirmed": selected,
     }
 
 
-def parse_vina_output(stdout: str) -> dict[str, float | None]:
+def parse_vina_output(stdout: str) -> dict[str, Any]:
+    mode_values = _mode_values(stdout)
     remark_score = _find_remark_vina_score(stdout)
     if remark_score is not None:
-        return {"vina_score": _rounded(_valid_affinity(remark_score))}
-    table_values = _first_mode_values(stdout)
-    return {"vina_score": _rounded(table_values.get("affinity")) if table_values else None}
+        vina_score = _rounded(_valid_affinity(remark_score))
+    else:
+        table_values = mode_values[0] if mode_values else None
+        vina_score = _rounded(table_values.get("affinity")) if table_values else None
+    return {
+        "vina_score": vina_score,
+        "selected_pose_rank": 1 if vina_score is not None else None,
+        "pose_count": len(mode_values) if mode_values else (1 if vina_score is not None else None),
+        "pose_selection_method": "vina_lowest_affinity_mode_1" if vina_score is not None else None,
+        "best_pose_confirmed": vina_score is not None,
+    }
 
 
 def _run_command(command: list[str], timeout_seconds: int) -> tuple[int | None, str, str, float]:
     started = time.perf_counter()
+    container_name = _extract_container_name(command)
     try:
         completed = subprocess.run(
             command,
@@ -607,6 +951,9 @@ def _run_command(command: list[str], timeout_seconds: int) -> tuple[int | None, 
         )
     except subprocess.TimeoutExpired as exc:
         runtime_seconds = time.perf_counter() - started
+        # Clean up Docker container if timeout occurred
+        if container_name:
+            _cleanup_docker_container(container_name)
         return None, exc.stdout or "", exc.stderr or "docking_tool_timeout", runtime_seconds
     except OSError as exc:
         runtime_seconds = time.perf_counter() - started
@@ -662,12 +1009,14 @@ def _grid_args(request: DockingToolRequest) -> list[str]:
     ]
 
 
-def _first_mode_values(stdout: str) -> dict[str, float] | None:
+def _mode_values(stdout: str) -> list[dict[str, float]]:
     row_pattern = re.compile(
         rf"^\s*(\d{{1,3}})\s+\|?\s*({_FLOAT_PATTERN})"
         rf"(?:\s+\|?\s*({_FLOAT_PATTERN}))?"
         rf"(?:\s+\|?\s*({_FLOAT_PATTERN}))?"
+        rf"(?:\s+\|?\s*({_FLOAT_PATTERN}))?"
     )
+    results: list[dict[str, float]] = []
     for line in stdout.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("-") or stripped.lower().startswith("mode"):
@@ -680,16 +1029,19 @@ def _first_mode_values(stdout: str) -> dict[str, float] | None:
         if mode <= 0 or mode > 100 or affinity is None:
             continue
         result = {"affinity": affinity}
-        if match.group(3) is not None:
-            cnn_score = _valid_cnn_score(float(match.group(3)))
+        cnn_score_value = match.group(4) if match.group(5) is not None else match.group(3)
+        cnn_affinity_value = match.group(5) if match.group(5) is not None else match.group(4)
+        if cnn_score_value is not None:
+            cnn_score = _valid_cnn_score(float(cnn_score_value))
             if cnn_score is not None:
                 result["cnn_score"] = cnn_score
-        if match.group(4) is not None:
-            cnn_affinity = _valid_affinity(float(match.group(4)))
+        if cnn_affinity_value is not None:
+            cnn_affinity = _valid_affinity(float(cnn_affinity_value))
             if cnn_affinity is not None:
                 result["cnn_affinity"] = cnn_affinity
-        return result
-    return None
+        result["rank"] = float(mode)
+        results.append(result)
+    return results
 
 
 def _find_named_float(stdout: str, label: str) -> float | None:
@@ -725,13 +1077,174 @@ def _tool_warnings(
     stderr: str,
 ) -> list[str]:
     warnings: list[str] = []
-    if exit_code != 0:
+    error_text = stderr.lower()
+    if exit_code is None:
+        warnings.append("external_docking_timeout")
+    elif exit_code != 0:
         warnings.append("external_docking_tool_failed")
+    if "pdbqt parsing error" in error_text and (
+        "rigid receptor" in error_text or "> root" in error_text
+    ):
+        warnings.append("external_docking_invalid_receptor_pdbqt")
+    elif "pdbqt parsing error" in error_text and "ligand" in error_text:
+        warnings.append("external_docking_invalid_ligand_pdbqt")
+    if any(
+        marker in error_text
+        for marker in [
+            "could not select device driver",
+            "nvidia-container-cli",
+            "no cuda-capable device",
+            "cuda driver version is insufficient",
+        ]
+    ):
+        warnings.append("external_docking_gpu_unavailable")
+    if "out of memory" in error_text or "cuda error: out of memory" in error_text:
+        warnings.append("external_docking_out_of_memory")
+    if "no such file or directory" in error_text or "file not found" in error_text:
+        warnings.append("external_docking_input_file_not_found")
     if vina_score is None:
         warnings.append("external_docking_score_not_found")
-    if stderr:
+    if stderr and "docking_tool_timeout" not in stderr:
         warnings.append("external_docking_stderr_present")
     return warnings
+
+
+def pose_artifact_available(pose_file: str | None) -> bool:
+    if not pose_file:
+        return False
+    path = Path(pose_file)
+    return path.is_file() and path.stat().st_size > 0
+
+
+def pose_coordinates_from_file(
+    pose_file: str | None,
+    *,
+    max_atoms: int = 120,
+) -> dict[str, Any] | None:
+    if not pose_artifact_available(pose_file):
+        return None
+
+    assert pose_file is not None
+    path = Path(pose_file)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    parsed = _parse_v2000_pose_atoms(text, max_atoms=max_atoms)
+    pose_format = "sdf"
+    if parsed is None and path.suffix.lower() in {".pdb", ".pdbqt"}:
+        parsed = _parse_pdb_pose_atoms(text, max_atoms=max_atoms)
+        pose_format = path.suffix.lower().lstrip(".")
+    if parsed is None and path.suffix.lower() == ".xyz":
+        parsed = _parse_xyz_pose_atoms(text, max_atoms=max_atoms)
+        pose_format = "xyz"
+    if parsed is None:
+        return None
+
+    atom_count, atoms = parsed
+    return {
+        "format": pose_format,
+        "atom_count": atom_count,
+        "returned_atom_count": len(atoms),
+        "truncated": atom_count > len(atoms),
+        "atoms": atoms,
+    }
+
+
+def _parse_v2000_pose_atoms(
+    text: str,
+    *,
+    max_atoms: int,
+) -> tuple[int, list[dict[str, Any]]] | None:
+    lines = text.splitlines()
+    counts_index: int | None = None
+    atom_count: int | None = None
+    for index, line in enumerate(lines):
+        parts = line.split()
+        if len(parts) < 2 or "V2000" not in line.upper():
+            continue
+        try:
+            atom_count = int(parts[0])
+        except ValueError:
+            continue
+        counts_index = index
+        break
+
+    if counts_index is None or atom_count is None or atom_count <= 0:
+        return None
+
+    atoms: list[dict[str, Any]] = []
+    for offset, line in enumerate(lines[counts_index + 1 : counts_index + 1 + atom_count], start=1):
+        if len(atoms) >= max_atoms:
+            break
+        parts = line.split()
+        if len(parts) < 4:
+            return None
+        try:
+            x, y, z = (round(float(parts[i]), 4) for i in range(3))
+        except ValueError:
+            return None
+        atoms.append({"index": offset, "element": parts[3], "x": x, "y": y, "z": z})
+
+    return (atom_count, atoms) if atoms else None
+
+
+def _parse_pdb_pose_atoms(
+    text: str,
+    *,
+    max_atoms: int,
+) -> tuple[int, list[dict[str, Any]]] | None:
+    atom_lines = [
+        line for line in text.splitlines() if line.startswith(("ATOM  ", "HETATM"))
+    ]
+    atoms: list[dict[str, Any]] = []
+    for line in atom_lines[:max_atoms]:
+        try:
+            x = round(float(line[30:38]), 4)
+            y = round(float(line[38:46]), 4)
+            z = round(float(line[46:54]), 4)
+        except ValueError:
+            return None
+        element = line[76:78].strip() or line[12:16].strip().lstrip("0123456789")[:2]
+        atoms.append(
+            {
+                "index": len(atoms) + 1,
+                "element": element or "X",
+                "x": x,
+                "y": y,
+                "z": z,
+            }
+        )
+    return (len(atom_lines), atoms) if atoms else None
+
+
+def _parse_xyz_pose_atoms(
+    text: str,
+    *,
+    max_atoms: int,
+) -> tuple[int, list[dict[str, Any]]] | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    try:
+        atom_count = int(lines[0])
+    except ValueError:
+        return None
+
+    atoms: list[dict[str, Any]] = []
+    for offset, line in enumerate(lines[2 : 2 + atom_count], start=1):
+        if len(atoms) >= max_atoms:
+            break
+        parts = line.split()
+        if len(parts) < 4:
+            return None
+        try:
+            x, y, z = (round(float(parts[i]), 4) for i in range(1, 4))
+        except ValueError:
+            return None
+        atoms.append({"index": offset, "element": parts[0], "x": x, "y": y, "z": z})
+    return (atom_count, atoms) if atoms else None
 
 
 def _result_labels(tool_name: str, success: bool) -> list[str]:
@@ -761,10 +1274,13 @@ def _first_existing_docker_image(images: list[str | None]) -> str | None:
                 text=True,
                 timeout=5,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+            if proc.returncode == 0:
+                return image
+        except subprocess.TimeoutExpired:
+            continue
+        except FileNotFoundError:
+            # Docker not found, bail out
             return None
-        if proc.returncode == 0:
-            return image
     return None
 
 
@@ -781,3 +1297,83 @@ def _rounded(value: float | None) -> float | None:
     if value is None:
         return None
     return round(float(value), 3)
+
+
+def _combined_output(stdout: str, stderr: str) -> str:
+    return "\n".join(part for part in [stdout, stderr] if part)
+
+
+def _run_probe(command: list[str], timeout: int = 10):
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+
+def _probe_version(probe) -> str:
+    output = _combined_output(probe.stdout or "", probe.stderr or "").strip()
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in lines:
+        if re.search(r"\b(?:gnina|vina)\b", line, re.IGNORECASE):
+            return line
+    return lines[0] if lines else "unknown"
+
+
+def _extract_container_name(command: list[str]) -> str | None:
+    """Extract container name from Docker command if present."""
+    try:
+        if "docker" in command and "run" in command:
+            # Look for --name flag
+            if "--name" in command:
+                name_index = command.index("--name")
+                if name_index + 1 < len(command):
+                    return command[name_index + 1]
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _cleanup_docker_container(container_name: str) -> None:
+    """Force remove a Docker container."""
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # Best effort cleanup, don't fail if it doesn't work
+        pass
+
+
+def _check_gpu_available(docker_image: str | None = None) -> bool:
+    """Check if NVIDIA GPU is available for Docker."""
+    image = docker_image or os.environ.get("GNINA_IMAGE", "gnina/gnina:latest")
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--gpus",
+                "all",
+                "--entrypoint",
+                "nvidia-smi",
+                image,
+                "-L",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False

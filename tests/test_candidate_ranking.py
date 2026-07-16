@@ -1,6 +1,7 @@
 from medagent.core.config import Settings
 from medagent.db.models import (
     ADMETResult,
+    AgentRun,
     Base,
     DockingResult,
     Molecule,
@@ -80,6 +81,50 @@ def test_external_refined_candidates_rank_ahead_of_coarse_only_candidates(tmp_pa
         assert rankings["MOL-REFINED"].score_breakdown["refinement"]["state"] == "externally_refined"
         assert rankings["MOL-COARSE"].score_breakdown["refinement"]["state"] == "coarse_only"
         assert rankings["MOL-COARSE"].score_breakdown["refinement"]["provisional_penalty"] == 40.0
+        assert rankings["MOL-REFINED"].evidence_confidence > rankings["MOL-COARSE"].evidence_confidence
+        assert rankings["MOL-COARSE"].score_breakdown["docking"]["evidence_tier"] == "surrogate"
+        assert rankings["MOL-COARSE"].score_breakdown["admet"]["evidence_tier"] == "surrogate"
+        assert rankings["MOL-COARSE"].score_breakdown["synthesis"]["evidence_tier"] == "surrogate"
+
+
+def test_ranking_agent_run_is_failed_when_ranking_errors(tmp_path, monkeypatch):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}")
+    engine = build_engine(settings)
+    Base.metadata.create_all(bind=engine)
+    session_factory = build_session_factory(settings)
+
+    with session_factory() as db:
+        project = Project(project_id="PROJ-RANKING-FAIL", name="Ranking failure")
+        molecule = Molecule(
+            molecule_id="MOL-RANKING-FAIL",
+            project_id=project.project_id,
+            smiles="CCO",
+            status="candidate_assessed",
+            labels=[],
+        )
+        db.add_all([project, molecule])
+        db.commit()
+
+        def fail_load_evidence(*args, **kwargs):
+            raise RuntimeError("ranking evidence unavailable")
+
+        monkeypatch.setattr(
+            "medagent.services.candidate_ranking._load_evidence_bundle",
+            fail_load_evidence,
+        )
+
+        try:
+            generate_project_rankings(db, project, molecules=[molecule], top_n=1)
+        except RuntimeError as exc:
+            assert str(exc) == "ranking evidence unavailable"
+        else:
+            raise AssertionError("generate_project_rankings should raise")
+
+        runs = db.query(AgentRun).filter_by(project_id=project.project_id).all()
+        assert len(runs) == 1
+        assert runs[0].agent_name == "ranking_agent"
+        assert runs[0].status == "failed"
+        assert runs[0].error_message == "ranking evidence unavailable"
 
 
 def _add_supporting_evidence(
@@ -123,6 +168,17 @@ def _add_supporting_evidence(
             key_hbond_count=2,
             clash_count=0,
             labels=docking_labels,
+            raw_output=(
+                {
+                    "status": "surrogate_only",
+                    "estimated_affinity_like_score": vina_score,
+                    "estimated_pose_confidence": cnn_score,
+                    "estimated_key_hbond_count": 2,
+                    "estimated_clash_count": 0,
+                }
+                if "rdkit_surrogate_docking" in docking_labels
+                else {"status": "success", "result_kind": "external_docking"}
+            ),
         )
     )
     db.add(
@@ -135,7 +191,18 @@ def _add_supporting_evidence(
             solubility="medium",
             permeability="high",
             admet_risk_score=admet_risk,
-            labels=["admet_clean"],
+            labels=(
+                ["admet_clean", "rdkit_surrogate_admet"]
+                if "rdkit_surrogate_docking" in docking_labels
+                else ["admet_clean", "admet_ai_predicted"]
+            ),
+            raw_output={
+                "status": (
+                    "surrogate_only"
+                    if "rdkit_surrogate_docking" in docking_labels
+                    else "success"
+                )
+            },
         )
     )
     db.add(
@@ -146,6 +213,13 @@ def _add_supporting_evidence(
             route_confidence=route_confidence,
             buyable_building_blocks=2,
             labels=route_labels,
-            route_json={"hazardous_reaction_count": 0},
+            route_json={
+                "hazardous_reaction_count": 0,
+                "status": (
+                    "surrogate_only"
+                    if "rdkit_surrogate_synthesis" in route_labels
+                    else "success"
+                ),
+            },
         )
     )

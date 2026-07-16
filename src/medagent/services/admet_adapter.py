@@ -26,10 +26,12 @@ import math
 import os
 import shutil
 import subprocess
-import tempfile
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+from medagent.services.docker_runtime import DockerMountBuilder, docker_temporary_directory
 
 
 _ADMET_AI_MODEL_CACHE: dict[str | None, Any] = {}
@@ -92,6 +94,7 @@ class ChempropADMETOutput:
     stderr: str = ""
     exit_code: int | None = None
     runtime_seconds: float = 0.0
+    compute_device: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +171,19 @@ def _check_admet_ai_available() -> dict[str, Any] | None:
     except importlib.metadata.PackageNotFoundError:
         version = "unknown"
 
+    try:
+        import torch
+
+        gpu_available = bool(torch.cuda.is_available())
+    except (ImportError, RuntimeError):
+        gpu_available = False
+
     return {
         "version": version,
         "models_dir": str(models_dir),
         "model_count": len(model_files),
+        "gpu_available": gpu_available,
+        "device": "cuda" if gpu_available else "cpu",
     }
 
 
@@ -213,35 +225,48 @@ def check_chemprop_available() -> dict[str, Any]:
         "docker_image": None,
         "models_dir": None,
         "model_count": None,
+        "model_configured": False,
+        "runtime_available": False,
+        "gpu_available": False,
+        "device": None,
+        "warning": None,
     }
 
     # Prefer ADMET-AI's bundled Chemprop ADMET ensembles when installed.
     admet_ai_status = _check_admet_ai_available()
     if admet_ai_status:
         result["available"] = True
+        result["runtime_available"] = True
         result["mode"] = "admet_ai"
         result["version"] = admet_ai_status["version"]
         result["models_dir"] = admet_ai_status["models_dir"]
         result["model_count"] = admet_ai_status["model_count"]
+        result["model_configured"] = True
+        result["gpu_available"] = bool(admet_ai_status.get("gpu_available", False))
+        result["device"] = admet_ai_status.get("device") or (
+            "cuda" if result["gpu_available"] else "cpu"
+        )
         return result
 
     # Check local CLI
     cli_status = _check_chemprop_cli()
     if cli_status:
-        result["available"] = True
+        result["runtime_available"] = True
         result["mode"] = "local_cli"
         result["version"] = cli_status["version"]
         result["path"] = cli_status["path"]
-        if cli_status.get("warning"):
+        _apply_checkpoint_status(result)
+        if cli_status.get("warning") and not result.get("warning"):
             result["warning"] = cli_status["warning"]
         return result
 
     # Check pip package
     try:
         import chemprop
-        result["available"] = True
+        result["runtime_available"] = True
         result["mode"] = "python_package"
         result["version"] = getattr(chemprop, "__version__", "unknown")
+        _apply_checkpoint_status(result)
         return result
     except ImportError:
         pass
@@ -253,14 +278,37 @@ def check_chemprop_available() -> dict[str, Any]:
             capture_output=True, text=True, timeout=10,
         )
         if proc.returncode == 0:
-            result["available"] = True
             result["mode"] = "docker"
             result["docker_image"] = "chemprop:latest"
+            runtime_probe = subprocess.run(
+                ["docker", "run", "--rm", "chemprop:latest", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            result["runtime_available"] = runtime_probe.returncode == 0
+            result["gpu_available"] = _check_gpu_available("chemprop:latest")
+            if not result["runtime_available"]:
+                result["warning"] = "chemprop_runtime_probe_failed"
+            else:
+                _apply_checkpoint_status(result)
             return result
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
     return result
+
+
+def _apply_checkpoint_status(result: dict[str, Any]) -> None:
+    configured = os.environ.get("CHEMPROP_CHECKPOINT_DIR")
+    checkpoint_dir = Path(configured).expanduser().resolve() if configured else None
+    model_configured = bool(checkpoint_dir and checkpoint_dir.is_dir())
+    result["model_configured"] = model_configured
+    result["models_dir"] = str(checkpoint_dir) if model_configured else None
+    result["available"] = bool(result.get("runtime_available") and model_configured)
+    if not model_configured:
+        result["warning"] = "chemprop_checkpoint_not_configured"
 
 
 # ---------------------------------------------------------------------------
@@ -305,12 +353,14 @@ def _run_admet_ai(
 
     start_time = time.monotonic()
     models_dir = request.checkpoint_dir or os.environ.get("ADMET_AI_MODELS_DIR") or chemprop_status.get("models_dir")
+    compute_device = chemprop_status.get("device")
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
 
     try:
         with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
             model = _get_admet_ai_model(models_dir)
+            compute_device = str(model.device)
             predictions = model.predict(smiles=request.smiles_list)
     except ImportError as exc:
         return ChempropADMETOutput(
@@ -319,6 +369,7 @@ def _run_admet_ai(
             success=False,
             warnings=["admet_ai_not_installed", str(exc)],
             runtime_seconds=time.monotonic() - start_time,
+            compute_device=compute_device,
         )
     except Exception as exc:
         return ChempropADMETOutput(
@@ -329,6 +380,7 @@ def _run_admet_ai(
             stdout=stdout_buffer.getvalue()[:2000],
             stderr=stderr_buffer.getvalue()[:2000],
             runtime_seconds=time.monotonic() - start_time,
+            compute_device=compute_device,
         )
 
     results = _parse_admet_ai_predictions(
@@ -353,6 +405,7 @@ def _run_admet_ai(
         stderr=stderr_buffer.getvalue()[:2000],
         exit_code=0 if results else None,
         runtime_seconds=time.monotonic() - start_time,
+        compute_device=compute_device,
     )
 
 
@@ -401,11 +454,16 @@ def _run_chemprop_local(request: ChempropADMETRequest) -> ChempropADMETOutput:
 
     start_time = time.monotonic()
     warnings: list[str] = []
-    checkpoint_dir = _resolve_checkpoint_dir(request)
-    if not checkpoint_dir:
+    checkpoint_dir_value = _resolve_checkpoint_dir(request)
+    if not checkpoint_dir_value:
         return _chemprop_model_not_configured(start_time)
+    checkpoint_dir = Path(checkpoint_dir_value).expanduser().resolve()
+    if not checkpoint_dir.is_dir():
+        result = _chemprop_model_not_configured(start_time)
+        result.warnings.insert(1, "chemprop_checkpoint_path_not_found")
+        return result
 
-    with tempfile.TemporaryDirectory(prefix="chemprop_admet_") as tmp_dir:
+    with docker_temporary_directory(prefix="chemprop_admet_") as tmp_dir:
         tmp_path = Path(tmp_dir)
         input_csv = tmp_path / "input.csv"
         output_csv = tmp_path / "output.csv"
@@ -491,11 +549,16 @@ def _run_chemprop_docker(request: ChempropADMETRequest) -> ChempropADMETOutput:
 
     start_time = time.monotonic()
     warnings: list[str] = []
-    checkpoint_dir = _resolve_checkpoint_dir(request)
-    if not checkpoint_dir:
+    checkpoint_dir_value = _resolve_checkpoint_dir(request)
+    if not checkpoint_dir_value:
         return _chemprop_model_not_configured(start_time)
+    checkpoint_dir = Path(checkpoint_dir_value).expanduser().resolve()
+    if not checkpoint_dir.is_dir():
+        result = _chemprop_model_not_configured(start_time)
+        result.warnings.insert(1, "chemprop_checkpoint_path_not_found")
+        return result
 
-    with tempfile.TemporaryDirectory(prefix="chemprop_admet_") as tmp_dir:
+    with docker_temporary_directory(prefix="chemprop_admet_") as tmp_dir:
         tmp_path = Path(tmp_dir)
         input_csv = tmp_path / "input.csv"
         output_csv = tmp_path / "output.csv"
@@ -503,17 +566,17 @@ def _run_chemprop_docker(request: ChempropADMETRequest) -> ChempropADMETOutput:
         # Write input CSV
         _write_input_csv(input_csv, request.smiles_list)
 
-        # Build Docker command
-        cmd = [
-            "docker", "run", "--rm",
-            "-v", f"{tmp_path.resolve()}:/data",
-            request.docker_image,
-            "chemprop", "predict",
-            "--test-path", "/data/input.csv",
-            "--preds-path", "/data/output.csv",
-        ]
+        # Generate unique container name
+        container_name = f"chemprop_{int(time.time() * 1000)}"
 
-        cmd.extend(["--checkpoint-dir", checkpoint_dir])
+        has_gpu = _check_gpu_available(request.docker_image)
+        cmd = _build_chemprop_docker_command(
+            docker_image=request.docker_image,
+            container_name=container_name,
+            data_dir=tmp_path,
+            checkpoint_dir=checkpoint_dir,
+            use_gpu=has_gpu,
+        )
 
         # Run Docker
         try:
@@ -527,6 +590,8 @@ def _run_chemprop_docker(request: ChempropADMETRequest) -> ChempropADMETOutput:
             stdout = proc.stdout
             stderr = proc.stderr
         except subprocess.TimeoutExpired:
+            # Clean up container on timeout
+            _cleanup_docker_container(container_name)
             return ChempropADMETOutput(
                 adapter_mode="chemprop_docker_timeout",
                 tool_name="chemprop",
@@ -553,6 +618,9 @@ def _run_chemprop_docker(request: ChempropADMETRequest) -> ChempropADMETOutput:
             )
         else:
             warnings.append("chemprop_output_file_not_created")
+
+        if not has_gpu:
+            warnings.append("chemprop_running_without_gpu")
 
         labels = ["chemprop_admet", "chemprop_docker"]
         if not results:
@@ -602,6 +670,36 @@ def _build_chemprop_command(
         cmd.extend(["--checkpoint-dir", checkpoint_dir])
 
     return cmd
+
+
+def _build_chemprop_docker_command(
+    *,
+    docker_image: str,
+    container_name: str,
+    data_dir: Path,
+    checkpoint_dir: Path,
+    use_gpu: bool,
+) -> list[str]:
+    mounts = DockerMountBuilder()
+    data_path = mounts.bind(data_dir.resolve(), "/data")
+    checkpoint_path = mounts.bind(checkpoint_dir.resolve(), "/models", read_only=True)
+    command = ["docker", "run", "--rm", "--name", container_name]
+    if use_gpu:
+        command.extend(["--gpus", "all"])
+    command.extend(
+        [
+            *mounts.arguments,
+            docker_image,
+            "predict",
+            "--test-path",
+            str(PurePosixPath(data_path, "input.csv")),
+            "--preds-path",
+            str(PurePosixPath(data_path, "output.csv")),
+            "--checkpoint-dir",
+            checkpoint_path,
+        ]
+    )
+    return command
 
 
 def _parse_chemprop_output(
@@ -693,10 +791,29 @@ def _parse_admet_ai_predictions(
     else:
         return []
 
+    prediction_index = getattr(predictions, "index", None)
+    indexed_smiles = list(prediction_index) if prediction_index is not None else None
+    input_occurrences: dict[str, deque[int]] = defaultdict(deque)
+    for input_index, input_smiles in enumerate(smiles_list):
+        input_occurrences[str(input_smiles)].append(input_index)
+
     results: list[SingleADMETResult] = []
     for idx, row in enumerate(rows):
-        mol_id = molecule_ids[idx] if idx < len(molecule_ids) else f"MOL-{idx}"
-        smi = smiles_list[idx] if idx < len(smiles_list) else ""
+        if indexed_smiles is not None:
+            if idx >= len(indexed_smiles):
+                continue
+            predicted_smiles = str(indexed_smiles[idx])
+            occurrences = input_occurrences.get(predicted_smiles)
+            if not occurrences:
+                continue
+            input_index = occurrences.popleft()
+        else:
+            input_index = idx
+
+        if input_index >= len(smiles_list) or input_index >= len(molecule_ids):
+            continue
+        mol_id = molecule_ids[input_index]
+        smi = smiles_list[input_index]
 
         herg_prob = _safe_float(_first_present(row, "hERG"))
         ames_prob = _safe_float(_first_present(row, "AMES", "Ames"))
@@ -806,4 +923,48 @@ def chemprop_tool_status() -> dict[str, Any]:
         "docker_image": status.get("docker_image"),
         "models_dir": status.get("models_dir"),
         "model_count": status.get("model_count"),
+        "model_configured": status.get("model_configured", False),
+        "runtime_available": status.get("runtime_available", False),
+        "gpu_available": status.get("gpu_available", False),
+        "device": status.get("device"),
+        "warning": status.get("warning"),
     }
+
+
+def _check_gpu_available(docker_image: str = "chemprop:latest") -> bool:
+    """Check if NVIDIA GPU is available for Docker."""
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--gpus",
+                "all",
+                "--entrypoint",
+                "nvidia-smi",
+                docker_image,
+                "-L",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _cleanup_docker_container(container_name: str) -> None:
+    """Force remove a Docker container."""
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # Best effort cleanup, don't fail if it doesn't work
+        pass

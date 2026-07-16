@@ -1,0 +1,32 @@
+{
+  "molecule_ids": [
+    "MOL-D87CC67DED",
+    "MOL-450DC51730",
+    "MOL-14EA0E2E97",
+    "MOL-74243C4ADE",
+    "MOL-657EB271C8"
+  ],
+  "max_molecules": 5,
+  "top_n": 5,
+  "assessment_mode": "external",
+  "external_top_n": 3,
+  "protein_file": "student_tool_runs/data/3OG7_BRAF_receptor.pdb",
+  "grid_center": [1.869, -2.638, -19.918],
+  "grid_size": [24.305, 13.133, 14.396],
+  "key_residues": [
+    "ALA481:A",
+    "ASP594:A",
+    "CYS532:A",
+    "GLN530:A",
+    "GLY534:A",
+    "LYS483:A",
+    "PHE516:A",
+    "PHE595:A",
+    "TRP531:A",
+    "VAL482:A"
+  ],
+  "admet_properties": ["solubility", "permeability", "hERG", "CYP3A4", "CYP2D6", "Ames", "DILI", "Pgp_substrate"],
+  "max_synthesis_steps": 5,
+  "prefer_buyable_building_blocks": true
+}
+

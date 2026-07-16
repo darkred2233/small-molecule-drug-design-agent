@@ -21,7 +21,6 @@ import argparse
 import importlib
 import importlib.metadata
 import importlib.util
-import os
 import shutil
 import subprocess
 import sys
@@ -125,63 +124,9 @@ def _check_admet_ai_models() -> dict[str, Any] | None:
 
 def check_chemprop() -> dict[str, Any]:
     """检查Chemprop可用性"""
-    result = {
-        "name": "Chemprop",
-        "available": False,
-        "mode": None,
-        "version": None,
-        "path": None,
-        "models_dir": None,
-        "model_count": None,
-    }
+    from medagent.services.admet_adapter import check_chemprop_available
 
-    # 检查Python包
-    admet_ai_status = _check_admet_ai_models()
-    if admet_ai_status:
-        result["available"] = True
-        result["mode"] = "admet_ai"
-        result["version"] = admet_ai_status["version"]
-        result["models_dir"] = admet_ai_status["models_dir"]
-        result["model_count"] = admet_ai_status["model_count"]
-        return result
-
-    try:
-        import chemprop
-        result["available"] = True
-        result["mode"] = "python_package"
-        result["version"] = getattr(chemprop, "__version__", "unknown")
-        return result
-    except ImportError:
-        pass
-
-    # 检查CLI
-    cli_status = _check_chemprop_cli()
-    if cli_status:
-        result["available"] = True
-        result["mode"] = "cli"
-        result["version"] = cli_status["version"]
-        result["path"] = cli_status["path"]
-        if cli_status.get("warning"):
-            result["warning"] = cli_status["warning"]
-        return result
-
-    # 检查Docker
-    try:
-        proc = subprocess.run(
-            ["docker", "image", "inspect", "chemprop:latest"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if proc.returncode == 0:
-            result["available"] = True
-            result["mode"] = "docker"
-            result["docker_image"] = "chemprop:latest"
-            return result
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    return result
+    return {"name": "Chemprop", **check_chemprop_available()}
 
 
 def _check_chemprop_cli() -> dict[str, Any] | None:
@@ -216,136 +161,23 @@ def _check_chemprop_cli() -> dict[str, Any] | None:
 
 def check_gnina() -> dict[str, Any]:
     """检查GNINA可用性"""
-    result = {
-        "name": "GNINA",
-        "available": False,
-        "version": None,
-        "path": None,
-    }
+    from medagent.services.docking_adapters import check_gnina_available
 
-    # 检查CLI
-    try:
-        proc = subprocess.run(
-            ["gnina", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            result["available"] = True
-            result["version"] = proc.stdout.strip()
-            result["path"] = "gnina"
-            return result
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # 检查Docker
-    gnina_images = [
-        os.environ.get("GNINA_IMAGE", "gnina/gnina:latest"),
-        "gnina/gnina:latest",
-        "gnina/gnina:1.0.3",
-        "gnina:latest",
-    ]
-    for image in dict.fromkeys(gnina_images):
-        try:
-            proc = subprocess.run(
-                ["docker", "image", "inspect", image],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if proc.returncode == 0:
-                result["available"] = True
-                result["mode"] = "docker"
-                result["docker_image"] = image
-                return result
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-    return result
+    return {"name": "GNINA", **check_gnina_available()}
 
 
 def check_vina() -> dict[str, Any]:
     """检查AutoDock Vina可用性"""
-    result = {
-        "name": "AutoDock Vina",
-        "available": False,
-        "version": None,
-        "path": None,
-    }
+    from medagent.services.docking_adapters import check_vina_available
 
-    # 检查CLI
-    for cmd in ["vina", "autodock_vina", "vina_1_1_2"]:
-        try:
-            proc = subprocess.run(
-                [cmd, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if proc.returncode == 0 or "AutoDock Vina" in proc.stdout:
-                result["available"] = True
-                result["version"] = proc.stdout.strip()
-                result["path"] = cmd
-                return result
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-
-    # 检查Docker
-    try:
-        proc = subprocess.run(
-            ["docker", "image", "inspect", "vina:latest"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            result["available"] = True
-            result["mode"] = "docker"
-            result["docker_image"] = "vina:latest"
-            return result
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    return result
+    return {"name": "AutoDock Vina", **check_vina_available()}
 
 
 def check_diffdock() -> dict[str, Any]:
     """检查DiffDock可用性"""
-    result = {
-        "name": "DiffDock",
-        "available": False,
-        "mode": None,
-        "version": None,
-    }
+    from medagent.services.docking_adapters import check_diffdock_available
 
-    # 检查Python包
-    try:
-        import diffdock
-        result["available"] = True
-        result["mode"] = "python_package"
-        result["version"] = getattr(diffdock, "__version__", "unknown")
-        return result
-    except ImportError:
-        pass
-
-    # 检查Docker
-    try:
-        proc = subprocess.run(
-            ["docker", "image", "inspect", "diffdock:latest"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            result["available"] = True
-            result["mode"] = "docker"
-            result["docker_image"] = "diffdock:latest"
-            return result
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    return result
+    return {"name": "DiffDock", **check_diffdock_available()}
 
 
 def check_reinvent4() -> dict[str, Any]:

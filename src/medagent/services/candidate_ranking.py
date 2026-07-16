@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -125,37 +126,41 @@ def generate_project_rankings(
         requested_count=len(selected_molecules),
     )
 
-    scored_molecules: list[ScoredMolecule] = []
-    warnings: list[str] = []
-    for molecule in selected_molecules:
-        bundle = _load_evidence_bundle(db, molecule)
-        scored = _score_molecule(
-            molecule,
-            bundle,
-            external_refinement_present=external_refinement_present,
+    try:
+        scored_molecules: list[ScoredMolecule] = []
+        warnings: list[str] = []
+        for molecule in selected_molecules:
+            bundle = _load_evidence_bundle(db, molecule)
+            scored = _score_molecule(
+                molecule,
+                bundle,
+                external_refinement_present=external_refinement_present,
+            )
+            scored_molecules.append(scored)
+            warnings.extend(_missing_evidence_warnings(scored.score_breakdown))
+            summary.evaluated_count += 1
+
+        ranked = sorted(
+            scored_molecules,
+            key=lambda item: (
+                _refinement_sort_tier(item, external_refinement_present),
+                -item.overall_score,
+                item.con_score,
+                item.molecule.molecule_id,
+            ),
         )
-        scored_molecules.append(scored)
-        warnings.extend(_missing_evidence_warnings(scored.score_breakdown))
-        summary.evaluated_count += 1
+        stored = ranked[:top_n]
+        _replace_project_rankings(db, project, stored)
 
-    ranked = sorted(
-        scored_molecules,
-        key=lambda item: (
-            _refinement_sort_tier(item, external_refinement_present),
-            -item.overall_score,
-            item.con_score,
-            item.molecule.molecule_id,
-        ),
-    )
-    stored = ranked[:top_n]
-    _replace_project_rankings(db, project, stored)
-
-    summary.generated_count = len(stored)
-    summary.molecule_ids = [item.molecule.molecule_id for item in stored]
-    summary.warnings = _dedupe(warnings)
-    _finish_agent_run(agent_run, summary)
-    db.commit()
-    return summary
+        summary.generated_count = len(stored)
+        summary.molecule_ids = [item.molecule.molecule_id for item in stored]
+        summary.warnings = _dedupe(warnings)
+        _finish_agent_run(agent_run, summary)
+        db.commit()
+        return summary
+    except Exception as exc:
+        _fail_agent_run(db, agent_run, exc)
+        raise
 
 
 def list_project_rankings(db: Session, project: Project) -> list[Ranking]:
@@ -386,19 +391,41 @@ def _score_docking(result: DockingResult | None) -> ComponentScore:
             details={"available": False, "reason": "missing_docking_result"},
         )
 
-    vina_score = result.vina_score
+    raw_output = result.raw_output or {}
+    surrogate = raw_output.get("status") == "surrogate_only" or "rdkit_surrogate_docking" in (
+        result.labels or []
+    )
+    vina_score = (
+        raw_output.get("estimated_affinity_like_score") if surrogate else result.vina_score
+    )
+    cnn_score = raw_output.get("estimated_pose_confidence") if surrogate else result.cnn_score
+    diffdock_confidence = None if surrogate else result.diffdock_confidence
+    key_hbond_count = (
+        raw_output.get("estimated_key_hbond_count") if surrogate else result.key_hbond_count
+    )
+    clash_count = raw_output.get("estimated_clash_count") if surrogate else result.clash_count
     affinity_score = 0.5 if vina_score is None else _clamp((-float(vina_score) - 4.0) / 6.0, 0, 1)
-    pose_score = 0.55 if result.cnn_score is None else _clamp(float(result.cnn_score), 0, 1)
-    interaction_score = _clamp(float(result.key_hbond_count or 0) / 3.0, 0, 1)
-    clash_risk = _clamp(float(result.clash_count or 0) * 0.25, 0, 1)
+    if cnn_score is not None:
+        pose_score = _clamp(float(cnn_score), 0, 1)
+        pose_score_method = "gnina_cnn_score"
+    elif diffdock_confidence is not None:
+        pose_score = _diffdock_confidence_ranking_score(float(diffdock_confidence))
+        pose_score_method = "uncalibrated_sigmoid_for_within_project_ranking_only"
+    else:
+        pose_score = 0.55
+        pose_score_method = "neutral_missing_pose_confidence"
+    interaction_score = _clamp(float(key_hbond_count or 0) / 3.0, 0, 1)
+    clash_risk = _clamp(float(clash_count or 0) * 0.25, 0, 1)
     pose_risk = 0.20 if "pose_uncertain" in (result.labels or []) else 0.0
     positive = _clamp(affinity_score * 0.70 + pose_score * 0.20 + interaction_score * 0.10, 0, 1)
     risk = _clamp(clash_risk + pose_risk, 0, 1)
     blockers = []
-    if result.clash_count and result.clash_count >= 2:
+    if not surrogate and clash_count and clash_count >= 2:
         blockers.append("steric_clash")
-    if result.cnn_score is not None and result.cnn_score < 0.35:
+    if not surrogate and cnn_score is not None and cnn_score < 0.35:
         blockers.append("low_pose_confidence")
+
+    confidence_credit = 0.15 if surrogate else (0.9 if diffdock_confidence is not None else 1.0)
 
     return ComponentScore(
         available=True,
@@ -406,16 +433,32 @@ def _score_docking(result: DockingResult | None) -> ComponentScore:
         risk=risk,
         details={
             "available": True,
+            "evidence_tier": "surrogate" if surrogate else "external_tool",
+            "confidence_credit": confidence_credit,
             "positive_score": round(positive, 3),
             "risk_score": round(risk, 3),
             "vina_score": vina_score,
-            "cnn_score": result.cnn_score,
-            "key_hbond_count": result.key_hbond_count,
-            "clash_count": result.clash_count,
+            "cnn_score": None if surrogate else result.cnn_score,
+            "diffdock_confidence": diffdock_confidence,
+            "pose_score_method": pose_score_method,
+            "estimated_pose_confidence": cnn_score if surrogate else None,
+            "key_hbond_count": None if surrogate else result.key_hbond_count,
+            "estimated_key_hbond_count": key_hbond_count if surrogate else None,
+            "clash_count": None if surrogate else result.clash_count,
+            "estimated_clash_count": clash_count if surrogate else None,
             "labels": result.labels or [],
         },
         blockers=blockers,
     )
+
+
+def _diffdock_confidence_ranking_score(value: float) -> float:
+    """Map an uncalibrated DiffDock score monotonically for ranking, never as probability."""
+    if value >= 60:
+        return 1.0
+    if value <= -60:
+        return 0.0
+    return _clamp(1.0 / (1.0 + math.exp(-value)), 0, 1)
 
 
 def _score_admet(result: ADMETResult | None) -> ComponentScore:
@@ -427,6 +470,10 @@ def _score_admet(result: ADMETResult | None) -> ComponentScore:
             details={"available": False, "reason": "missing_admet_result"},
         )
 
+    raw_output = result.raw_output or {}
+    surrogate = raw_output.get("status") == "surrogate_only" or "rdkit_surrogate_admet" in (
+        result.labels or []
+    )
     risk = result.admet_risk_score
     if risk is None:
         probabilities = [value for value in [result.hERG_probability, result.Ames_probability] if value is not None]
@@ -435,11 +482,11 @@ def _score_admet(result: ADMETResult | None) -> ComponentScore:
     permeability_bonus = {"high": 0.07, "medium": 0.03, "low": -0.07}.get(result.permeability or "", 0.0)
     positive = _clamp(1.0 - float(risk) + solubility_bonus + permeability_bonus, 0, 1)
     blockers = []
-    if result.hERG_risk == "high_risk":
+    if not surrogate and result.hERG_risk == "high_risk":
         blockers.append("high_hERG_risk")
-    if result.Ames_risk == "high_risk":
+    if not surrogate and result.Ames_risk == "high_risk":
         blockers.append("high_Ames_risk")
-    if "admet_blocker" in (result.labels or []):
+    if not surrogate and "admet_blocker" in (result.labels or []):
         blockers.append("admet_blocker")
 
     return ComponentScore(
@@ -448,6 +495,8 @@ def _score_admet(result: ADMETResult | None) -> ComponentScore:
         risk=_clamp(float(risk), 0, 1),
         details={
             "available": True,
+            "evidence_tier": "surrogate" if surrogate else "predictive_model",
+            "confidence_credit": 0.25 if surrogate else 1.0,
             "positive_score": round(positive, 3),
             "risk_score": round(_clamp(float(risk), 0, 1), 3),
             "hERG_probability": result.hERG_probability,
@@ -471,20 +520,31 @@ def _score_synthesis(result: SynthesisRoute | None) -> ComponentScore:
             details={"available": False, "reason": "missing_synthesis_route"},
         )
 
-    confidence = float(result.route_confidence or 0.35)
-    route_steps = int(result.route_steps or 0)
     route_json = result.route_json or {}
-    route_found_bonus = 0.25 if result.route_found else -0.15
+    surrogate = route_json.get("status") == "surrogate_only" or "rdkit_surrogate_synthesis" in (
+        result.labels or []
+    )
+    if surrogate:
+        confidence = float(route_json.get("estimated_route_confidence") or 0.35)
+        route_steps = int(route_json.get("estimated_route_steps") or 0)
+        route_feasible = bool(route_json.get("estimated_route_feasible"))
+        route_found_bonus = 0.05 if route_feasible else -0.10
+    else:
+        confidence = float(result.route_confidence or 0.35)
+        route_steps = int(result.route_steps or 0)
+        route_feasible = bool(result.route_found)
+        route_found_bonus = 0.25 if route_feasible else -0.15
     step_penalty = _clamp(max(route_steps - 5, 0) * 0.08, 0, 0.35)
     hazard_penalty = _clamp(float(route_json.get("hazardous_reaction_count") or 0) * 0.18, 0, 0.45)
     positive = _clamp(confidence + route_found_bonus - step_penalty - hazard_penalty, 0, 1)
-    risk = _clamp((0.15 if result.route_found else 0.50) + step_penalty + hazard_penalty, 0, 1)
+    base_risk = (0.25 if route_feasible else 0.45) if surrogate else (0.15 if route_feasible else 0.50)
+    risk = _clamp(base_risk + step_penalty + hazard_penalty, 0, 1)
     blockers = []
-    if not result.route_found:
+    if not surrogate and not result.route_found:
         blockers.append("route_not_found")
-    if route_steps > 8:
+    if not surrogate and route_steps > 8:
         blockers.append("long_synthesis_route")
-    if hazard_penalty > 0:
+    if not surrogate and hazard_penalty > 0:
         blockers.append("hazardous_route")
 
     return ComponentScore(
@@ -493,12 +553,19 @@ def _score_synthesis(result: SynthesisRoute | None) -> ComponentScore:
         risk=risk,
         details={
             "available": True,
+            "evidence_tier": "surrogate" if surrogate else "retrosynthesis_tool",
+            "confidence_credit": 0.25 if surrogate else 1.0,
             "positive_score": round(positive, 3),
             "risk_score": round(risk, 3),
-            "route_found": result.route_found,
-            "route_steps": result.route_steps,
-            "route_confidence": result.route_confidence,
-            "buyable_building_blocks": result.buyable_building_blocks,
+            "route_found": result.route_found if not surrogate else None,
+            "route_steps": result.route_steps if not surrogate else None,
+            "route_confidence": result.route_confidence if not surrogate else None,
+            "buyable_building_blocks": (
+                result.buyable_building_blocks if not surrogate else None
+            ),
+            "estimated_route_feasible": route_feasible if surrogate else None,
+            "estimated_route_steps": route_steps if surrogate else None,
+            "estimated_route_confidence": confidence if surrogate else None,
             "SA_score": route_json.get("SA_score"),
             "SCScore": route_json.get("SCScore"),
             "hazardous_reaction_count": route_json.get("hazardous_reaction_count"),
@@ -686,7 +753,11 @@ def _evidence_confidence(components: dict[str, ComponentScore]) -> float:
         "rule_filter": 0.15,
         "properties": 0.15,
     }
-    confidence = sum(weight for key, weight in weights.items() if components[key].available)
+    confidence = sum(
+        weight * float(components[key].details.get("confidence_credit", 1.0))
+        for key, weight in weights.items()
+        if components[key].available
+    )
     if components.get("rag_evidence") and components["rag_evidence"].available:
         confidence += 0.10
     return round(_clamp(confidence, 0, 1), 3)
@@ -785,6 +856,28 @@ def _create_agent_run(db: Session, project: Project, input_json: dict[str, Any])
 def _finish_agent_run(agent_run: AgentRun, summary: RankingSummary) -> None:
     agent_run.status = "success"
     agent_run.output_json = summary.as_dict()
+
+
+def _fail_agent_run(db: Session, agent_run: AgentRun, exc: Exception) -> None:
+    agent_run_id = agent_run.agent_run_id
+    project_id = agent_run.project_id
+    input_json = dict(agent_run.input_json or {})
+    error_message = str(exc)
+    db.rollback()
+    failed_run = db.query(AgentRun).filter_by(agent_run_id=agent_run_id).one_or_none()
+    if failed_run is None:
+        failed_run = AgentRun(
+            agent_run_id=agent_run_id,
+            project_id=project_id,
+            agent_name=RANKING_AGENT_NAME,
+            model_name="heuristic-ranker",
+            input_json=input_json,
+        )
+        db.add(failed_run)
+    failed_run.status = "failed"
+    failed_run.error_message = error_message
+    failed_run.output_json = {"error": error_message}
+    db.commit()
 
 
 def _dedupe(values: list[str]) -> list[str]:
