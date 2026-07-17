@@ -161,6 +161,7 @@ class Molecule(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     molecule_id: Mapped[str] = mapped_column(String(80), unique=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     smiles: Mapped[str] = mapped_column(Text)
     inchi_key: Mapped[str | None] = mapped_column(String(120), index=True)
     scaffold: Mapped[str | None] = mapped_column(String(160), index=True)
@@ -191,6 +192,7 @@ class RuleFilterResult(TimestampMixin, Base):
     filter_result_id: Mapped[str] = mapped_column(String(80), unique=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
     molecule_id: Mapped[str] = mapped_column(ForeignKey("molecules.molecule_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     rule_set: Mapped[str] = mapped_column(String(80), default="basic_drug_likeness_v1")
     decision: Mapped[str] = mapped_column(String(80))
     failed_rules: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -202,10 +204,11 @@ class RuleFilterResult(TimestampMixin, Base):
 
 class ConformerResult(TimestampMixin, Base):
     __tablename__ = "conformer_results"
-    __table_args__ = (UniqueConstraint("molecule_id"),)
+    __table_args__ = (UniqueConstraint("molecule_id", "round_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     molecule_id: Mapped[str] = mapped_column(ForeignKey("molecules.molecule_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     conformer_generated: Mapped[bool] = mapped_column(Boolean, default=False)
     conformer_count: Mapped[int | None] = mapped_column(Integer)
     lowest_energy: Mapped[float | None] = mapped_column(Float)
@@ -220,10 +223,11 @@ class ConformerResult(TimestampMixin, Base):
 
 class DockingResult(TimestampMixin, Base):
     __tablename__ = "docking_results"
-    __table_args__ = (UniqueConstraint("molecule_id"),)
+    __table_args__ = (UniqueConstraint("molecule_id", "round_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     molecule_id: Mapped[str] = mapped_column(ForeignKey("molecules.molecule_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     tool_run_id: Mapped[str | None] = mapped_column(String(80))
     vina_score: Mapped[float | None] = mapped_column(Float)
     cnn_score: Mapped[float | None] = mapped_column(Float)
@@ -237,10 +241,11 @@ class DockingResult(TimestampMixin, Base):
 
 class ADMETResult(TimestampMixin, Base):
     __tablename__ = "admet_results"
-    __table_args__ = (UniqueConstraint("molecule_id"),)
+    __table_args__ = (UniqueConstraint("molecule_id", "round_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     molecule_id: Mapped[str] = mapped_column(ForeignKey("molecules.molecule_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     hERG_probability: Mapped[float | None] = mapped_column(Float)
     hERG_risk: Mapped[str | None] = mapped_column(String(80))
     Ames_probability: Mapped[float | None] = mapped_column(Float)
@@ -254,10 +259,11 @@ class ADMETResult(TimestampMixin, Base):
 
 class SynthesisRoute(TimestampMixin, Base):
     __tablename__ = "synthesis_routes"
-    __table_args__ = (UniqueConstraint("molecule_id"),)
+    __table_args__ = (UniqueConstraint("molecule_id", "round_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     molecule_id: Mapped[str] = mapped_column(ForeignKey("molecules.molecule_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     route_found: Mapped[bool] = mapped_column(Boolean, default=False)
     route_steps: Mapped[int | None] = mapped_column(Integer)
     route_confidence: Mapped[float | None] = mapped_column(Float)
@@ -312,6 +318,7 @@ class AgentRun(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     agent_run_id: Mapped[str] = mapped_column(String(80), unique=True)
     project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     agent_name: Mapped[str] = mapped_column(String(120), index=True)
     model_name: Mapped[str | None] = mapped_column(String(120))
     status: Mapped[str] = mapped_column(String(80), default="queued")
@@ -328,6 +335,7 @@ class Critique(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     critique_id: Mapped[str] = mapped_column(String(80), unique=True)
     molecule_id: Mapped[str] = mapped_column(ForeignKey("molecules.molecule_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     con_score: Mapped[float | None] = mapped_column(Float)
     risk_level: Mapped[str] = mapped_column(String(80))
     reason: Mapped[str] = mapped_column(Text)
@@ -338,6 +346,9 @@ class Critique(TimestampMixin, Base):
     analysis_method: Mapped[str] = mapped_column(
         String(80), default="heuristic_self_refutation"
     )
+    property_diagnostics_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    campaign_patch_suggestions_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    requires_user_confirmation: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class ReasoningTrace(TimestampMixin, Base):
@@ -385,6 +396,7 @@ class AdvisorSuggestion(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     suggestion_id: Mapped[str] = mapped_column(String(80), unique=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     summary: Mapped[str] = mapped_column(Text)
     suggestions: Mapped[list[dict]] = mapped_column(JSON, default=list)
     next_round_constraints: Mapped[list[dict]] = mapped_column(JSON, default=list)
@@ -393,11 +405,12 @@ class AdvisorSuggestion(TimestampMixin, Base):
 
 class Ranking(TimestampMixin, Base):
     __tablename__ = "rankings"
-    __table_args__ = (UniqueConstraint("project_id", "molecule_id"),)
+    __table_args__ = (UniqueConstraint("project_id", "molecule_id", "round_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.project_id"), index=True)
     molecule_id: Mapped[str] = mapped_column(ForeignKey("molecules.molecule_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     rank: Mapped[int] = mapped_column(Integer)
     pro_score: Mapped[float | None] = mapped_column(Float)
     con_score: Mapped[float | None] = mapped_column(Float)
@@ -405,3 +418,88 @@ class Ranking(TimestampMixin, Base):
     overall_score: Mapped[float | None] = mapped_column(Float)
     final_decision: Mapped[str] = mapped_column(String(80))
     score_breakdown: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+# ---------------------------------------------------------------------------
+# Round + Campaign tables
+# ---------------------------------------------------------------------------
+
+
+class TargetLigand(TimestampMixin, Base):
+    """靶点已知配体（ChEMBL / PubChem / 内置数据）。"""
+    __tablename__ = "target_ligands"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_ligand_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    name: Mapped[str | None] = mapped_column(String(200))
+    smiles: Mapped[str] = mapped_column(Text)
+    canonical_smiles: Mapped[str | None] = mapped_column(Text)
+    inchi_key: Mapped[str | None] = mapped_column(String(120), index=True)
+    source: Mapped[str] = mapped_column(String(80))  # chembl / pubchem / builtin
+    source_id: Mapped[str | None] = mapped_column(String(200))
+    activity_value: Mapped[float | None] = mapped_column(Float)
+    activity_unit: Mapped[str | None] = mapped_column(String(40))
+    activity_type: Mapped[str | None] = mapped_column(String(40))
+    pchembl_value: Mapped[float | None] = mapped_column(Float)
+    assay_type: Mapped[str | None] = mapped_column(String(80))
+    confidence_level: Mapped[str] = mapped_column(String(40), default="standard")
+    properties_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    provenance_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+
+
+class ProjectResource(TimestampMixin, Base):
+    """项目级资源（receptor / pocket / source pool 等）。"""
+    __tablename__ = "project_resources"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    resource_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    target_id: Mapped[str | None] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    resource_type: Mapped[str] = mapped_column(String(80))  # receptor / binding_pocket / source_compound_library / ...
+    scope: Mapped[str] = mapped_column(String(80))  # builtin / target / project / user_uploaded / generated
+    name: Mapped[str] = mapped_column(String(200))
+    file_path: Mapped[str | None] = mapped_column(Text)
+    metadata_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    confidence_level: Mapped[str | None] = mapped_column(String(40))
+    source_url: Mapped[str | None] = mapped_column(Text)
+
+
+class ProjectRound(TimestampMixin, Base):
+    """项目轮次。"""
+    __tablename__ = "project_rounds"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    round_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_number: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(40), default="draft")  # draft/ready/running/completed/failed/cancelled
+    parent_round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"))
+    user_conditions_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    run_plan_snapshot_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    campaigns: Mapped[list["CampaignRun"]] = relationship(back_populates="round")
+
+
+class CampaignRun(TimestampMixin, Base):
+    """方法级运行记录。"""
+    __tablename__ = "campaign_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_run_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    round_id: Mapped[str] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    method: Mapped[str] = mapped_column(String(40))  # crem / reinvent4 / autogrow4
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    config_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    resource_bundle_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    input_molecule_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    output_molecule_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    metrics_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    warnings_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    round: Mapped["ProjectRound"] = relationship(back_populates="campaigns")

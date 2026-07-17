@@ -8,6 +8,7 @@ from medagent.db.models import AgentRun, Molecule, Project, Ranking
 from medagent.domain.schemas import AgentResult, AgentTask, RunPlan
 from medagent.pipeline.state import PIPELINE_FAILED
 from medagent.services.advisor import generate_project_advice
+from medagent.services.sar_bridge import sar_to_generation_constraints
 from medagent.services.candidate_assessment import (
     candidate_assessment_tool_status,
     run_project_candidate_assessment,
@@ -75,6 +76,7 @@ class PipelineOrchestrator:
         consecutive_tool_failures = 0
         seeds = _initial_iterative_seed_smiles(db, project, plan)
         advisor_context: list[str] = []
+        sar_constraints: dict[str, Any] = {}
 
         try:
             if not seeds:
@@ -93,6 +95,7 @@ class PipelineOrchestrator:
                         round_number=round_number,
                         seed_molecules=seeds,
                         sar_context=advisor_context,
+                        sar_constraints=sar_constraints,
                         remaining_total=remaining_total,
                     )
                     if not tasks:
@@ -101,6 +104,9 @@ class PipelineOrchestrator:
 
                     round_summary: dict[str, Any] = {
                         "round": round_number,
+                        "stage": "generation",
+                        "status": "running",
+                        "active_agent": None,
                         "seed_molecules": seeds,
                         "agents": [],
                         "stored_molecule_ids": [],
@@ -112,10 +118,17 @@ class PipelineOrchestrator:
                         "score_improvement": None,
                         "stop_reason": None,
                     }
+                    round_summaries.append(round_summary)
+                    _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                    db.commit()
                     stored_molecule_ids: list[str] = []
                     round_agent_failures = 0
 
                     for task in tasks:
+                        round_summary["stage"] = "generation"
+                        round_summary["active_agent"] = task.agent
+                        _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                        db.commit()
                         agent_run, result, storage_summary = self._run_generation_agent_task(
                             db,
                             project,
@@ -139,6 +152,9 @@ class PipelineOrchestrator:
                         stored_molecule_ids.extend(storage_summary["molecule_ids"])
                         if not result.success and result.status != "skipped":
                             round_agent_failures += 1
+                        round_summary["active_agent"] = None
+                        _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                        db.commit()
 
                     stored_molecule_ids = _dedupe(stored_molecule_ids)
                     round_summary["stored_molecule_ids"] = stored_molecule_ids
@@ -149,16 +165,26 @@ class PipelineOrchestrator:
 
                     if not stored_molecule_ids:
                         round_summary["stop_reason"] = "round_returned_no_new_candidates"
-                        round_summaries.append(round_summary)
+                        round_summary["stage"] = "completed"
+                        round_summary["status"] = "stopped"
                         stop_reason = "round_returned_no_new_candidates"
                         _update_iterative_run(orchestrator_run, round_summaries, stop_reason)
                         db.commit()
                         break
 
+                    round_summary["stage"] = "validation"
+                    _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                    db.commit()
                     round_summary["validation"] = validate_project_molecules(db, project)
                     if plan.evaluation.use_filters:
+                        round_summary["stage"] = "filtering"
+                        _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                        db.commit()
                         round_summary["filtering"] = filter_project_molecules(db, project)
 
+                    round_summary["stage"] = "assessment"
+                    _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                    db.commit()
                     round_summary["assessment"] = self._run_iterative_round_assessment(
                         db,
                         project,
@@ -166,8 +192,19 @@ class PipelineOrchestrator:
                         molecule_ids=stored_molecule_ids,
                         round_number=round_number,
                     )
+                    round_summary["stage"] = "sar"
+                    _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                    db.commit()
+                    sar_result = _run_sar_analysis(db, self.settings, project)
+                    round_summary["sar"] = sar_result.get("summary", {})
+                    sar_constraints = sar_result.get("constraints", {})
+                    sar_context_strings = sar_result.get("sar_context", [])
+
+                    round_summary["stage"] = "advisor"
+                    _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
+                    db.commit()
                     round_summary["advisor"] = generate_project_advice(db, project)
-                    advisor_context = _advisor_context(round_summary["advisor"])
+                    advisor_context = _advisor_context(round_summary["advisor"]) + sar_context_strings
 
                     top_score = _top_ranking_score(db, project)
                     round_summary["top_score"] = top_score
@@ -181,7 +218,8 @@ class PipelineOrchestrator:
                         project,
                         top_n=min(plan.evaluation.top_n, plan.next_round_seed_count),
                     ) or seeds
-                    round_summaries.append(round_summary)
+                    round_summary["stage"] = "completed"
+                    round_summary["status"] = "completed"
                     _update_iterative_run(orchestrator_run, round_summaries, stop_reason=None)
                     db.commit()
 
@@ -437,9 +475,14 @@ def _generation_tasks_from_run_plan(
     round_number: int,
     seed_molecules: list[str],
     sar_context: list[str],
+    sar_constraints: dict[str, Any] | None = None,
     remaining_total: int,
 ) -> list[AgentTask]:
-    constraints = _generation_constraints_for_round(db, project, plan, round_number=round_number)
+    constraints = _generation_constraints_for_round(
+        db, project, plan,
+        round_number=round_number,
+        sar_constraints=sar_constraints,
+    )
     tasks: list[AgentTask] = []
     remaining = max(0, remaining_total)
     for agent_name in ("reinvent4", "crem", "autogrow4"):
@@ -482,10 +525,12 @@ def _generation_constraints_for_round(
     plan: RunPlan,
     *,
     round_number: int,
+    sar_constraints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     constraints = {
         **DEFAULT_GENERATION_CONSTRAINTS,
         **dict(plan.constraints or {}),
+        **(sar_constraints or {}),
         "optimization_round": round_number,
     }
     docking_config = project_docking_config(db, project, constraints.get("binding_site_id"))
@@ -639,6 +684,38 @@ def _top_ranking_score(db: Session, project: Project) -> float | None:
     if ranking is None or ranking.overall_score is None:
         return None
     return float(ranking.overall_score)
+
+
+def _run_sar_analysis(
+    db: Session,
+    settings: Any,
+    project: Project,
+) -> dict[str, Any]:
+    """Run SAR analysis and return constraints + context for the next round."""
+    try:
+        from medagent.agents.sar import SARAgent
+
+        use_llm = bool(getattr(settings, "dashscope_api_key", None))
+        sar_report = SARAgent(db).analyze_sar(project, use_llm=use_llm)
+        bridge = sar_to_generation_constraints(sar_report)
+        return {
+            "summary": {
+                "molecules_analyzed": sar_report.molecules_analyzed,
+                "patterns_count": len(sar_report.sar_patterns),
+                "pharmacophores_count": len(sar_report.pharmacophores),
+                "suggestions_count": len(sar_report.optimization_suggestions),
+                "key_findings": sar_report.key_findings,
+                "warnings": sar_report.warnings,
+            },
+            "constraints": bridge["constraints"],
+            "sar_context": bridge["sar_context"],
+        }
+    except Exception as exc:
+        return {
+            "summary": {"error": str(exc)},
+            "constraints": {},
+            "sar_context": [f"sar_analysis_failed:{type(exc).__name__}"],
+        }
 
 
 def _advisor_context(advisor_output: dict[str, Any] | None) -> list[str]:

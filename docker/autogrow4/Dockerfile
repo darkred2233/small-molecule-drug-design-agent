@@ -43,9 +43,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     autodock-vina \
     ca-certificates
 
-# Install RDKit and dependencies
+# Install RDKit and dependencies.
+# rdkit-pypi is built against NumPy 1.x; NumPy 2.x emits ABI errors in AutoGrow4.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install rdkit-pypi numpy scipy
+    pip install "numpy<2" scipy rdkit-pypi func_timeout molvs
 
 # Install the reviewed AutoGrow4 v4.0.3 source revision. AUTOGROW4_REF remains
 # a build argument so upgrades are explicit and visible in image metadata.

@@ -43,8 +43,14 @@ def generate_project_critiques(
     project: Project,
     settings: Settings | None = None,
     max_molecules: int = 50,
+    round_id: str | None = None,
 ) -> dict[str, Any]:
-    candidates = _select_candidates(db, project, max_molecules=max_molecules)
+    candidates = _select_candidates(
+        db,
+        project,
+        max_molecules=max_molecules,
+        round_id=round_id,
+    )
     critique_ids: list[str] = []
     con_scores: list[float] = []
     risk_counts = {"low": 0, "medium": 0, "high": 0}
@@ -54,8 +60,15 @@ def generate_project_critiques(
     llm_critique_count = 0
 
     for molecule, ranking in candidates:
-        blueprint = _build_critique_blueprint(db, project, settings, molecule, ranking)
-        critique = _upsert_critique(db, molecule, blueprint)
+        blueprint = _build_critique_blueprint(
+            db,
+            project,
+            settings,
+            molecule,
+            ranking,
+            round_id=round_id,
+        )
+        critique = _upsert_critique(db, molecule, blueprint, round_id=round_id)
         critique_ids.append(critique.critique_id)
         con_scores.append(blueprint.con_score)
         risk_counts[blueprint.risk_level] += 1
@@ -68,6 +81,7 @@ def generate_project_critiques(
     db.commit()
     return {
         "project_id": project.project_id,
+        "round_id": round_id,
         "evaluated_count": len(candidates),
         "critique_count": len(critique_ids),
         "critique_ids": critique_ids,
@@ -103,27 +117,27 @@ def _select_candidates(
     db: Session,
     project: Project,
     max_molecules: int,
+    round_id: str | None = None,
 ) -> list[tuple[Molecule, Ranking | None]]:
-    rankings = (
-        db.query(Ranking)
-        .filter_by(project_id=project.project_id)
-        .order_by(Ranking.rank.asc(), Ranking.id.asc())
-        .limit(max_molecules)
-        .all()
-    )
+    ranking_query = db.query(Ranking).filter_by(project_id=project.project_id)
+    if round_id is not None:
+        ranking_query = ranking_query.filter_by(round_id=round_id)
+    else:
+        ranking_query = ranking_query.filter(Ranking.round_id.is_(None))
+    rankings = ranking_query.order_by(Ranking.rank.asc(), Ranking.id.asc()).limit(max_molecules).all()
     ranking_by_molecule_id = {ranking.molecule_id: ranking for ranking in rankings}
     selected_ids: list[str] = []
     for ranking in rankings:
         if ranking.molecule_id not in selected_ids:
             selected_ids.append(ranking.molecule_id)
 
-    assessed_molecules = (
-        db.query(Molecule)
-        .filter_by(project_id=project.project_id, status="candidate_assessed")
-        .order_by(Molecule.id.asc())
-        .limit(max_molecules)
-        .all()
+    assessed_query = db.query(Molecule).filter_by(
+        project_id=project.project_id,
+        status="candidate_assessed",
     )
+    if round_id is not None:
+        assessed_query = assessed_query.filter_by(round_id=round_id)
+    assessed_molecules = assessed_query.order_by(Molecule.id.asc()).limit(max_molecules).all()
     for molecule in assessed_molecules:
         if len(selected_ids) >= max_molecules:
             break
@@ -143,13 +157,10 @@ def _select_candidates(
             if molecule_id in molecule_by_id
         ]
 
-    molecules = (
-        db.query(Molecule)
-        .filter_by(project_id=project.project_id)
-        .order_by(Molecule.id.asc())
-        .limit(max_molecules)
-        .all()
-    )
+    molecule_query = db.query(Molecule).filter_by(project_id=project.project_id)
+    if round_id is not None:
+        molecule_query = molecule_query.filter_by(round_id=round_id)
+    molecules = molecule_query.order_by(Molecule.id.asc()).limit(max_molecules).all()
     return [(molecule, None) for molecule in molecules]
 
 
@@ -159,15 +170,28 @@ def _build_critique_blueprint(
     settings: Settings | None,
     molecule: Molecule,
     ranking: Ranking | None,
+    round_id: str | None = None,
 ) -> CritiqueBlueprint:
-    admet = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
-    docking = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
-    rule_filter = (
-        db.query(RuleFilterResult)
-        .filter_by(molecule_id=molecule.molecule_id)
+    admet = (
+        db.query(ADMETResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
         .one_or_none()
     )
-    synthesis = db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    docking = (
+        db.query(DockingResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
+    rule_filter = (
+        db.query(RuleFilterResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
+    synthesis = (
+        db.query(SynthesisRoute)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     existing_links = (
         db.query(EvidenceLink)
         .filter_by(molecule_id=molecule.molecule_id)
@@ -440,12 +464,18 @@ def _upsert_critique(
     db: Session,
     molecule: Molecule,
     blueprint: CritiqueBlueprint,
+    round_id: str | None = None,
 ) -> Critique:
-    critique = db.query(Critique).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    critique = (
+        db.query(Critique)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if critique is None:
         critique = Critique(
             critique_id=new_id("CRT"),
             molecule_id=molecule.molecule_id,
+            round_id=round_id,
             con_score=blueprint.con_score,
             risk_level=blueprint.risk_level,
             reason=blueprint.reason,

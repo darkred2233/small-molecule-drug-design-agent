@@ -313,6 +313,53 @@ def test_iterative_run_score_improvement_stop_can_be_enabled(
     assert saved_orchestrator_run.output_json["stop_reason"] == "min_score_improvement_not_met"
 
 
+def test_iterative_run_keeps_generation_progress_when_assessment_fails(
+    tmp_path,
+    monkeypatch,
+):
+    settings, session_factory = _session_factory(tmp_path)
+    assessment_calls = []
+    final_route_calls = []
+    _patch_iterative_dependencies(monkeypatch, assessment_calls, final_route_calls)
+
+    def failing_assessment(*_args, **_kwargs):
+        raise RuntimeError("assessment stalled")
+
+    monkeypatch.setattr(orchestrator_module, "run_project_candidate_assessment", failing_assessment)
+
+    with session_factory() as db:
+        project = Project(
+            project_id="PROJ-ITERATIVE-PARTIAL-PROGRESS",
+            name="Iterative partial progress",
+            objective="Persist generation progress before assessment",
+        )
+        db.add(project)
+        db.commit()
+
+        try:
+            PipelineOrchestrator(settings).run_iterative(
+                db,
+                project,
+                _crem_only_run_plan("disabled", max_rounds=1, top_n=1),
+            )
+        except RuntimeError:
+            pass
+
+        saved_orchestrator_run = (
+            db.query(AgentRun)
+            .filter_by(project_id=project.project_id, agent_name="iterative_orchestrator_agent")
+            .one()
+        )
+
+    assert saved_orchestrator_run.status == "failed"
+    rounds = saved_orchestrator_run.output_json["rounds"]
+    assert len(rounds) == 1
+    assert rounds[0]["stage"] == "assessment"
+    assert rounds[0]["agents"][0]["agent"] == "crem"
+    assert rounds[0]["agents"][0]["stored_count"] == 1
+    assert rounds[0]["stored_molecule_ids"]
+
+
 def test_project_report_includes_target_and_sar_agent_outputs(tmp_path, monkeypatch):
     _, session_factory = _session_factory(tmp_path)
     monkeypatch.setattr(

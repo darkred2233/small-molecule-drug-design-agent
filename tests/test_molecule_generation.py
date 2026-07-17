@@ -60,6 +60,15 @@ def test_generate_molecules_runs_all_three_generation_classes(tmp_path):
         assert "datamol" in summary["tool_status"]
         assert set(summary["strategy_summaries"]) == {"reinvent4", "crem", "autogrow4"}
         assert all(item["stored_count"] == 3 for item in summary["strategy_summaries"].values())
+        assert summary["execution_summary"]["strategy_modes"].keys() == summary["strategy_summaries"].keys()
+        assert all(
+            item["execution_mode"] != "not_run"
+            for item in summary["strategy_summaries"].values()
+        )
+        assert all(
+            isinstance(item["fallback_used"], bool)
+            for item in summary["strategy_summaries"].values()
+        )
         assert all(
             item["candidate_source_counts"] for item in summary["strategy_summaries"].values()
         )

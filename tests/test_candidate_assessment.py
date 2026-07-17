@@ -251,6 +251,8 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
         assert response.status_code == 200
         body = response.json()
         assert body["project_id"] == project_id
+        assert body["runtime_policy"]["mode"] == "fast"
+        assert body["runtime_policy"]["external_refinement"] == "disabled"
         assert body["conformer"]["generated_count"] == 2
         assert body["docking"]["evaluated_count"] == 2
         assert body["admet"]["evaluated_count"] == 2
@@ -258,9 +260,15 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
         assert body["ranking"]["evaluated_count"] == 2
         assert body["tool_status"]["rdkit"]["available"] is True
         assert body["docking"]["adapter_mode"] == "rdkit_surrogate_docking"
+        assert body["docking"]["execution_mode"] == "surrogate_only"
+        assert body["docking"]["surrogate_count"] == 2
+        assert body["docking"]["fallback_used"] is False
         assert body["admet"]["adapter_mode"] == "rdkit_surrogate_admet"
+        assert body["admet"]["execution_mode"] == "surrogate_only"
         assert body["synthesis"]["adapter_mode"] == "rdkit_surrogate_synthesis"
+        assert body["synthesis"]["execution_mode"] == "surrogate_only"
         assert body["ranking"]["adapter_mode"] == "heuristic_candidate_ranking"
+        assert body["ranking"]["execution_mode"] == "internal_heuristic"
 
         conformers = client.get(f"/projects/{project_id}/conformer-results").json()
         assert len(conformers) == 2
@@ -405,6 +413,98 @@ def test_external_assessment_runs_available_admet_model_for_all_candidates(tmp_p
             "admet_ai_chemprop_admet"
         }
         assert {item["raw_output"]["compute_device"] for item in stored} == {"cuda"}
+
+
+def test_external_admet_exception_falls_back_and_finishes_agent_run(tmp_path, monkeypatch):
+    status = _minimal_tool_status_with_external()
+    status["gnina"]["available"] = False
+    status["aizynthfinder"]["available"] = False
+    status["chemprop"] = {
+        "available": True,
+        "runtime_available": True,
+        "mode": "admet_ai",
+        "version": "2.0.1",
+        "models_dir": "test-models",
+        "model_count": 10,
+        "gpu_available": True,
+        "device": "cuda",
+    }
+    monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", lambda: status)
+
+    def slow_admet(_request, _tool_status):
+        raise TimeoutError("chemprop stalled")
+
+    monkeypatch.setattr(candidate_assessment, "run_chemprop_admet", slow_admet)
+
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "max_molecules": 2,
+                "top_n": 2,
+                "assessment_mode": "external",
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["admet"]["adapter_mode"] == "rdkit_surrogate_admet"
+        assert "chemprop_external_adapter_exception:TimeoutError" in body["admet"]["warnings"]
+
+        with api_app.SessionLocal() as db:
+            runs = (
+                db.query(api_app.AgentRun)
+                .filter_by(project_id=project_id, agent_name="admet_agent")
+                .order_by(api_app.AgentRun.created_at.asc())
+                .all()
+            )
+
+        assert runs
+        assert all(run.status == "success" for run in runs)
+
+
+def test_cpu_admet_ai_large_external_batch_uses_surrogate_without_calling_model(
+    tmp_path,
+    monkeypatch,
+):
+    status = _minimal_tool_status_with_external()
+    status["gnina"]["available"] = False
+    status["aizynthfinder"]["available"] = False
+    status["chemprop"] = {
+        "available": True,
+        "runtime_available": True,
+        "mode": "admet_ai",
+        "version": "2.0.1",
+        "models_dir": "test-models",
+        "model_count": 10,
+        "gpu_available": False,
+        "device": "cpu",
+    }
+    monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", lambda: status)
+    monkeypatch.setenv("MEDAGENT_ADMET_AI_CPU_MAX_MOLECULES", "1")
+
+    def unexpected_admet(_request, _tool_status):
+        raise AssertionError("CPU ADMET-AI should be skipped for large batches")
+
+    monkeypatch.setattr(candidate_assessment, "run_chemprop_admet", unexpected_admet)
+
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "max_molecules": 2,
+                "top_n": 2,
+                "assessment_mode": "external",
+                "external_top_n": 2,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["admet"]["adapter_mode"] == "rdkit_surrogate_admet"
+        assert "admet_ai_cpu_batch_too_large_using_rdkit_surrogate" in body["admet"]["warnings"]
 
 
 def test_candidate_assessment_is_idempotent(tmp_path):
@@ -890,8 +990,18 @@ def test_external_assessment_mode_refines_only_top_n(tmp_path, monkeypatch):
         body = response.json()
         assert body["assessment_mode"] == "external"
         assert body["external_top_n"] == 1
+        assert body["runtime_policy"]["external_refinement"] == "top_n_after_coarse_screen"
         assert body["docking"]["adapter_mode"] == "gnina_docker_docking_top_n_refinement"
+        assert body["docking"]["execution_mode"] == "mixed_external_surrogate"
+        assert body["docking"]["external_tools_requested"] is True
+        assert body["docking"]["external_attempted_count"] == 1
+        assert body["docking"]["external_success_count"] == 1
+        assert body["docking"]["surrogate_count"] == 1
+        assert body["docking"]["fallback_used"] is False
         assert body["synthesis"]["adapter_mode"] == "aizynthfinder_docker_top_n_refinement"
+        assert body["synthesis"]["execution_mode"] == "mixed_external_surrogate"
+        assert body["synthesis"]["external_success_count"] == 1
+        assert body["synthesis"]["surrogate_count"] == 1
         assert len(docking_requests) == 1
         assert len(retrosynthesis_requests) == 1
 
@@ -936,10 +1046,15 @@ def test_external_refinement_skips_coarse_screen_failures(tmp_path, monkeypatch)
 
     original_failure_reasons = candidate_assessment._assessment_failure_reasons
 
-    def fake_failure_reasons(db, molecule, synthesis_route=None):
+    def fake_failure_reasons(db, molecule, synthesis_route=None, round_id=None):
         if molecule.smiles == "CCO":
             return ["assessment_bad_pose"]
-        return original_failure_reasons(db, molecule, synthesis_route=synthesis_route)
+        return original_failure_reasons(
+            db,
+            molecule,
+            synthesis_route=synthesis_route,
+            round_id=round_id,
+        )
 
     def fake_external_docking(request, tool_status):
         docking_requests.append((request, tool_status))

@@ -91,6 +91,7 @@ DOCKING_RESULT_LABELS = {
     "external_docking_adapter_pending",
     "external_docking_adapter_used",
     "external_docking_adapter_failed",
+    "external_docking_fallback_used",
     "external_docking_setup_incomplete",
     "external_docking_receptor_missing",
     "external_docking_grid_missing",
@@ -118,6 +119,9 @@ DOCKING_RESULT_LABELS = {
 }
 ADMET_RESULT_LABELS = {
     "external_admet_adapter_pending",
+    "external_admet_adapter_used",
+    "external_admet_adapter_failed",
+    "external_admet_fallback_used",
     "rdkit_surrogate_admet",
     "chemprop_predicted",
     "chemprop_admet",
@@ -132,6 +136,8 @@ ADMET_RESULT_LABELS = {
 SYNTHESIS_RESULT_LABELS = {
     "external_retrosynthesis_adapter_pending",
     "external_retrosynthesis_adapter_used",
+    "external_retrosynthesis_adapter_failed",
+    "external_retrosynthesis_fallback_used",
     "rdkit_surrogate_synthesis",
     "aizynthfinder_adapter",
     "askcos_adapter",
@@ -146,6 +152,7 @@ SYNTHESIS_RESULT_LABELS = {
     "too_many_steps",
     "hazardous_route",
 }
+DEFAULT_ADMET_AI_CPU_MAX_MOLECULES = 5
 
 
 @dataclass
@@ -161,6 +168,15 @@ class StageSummary:
     skipped_molecule_ids: list[str] = field(default_factory=list)
     failed_molecule_ids: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    round_id: str | None = None
+    execution_mode: str = "not_run"
+    external_tools_requested: bool = False
+    external_tools_enabled: bool = False
+    external_attempted_count: int = 0
+    external_success_count: int = 0
+    surrogate_count: int = 0
+    fallback_count: int = 0
+    fallback_used: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +191,15 @@ class StageSummary:
             "skipped_molecule_ids": self.skipped_molecule_ids,
             "failed_molecule_ids": self.failed_molecule_ids,
             "warnings": self.warnings,
+            "round_id": self.round_id,
+            "execution_mode": self.execution_mode,
+            "external_tools_requested": self.external_tools_requested,
+            "external_tools_enabled": self.external_tools_enabled,
+            "external_attempted_count": self.external_attempted_count,
+            "external_success_count": self.external_success_count,
+            "surrogate_count": self.surrogate_count,
+            "fallback_count": self.fallback_count,
+            "fallback_used": self.fallback_used,
         }
 
 
@@ -213,12 +238,13 @@ def run_project_candidate_assessment(
     prefer_buyable_building_blocks: bool = True,
     enable_external_synthesis_routes: bool = True,
     skip_ranking: bool = False,
+    round_id: str | None = None,
 ) -> dict[str, Any]:
     assessment_mode = _normalize_assessment_mode(assessment_mode)
-    molecules = _select_assessment_molecules(db, project, molecule_ids, max_molecules)
+    molecules = _select_assessment_molecules(db, project, molecule_ids, max_molecules, round_id)
     tool_status = candidate_assessment_tool_status()
     ranking_top_n = top_n or max_molecules
-    conformer = generate_project_conformers(db, project, molecules, tool_status)
+    conformer = generate_project_conformers(db, project, molecules, tool_status, round_id=round_id)
     docking = run_project_docking(
         db,
         project,
@@ -231,6 +257,7 @@ def run_project_candidate_assessment(
         grid_center=grid_center,
         grid_size=grid_size,
         key_residues=key_residues or [],
+        round_id=round_id,
     )
     admet = run_project_admet(
         db,
@@ -239,6 +266,7 @@ def run_project_candidate_assessment(
         tool_status,
         allow_external_tools=False,
         admet_properties=admet_properties or [],
+        round_id=round_id,
     )
     synthesis = run_project_synthesis(
         db,
@@ -248,15 +276,17 @@ def run_project_candidate_assessment(
         allow_external_tools=False,
         max_synthesis_steps=max_synthesis_steps,
         prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+        round_id=round_id,
     )
-    coarse_screen = _apply_coarse_screen_labels(db, molecules)
-    ranking = _skipped_ranking_summary(molecules, ranking_top_n) if skip_ranking else generate_project_rankings(
+    coarse_screen = _apply_coarse_screen_labels(db, molecules, round_id=round_id)
+    ranking = _skipped_ranking_summary(molecules, ranking_top_n, round_id=round_id) if skip_ranking else generate_project_rankings(
         db,
         project,
         molecules=molecules,
         max_molecules=max_molecules,
         top_n=ranking_top_n,
         tool_status=tool_status,
+        round_id=round_id,
     )
     if assessment_mode in {"external", "full"}:
         coarse_passed_ids = set(coarse_screen["passed_molecule_ids"])
@@ -286,6 +316,7 @@ def run_project_candidate_assessment(
                 grid_center=grid_center,
                 grid_size=grid_size,
                 key_residues=key_residues or [],
+                round_id=round_id,
             )
             admet_refinement = run_project_admet(
                 db,
@@ -294,6 +325,7 @@ def run_project_candidate_assessment(
                 tool_status,
                 allow_external_tools=True,
                 admet_properties=admet_properties or [],
+                round_id=round_id,
             )
             synthesis_refinement = None
             if enable_external_synthesis_routes:
@@ -305,13 +337,14 @@ def run_project_candidate_assessment(
                     allow_external_tools=True,
                     max_synthesis_steps=max_synthesis_steps,
                     prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+                    round_id=round_id,
                 )
             else:
                 synthesis.warnings = _dedupe(
                     synthesis.warnings
                     + ["external_retrosynthesis_skipped_by_synthesis_route_scope"]
                 )
-            _apply_external_refinement_labels(db, coarse_passed_molecules, refinement_molecules)
+            _apply_external_refinement_labels(db, coarse_passed_molecules, refinement_molecules, round_id=round_id)
             refinement_scope = "top_n" if assessment_mode == "external" else "full"
             _mark_external_refinement_summary(docking, docking_refinement, refinement_scope=refinement_scope)
             _mark_external_refinement_summary(admet, admet_refinement, refinement_scope=refinement_scope)
@@ -329,15 +362,22 @@ def run_project_candidate_assessment(
                     max_molecules=max_molecules,
                     top_n=ranking_top_n,
                     tool_status=tool_status,
+                    round_id=round_id,
                 )
     project.status = "candidate_assessed"
     db.commit()
     return {
         "project_id": project.project_id,
+        "round_id": round_id,
         "assessment_mode": assessment_mode,
         "external_top_n": external_top_n,
         "external_synthesis_routes_enabled": enable_external_synthesis_routes,
         "ranking_skipped": skip_ranking,
+        "runtime_policy": _assessment_runtime_policy(
+            assessment_mode=assessment_mode,
+            external_top_n=external_top_n,
+            enable_external_synthesis_routes=enable_external_synthesis_routes,
+        ),
         "conformer": conformer.as_dict(),
         "docking": docking.as_dict(),
         "admet": admet.as_dict(),
@@ -353,6 +393,7 @@ def generate_project_conformers(
     project: Project,
     molecules: list[Molecule],
     tool_status: dict[str, Any] | None = None,
+    round_id: str | None = None,
 ) -> StageSummary:
     tool_status = tool_status or candidate_assessment_tool_status()
     agent_run = _create_agent_run(
@@ -362,11 +403,14 @@ def generate_project_conformers(
         "rdkit_etkdg_conformer",
         {"molecule_ids": [molecule.molecule_id for molecule in molecules]},
         tool_status,
+        round_id=round_id,
     )
     summary = StageSummary(
         agent_run_id=agent_run.agent_run_id,
         adapter_mode="rdkit_etkdg_conformer",
         requested_count=len(molecules),
+        round_id=round_id,
+        execution_mode="local_tool",
     )
     _update_agent_run_progress(
         db,
@@ -388,7 +432,7 @@ def generate_project_conformers(
             current_molecule_id=molecule.molecule_id,
         )
         result = _calculate_conformer_result(molecule.smiles)
-        conformer = _upsert_conformer_result(db, molecule, result)
+        conformer = _upsert_conformer_result(db, molecule, result, round_id=round_id)
         molecule.labels = merge_labels(molecule.labels, conformer.labels)
         if conformer.conformer_generated:
             summary.generated_count += 1
@@ -424,6 +468,7 @@ def run_project_docking(
     grid_center: list[float] | None = None,
     grid_size: list[float] | None = None,
     key_residues: list[str] | None = None,
+    round_id: str | None = None,
 ) -> StageSummary:
     tool_status = tool_status or candidate_assessment_tool_status()
     key_residues = key_residues or []
@@ -450,11 +495,22 @@ def run_project_docking(
             "key_residues": key_residues,
         },
         tool_status,
+        round_id=round_id,
+    )
+    external_ready = allow_external_tools and _external_docking_ready(
+        tool_status,
+        protein_file,
+        grid_center,
+        grid_size,
     )
     summary = StageSummary(
         agent_run_id=agent_run.agent_run_id,
         adapter_mode="rdkit_surrogate_docking",
         requested_count=len(molecules),
+        round_id=round_id,
+        execution_mode="surrogate_only",
+        external_tools_requested=allow_external_tools,
+        external_tools_enabled=bool(external_ready),
         warnings=_external_docking_setup_warnings(
             tool_status,
             protein_file=protein_file,
@@ -525,6 +581,8 @@ def run_project_docking(
 
         external_result = None
         if allow_external_tools:
+            if external_ready:
+                summary.external_attempted_count += 1
             external_result = _attempt_external_docking(
                 project,
                 molecule,
@@ -542,8 +600,10 @@ def run_project_docking(
                 descriptors,
                 key_residues=key_residues,
                 external_result=external_result,
+                round_id=round_id,
             )
             external_adapter_modes.add(external_result.adapter_mode)
+            summary.external_success_count += 1
         else:
             if external_result is not None and external_result.warnings:
                 summary.warnings = _dedupe(summary.warnings + external_result.warnings)
@@ -554,7 +614,12 @@ def run_project_docking(
                 descriptors,
                 key_residues=key_residues,
                 fallback_warnings=summary.warnings if allow_external_tools else [],
+                external_tools_requested=allow_external_tools,
+                round_id=round_id,
             )
+            summary.surrogate_count += 1
+            if allow_external_tools:
+                summary.fallback_count += 1
         molecule.labels = _replace_result_labels(molecule.labels, DOCKING_RESULT_LABELS, docking.labels)
         summary.evaluated_count += 1
         summary.generated_count += 1
@@ -574,6 +639,7 @@ def run_project_docking(
         summary.adapter_mode = next(iter(external_adapter_modes))
     elif len(external_adapter_modes) > 1:
         summary.adapter_mode = "external_docking_with_rdkit_fallback"
+    _finalize_stage_execution_mode(summary, surrogate_mode="rdkit_surrogate_docking")
 
     _finish_agent_run(agent_run, summary, tool_status)
     db.commit()
@@ -587,11 +653,20 @@ def run_project_admet(
     tool_status: dict[str, Any] | None = None,
     allow_external_tools: bool = True,
     admet_properties: list[str] | None = None,
+    round_id: str | None = None,
 ) -> StageSummary:
     tool_status = tool_status or candidate_assessment_tool_status()
 
-    # Try Chemprop first if available
-    chemprop_available = allow_external_tools and tool_status.get("chemprop", {}).get("available", False)
+    external_admet_skip_warning = (
+        _external_admet_skip_warning(tool_status, len(molecules))
+        if allow_external_tools
+        else None
+    )
+    chemprop_available = (
+        allow_external_tools
+        and tool_status.get("chemprop", {}).get("available", False)
+        and external_admet_skip_warning is None
+    )
     adapter_mode = "chemprop_admet" if chemprop_available else "rdkit_surrogate_admet"
 
     agent_run = _create_agent_run(
@@ -604,11 +679,16 @@ def run_project_admet(
             "properties": admet_properties or [],
         },
         tool_status,
+        round_id=round_id,
     )
     summary = StageSummary(
         agent_run_id=agent_run.agent_run_id,
         adapter_mode=adapter_mode,
         requested_count=len(molecules),
+        round_id=round_id,
+        execution_mode="external_tool" if chemprop_available else "surrogate_only",
+        external_tools_requested=allow_external_tools,
+        external_tools_enabled=bool(chemprop_available),
         warnings=[],
     )
     _update_agent_run_progress(
@@ -627,12 +707,31 @@ def run_project_admet(
 
     if chemprop_available:
         # Use Chemprop for real ADMET predictions
-        chemprop_result = _run_chemprop_for_project(db, molecules, tool_status, admet_properties)
+        summary.external_attempted_count = len(molecules)
+        try:
+            chemprop_result = _run_chemprop_for_project(
+                db,
+                molecules,
+                tool_status,
+                admet_properties,
+            )
+        except Exception as exc:
+            chemprop_result = ChempropADMETOutput(
+                adapter_mode="chemprop_adapter_exception",
+                tool_name="chemprop",
+                success=False,
+                warnings=[
+                    f"chemprop_external_adapter_exception:{type(exc).__name__}",
+                    "use_rdkit_surrogate_fallback",
+                ],
+            )
         summary.adapter_mode = chemprop_result.adapter_mode
         summary.generated_count = len(chemprop_result.results)
         summary.evaluated_count = len(chemprop_result.results)
         summary.molecule_ids = [r.molecule_id for r in chemprop_result.results]
         summary.warnings.extend(chemprop_result.warnings)
+        if chemprop_result.success:
+            summary.external_success_count = len(chemprop_result.results)
 
         # Process Chemprop results
         for index, single_result in enumerate(chemprop_result.results, start=1):
@@ -649,6 +748,7 @@ def run_project_admet(
                 adapter_mode=chemprop_result.adapter_mode,
                 adapter_output=chemprop_result,
                 tool_status=tool_status.get("chemprop", {}),
+                round_id=round_id,
             )
             molecule.labels = _replace_result_labels(molecule.labels, ADMET_RESULT_LABELS, admet.labels)
             _update_agent_run_progress(
@@ -672,12 +772,21 @@ def run_project_admet(
                     summary.failed_count += 1
                     summary.failed_molecule_ids.append(molecule.molecule_id)
                     continue
-                admet = _upsert_admet_result(db, molecule, descriptors, tool_status)
+                admet = _upsert_admet_result(
+                    db,
+                    molecule,
+                    descriptors,
+                    tool_status,
+                    external_tools_requested=True,
+                    fallback_warnings=summary.warnings,
+                    round_id=round_id,
+                )
                 molecule.labels = _replace_result_labels(molecule.labels, ADMET_RESULT_LABELS, admet.labels)
                 summary.evaluated_count += 1
                 summary.generated_count += 1
                 summary.molecule_ids.append(molecule.molecule_id)
                 fallback_count += 1
+                summary.surrogate_count += 1
             _update_agent_run_progress(
                 db,
                 agent_run,
@@ -690,6 +799,7 @@ def run_project_admet(
             )
 
         if fallback_count:
+            summary.fallback_count += fallback_count
             if chemprop_ids:
                 summary.adapter_mode = "chemprop_with_rdkit_surrogate_admet"
                 summary.warnings.append("chemprop_partial_fallback_to_rdkit")
@@ -699,7 +809,9 @@ def run_project_admet(
     else:
         # RDKit surrogate fallback
         if allow_external_tools:
-            summary.warnings.append("external_admet_tools_not_installed")
+            summary.warnings.append(
+                external_admet_skip_warning or "external_admet_tools_not_installed"
+            )
         else:
             summary.warnings.append("external_admet_skipped_by_assessment_mode")
         for index, molecule in enumerate(molecules, start=1):
@@ -729,11 +841,22 @@ def run_project_admet(
                 )
                 continue
 
-            admet = _upsert_admet_result(db, molecule, descriptors, tool_status)
+            admet = _upsert_admet_result(
+                db,
+                molecule,
+                descriptors,
+                tool_status,
+                external_tools_requested=allow_external_tools,
+                fallback_warnings=summary.warnings if allow_external_tools else [],
+                round_id=round_id,
+            )
             molecule.labels = _replace_result_labels(molecule.labels, ADMET_RESULT_LABELS, admet.labels)
             summary.evaluated_count += 1
             summary.generated_count += 1
             summary.molecule_ids.append(molecule.molecule_id)
+            summary.surrogate_count += 1
+            if allow_external_tools:
+                summary.fallback_count += 1
             _update_agent_run_progress(
                 db,
                 agent_run,
@@ -745,6 +868,7 @@ def run_project_admet(
                 extra={"external_tools_enabled": False},
             )
 
+    _finalize_stage_execution_mode(summary, surrogate_mode="rdkit_surrogate_admet")
     _finish_agent_run(agent_run, summary, tool_status)
     db.commit()
     return summary
@@ -779,11 +903,16 @@ def _upsert_admet_result_from_chemprop(
     adapter_mode: str = "chemprop_admet",
     adapter_output: ChempropADMETOutput | None = None,
     tool_status: dict[str, Any] | None = None,
+    round_id: str | None = None,
 ) -> ADMETResult:
     """Create or update ADMET result from Chemprop prediction."""
-    result = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    result = (
+        db.query(ADMETResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if result is None:
-        result = ADMETResult(molecule_id=molecule.molecule_id)
+        result = ADMETResult(molecule_id=molecule.molecule_id, round_id=round_id)
         db.add(result)
 
     result.hERG_probability = chemprop_result.hERG_probability
@@ -793,7 +922,13 @@ def _upsert_admet_result_from_chemprop(
     result.solubility = chemprop_result.solubility
     result.permeability = chemprop_result.permeability
     result.admet_risk_score = chemprop_result.admet_risk_score
-    result.labels = _dedupe(chemprop_result.labels)
+    result.labels = _dedupe(
+        [
+            "external_admet_adapter_used",
+            *chemprop_result.labels,
+            adapter_mode,
+        ]
+    )
     tool_status = tool_status or {}
     tool_name = adapter_output.tool_name if adapter_output is not None else "chemprop"
     result.raw_output = {
@@ -813,6 +948,12 @@ def _upsert_admet_result_from_chemprop(
         ),
         "input_hash": _smiles_input_hash(molecule.smiles),
         "status": "success",
+        "execution_mode": "external_tool",
+        "evidence_tier": "predictive_model",
+        "external_tool_requested": True,
+        "external_tool_used": True,
+        "surrogate_used": False,
+        "fallback_used": False,
         "result_kind": "model_prediction",
         "CYP3A4_inhibition": chemprop_result.CYP3A4_inhibition,
         "CYP3A4_risk": chemprop_result.CYP3A4_risk,
@@ -836,6 +977,7 @@ def run_project_synthesis(
     allow_external_tools: bool = True,
     max_synthesis_steps: int = 5,
     prefer_buyable_building_blocks: bool = True,
+    round_id: str | None = None,
 ) -> StageSummary:
     tool_status = tool_status or candidate_assessment_tool_status()
     agent_run = _create_agent_run(
@@ -849,11 +991,17 @@ def run_project_synthesis(
             "prefer_buyable_building_blocks": prefer_buyable_building_blocks,
         },
         tool_status,
+        round_id=round_id,
     )
+    external_available = allow_external_tools and _external_synthesis_available(tool_status)
     summary = StageSummary(
         agent_run_id=agent_run.agent_run_id,
         adapter_mode="rdkit_surrogate_synthesis",
         requested_count=len(molecules),
+        round_id=round_id,
+        execution_mode="surrogate_only",
+        external_tools_requested=allow_external_tools,
+        external_tools_enabled=bool(external_available),
         warnings=["external_retrosynthesis_tools_not_installed"]
         if allow_external_tools and not _external_synthesis_available(tool_status)
         else [],
@@ -905,6 +1053,8 @@ def run_project_synthesis(
 
         external_result = None
         if allow_external_tools:
+            if external_available:
+                summary.external_attempted_count += 1
             external_result = _attempt_external_retrosynthesis(
                 project,
                 molecule,
@@ -920,8 +1070,10 @@ def run_project_synthesis(
                 external_result=external_result,
                 max_synthesis_steps=max_synthesis_steps,
                 prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+                round_id=round_id,
             )
             external_adapter_modes.add(external_result.adapter_mode)
+            summary.external_success_count += 1
             if external_result.warnings:
                 summary.warnings = _dedupe(summary.warnings + external_result.warnings)
         else:
@@ -934,10 +1086,19 @@ def run_project_synthesis(
                 tool_status,
                 max_synthesis_steps=max_synthesis_steps,
                 prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+                external_tools_requested=allow_external_tools,
+                fallback_warnings=summary.warnings if allow_external_tools else [],
+                round_id=round_id,
             )
+            summary.surrogate_count += 1
             fallback_count += 1
         molecule.labels = _replace_result_labels(molecule.labels, SYNTHESIS_RESULT_LABELS, route.labels)
-        failure_reasons = _assessment_failure_reasons(db, molecule, synthesis_route=route)
+        failure_reasons = _assessment_failure_reasons(
+            db,
+            molecule,
+            synthesis_route=route,
+            round_id=round_id,
+        )
         _apply_assessment_status(molecule, failure_reasons)
         _update_sa_score(db, molecule, route.route_json.get("SA_score"))
         summary.evaluated_count += 1
@@ -962,50 +1123,72 @@ def run_project_synthesis(
         summary.adapter_mode = next(iter(external_adapter_modes))
     elif external_adapter_modes:
         summary.adapter_mode = "aizynthfinder_with_rdkit_surrogate_fallback"
+    summary.fallback_count += fallback_count if allow_external_tools else 0
+    _finalize_stage_execution_mode(summary, surrogate_mode="rdkit_surrogate_synthesis")
 
     _finish_agent_run(agent_run, summary, tool_status)
     db.commit()
     return summary
 
 
-def list_project_conformer_results(db: Session, project: Project) -> list[ConformerResult]:
-    return (
+def list_project_conformer_results(
+    db: Session,
+    project: Project,
+    round_id: str | None = None,
+) -> list[ConformerResult]:
+    query = (
         db.query(ConformerResult)
         .join(Molecule, ConformerResult.molecule_id == Molecule.molecule_id)
         .filter(Molecule.project_id == project.project_id)
-        .order_by(Molecule.id.asc())
-        .all()
     )
+    if round_id is not None:
+        query = query.filter(ConformerResult.round_id == round_id)
+    return query.order_by(Molecule.id.asc()).all()
 
 
-def list_project_docking_results(db: Session, project: Project) -> list[DockingResult]:
-    return (
+def list_project_docking_results(
+    db: Session,
+    project: Project,
+    round_id: str | None = None,
+) -> list[DockingResult]:
+    query = (
         db.query(DockingResult)
         .join(Molecule, DockingResult.molecule_id == Molecule.molecule_id)
         .filter(Molecule.project_id == project.project_id)
-        .order_by(Molecule.id.asc())
-        .all()
     )
+    if round_id is not None:
+        query = query.filter(DockingResult.round_id == round_id)
+    return query.order_by(Molecule.id.asc()).all()
 
 
-def list_project_admet_results(db: Session, project: Project) -> list[ADMETResult]:
-    return (
+def list_project_admet_results(
+    db: Session,
+    project: Project,
+    round_id: str | None = None,
+) -> list[ADMETResult]:
+    query = (
         db.query(ADMETResult)
         .join(Molecule, ADMETResult.molecule_id == Molecule.molecule_id)
         .filter(Molecule.project_id == project.project_id)
-        .order_by(Molecule.id.asc())
-        .all()
     )
+    if round_id is not None:
+        query = query.filter(ADMETResult.round_id == round_id)
+    return query.order_by(Molecule.id.asc()).all()
 
 
-def list_project_synthesis_routes(db: Session, project: Project) -> list[SynthesisRoute]:
-    return (
+def list_project_synthesis_routes(
+    db: Session,
+    project: Project,
+    round_id: str | None = None,
+) -> list[SynthesisRoute]:
+    query = (
         db.query(SynthesisRoute)
         .join(Molecule, SynthesisRoute.molecule_id == Molecule.molecule_id)
         .filter(Molecule.project_id == project.project_id)
-        .order_by(Molecule.id.asc())
-        .all()
     )
+    if round_id is not None:
+        query = query.filter(SynthesisRoute.round_id == round_id)
+    return query.order_by(Molecule.id.asc()).all()
 
 
 def candidate_assessment_tool_status() -> dict[str, Any]:
@@ -1028,8 +1211,11 @@ def _select_assessment_molecules(
     project: Project,
     molecule_ids: list[str] | None,
     max_molecules: int,
+    round_id: str | None = None,
 ) -> list[Molecule]:
     query = db.query(Molecule).filter_by(project_id=project.project_id)
+    if round_id is not None:
+        query = query.filter_by(round_id=round_id)
     if molecule_ids:
         query = query.filter(Molecule.molecule_id.in_(molecule_ids))
     else:
@@ -1044,7 +1230,89 @@ def _normalize_assessment_mode(mode: str) -> str:
     return normalized
 
 
-def _skipped_ranking_summary(molecules: list[Molecule], top_n: int) -> StageSummary:
+def _assessment_runtime_policy(
+    *,
+    assessment_mode: str,
+    external_top_n: int,
+    enable_external_synthesis_routes: bool,
+) -> dict[str, Any]:
+    if assessment_mode == "fast":
+        return {
+            "mode": "fast",
+            "coarse_screen": "surrogate_only",
+            "external_refinement": "disabled",
+            "external_top_n": 0,
+            "external_synthesis_routes_enabled": False,
+        }
+    if assessment_mode == "external":
+        return {
+            "mode": "external",
+            "coarse_screen": "surrogate_first",
+            "external_refinement": "top_n_after_coarse_screen",
+            "external_top_n": external_top_n,
+            "external_synthesis_routes_enabled": enable_external_synthesis_routes,
+        }
+    return {
+        "mode": "full",
+        "coarse_screen": "surrogate_first",
+        "external_refinement": "all_coarse_passed_candidates",
+        "external_top_n": None,
+        "external_synthesis_routes_enabled": enable_external_synthesis_routes,
+    }
+
+
+def _finalize_stage_execution_mode(summary: StageSummary, surrogate_mode: str) -> None:
+    summary.fallback_used = summary.fallback_count > 0
+    if summary.external_success_count and summary.surrogate_count:
+        summary.execution_mode = "mixed_external_surrogate"
+        if summary.adapter_mode == surrogate_mode:
+            summary.adapter_mode = f"{surrogate_mode}_with_external_refinement"
+        return
+    if summary.external_success_count:
+        summary.execution_mode = "external_only"
+        return
+    if summary.surrogate_count and summary.external_tools_requested:
+        summary.execution_mode = "surrogate_fallback"
+        summary.adapter_mode = surrogate_mode
+        return
+    if summary.surrogate_count:
+        summary.execution_mode = "surrogate_only"
+        summary.adapter_mode = surrogate_mode
+        return
+    if summary.skipped_count == summary.requested_count:
+        summary.execution_mode = "skipped"
+
+
+def _external_admet_skip_warning(
+    tool_status: dict[str, Any],
+    molecule_count: int,
+) -> str | None:
+    chemprop_status = tool_status.get("chemprop") or {}
+    if not chemprop_status.get("available"):
+        return None
+    if chemprop_status.get("mode") != "admet_ai":
+        return None
+    if bool(chemprop_status.get("gpu_available")):
+        return None
+    if molecule_count <= _admet_ai_cpu_max_molecules():
+        return None
+    return "admet_ai_cpu_batch_too_large_using_rdkit_surrogate"
+
+
+def _admet_ai_cpu_max_molecules() -> int:
+    raw_value = os.environ.get("MEDAGENT_ADMET_AI_CPU_MAX_MOLECULES")
+    try:
+        parsed = int(raw_value) if raw_value is not None else DEFAULT_ADMET_AI_CPU_MAX_MOLECULES
+    except ValueError:
+        parsed = DEFAULT_ADMET_AI_CPU_MAX_MOLECULES
+    return max(1, parsed)
+
+
+def _skipped_ranking_summary(
+    molecules: list[Molecule],
+    top_n: int,
+    round_id: str | None = None,
+) -> StageSummary:
     ordered_ids = [molecule.molecule_id for molecule in molecules]
     return StageSummary(
         agent_run_id="RUN-RANKING-SKIPPED",
@@ -1054,6 +1322,8 @@ def _skipped_ranking_summary(molecules: list[Molecule], top_n: int) -> StageSumm
         molecule_ids=ordered_ids[:top_n],
         skipped_molecule_ids=ordered_ids,
         warnings=["ranking_skipped_by_request"],
+        round_id=round_id,
+        execution_mode="skipped",
     )
 
 
@@ -1081,13 +1351,17 @@ def _top_ranked_molecules_for_external_refinement(
     return [molecule_by_id[molecule_id] for molecule_id in selected_ids if molecule_id in molecule_by_id]
 
 
-def _apply_coarse_screen_labels(db: Session, molecules: list[Molecule]) -> dict[str, Any]:
+def _apply_coarse_screen_labels(
+    db: Session,
+    molecules: list[Molecule],
+    round_id: str | None = None,
+) -> dict[str, Any]:
     passed_ids: list[str] = []
     failed_ids: list[str] = []
     failure_reasons_by_id: dict[str, list[str]] = {}
 
     for molecule in molecules:
-        failure_reasons = _assessment_failure_reasons(db, molecule)
+        failure_reasons = _assessment_failure_reasons(db, molecule, round_id=round_id)
         failure_reasons_by_id[molecule.molecule_id] = failure_reasons
         molecule.labels = [label for label in (molecule.labels or []) if label not in COARSE_SCREEN_LABELS]
         if failure_reasons:
@@ -1137,6 +1411,7 @@ def _apply_external_refinement_labels(
     db: Session,
     coarse_passed_molecules: list[Molecule],
     refinement_molecules: list[Molecule],
+    round_id: str | None = None,
 ) -> None:
     refinement_ids = {molecule.molecule_id for molecule in refinement_molecules}
     for molecule in coarse_passed_molecules:
@@ -1144,7 +1419,7 @@ def _apply_external_refinement_labels(
         if molecule.molecule_id not in refinement_ids:
             molecule.labels = merge_labels(labels, ["coarse_only_candidate"])
             continue
-        evidence_labels = _external_evidence_labels(db, molecule)
+        evidence_labels = _external_evidence_labels(db, molecule, round_id=round_id)
         if evidence_labels:
             molecule.labels = merge_labels(labels, ["external_refinement_attempted", "externally_refined_candidate"])
         else:
@@ -1152,19 +1427,35 @@ def _apply_external_refinement_labels(
     db.commit()
 
 
-def _external_evidence_labels(db: Session, molecule: Molecule) -> list[str]:
+def _external_evidence_labels(
+    db: Session,
+    molecule: Molecule,
+    round_id: str | None = None,
+) -> list[str]:
     labels: list[str] = []
-    docking = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    docking = (
+        db.query(DockingResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if docking is not None and not _is_surrogate_docking_result(docking):
         docking_labels = docking.labels or []
         if "external_docking_adapter_used" in docking_labels:
             labels.append("external_docking_adapter_used")
-    admet = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    admet = (
+        db.query(ADMETResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if admet is not None and not _is_surrogate_admet_result(admet):
         admet_labels = admet.labels or []
         if "admet_ai_predicted" in admet_labels or "chemprop_predicted" in admet_labels:
             labels.append("external_admet_adapter_used")
-    synthesis = db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    synthesis = (
+        db.query(SynthesisRoute)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if synthesis is not None:
         synthesis_labels = synthesis.labels or []
         if "external_retrosynthesis_adapter_used" in synthesis_labels:
@@ -1177,9 +1468,19 @@ def _mark_external_refinement_summary(
     refinement: StageSummary,
     refinement_scope: str = "top_n",
 ) -> None:
+    base_surrogate_mode = base.adapter_mode
     refined_count = refinement.evaluated_count
+    base.external_tools_requested = base.external_tools_requested or refinement.external_tools_requested
+    base.external_tools_enabled = base.external_tools_enabled or refinement.external_tools_enabled
+    base.external_attempted_count += refinement.external_attempted_count
+    base.external_success_count += refinement.external_success_count
+    base.fallback_count += refinement.fallback_count
+    if refinement.external_success_count:
+        base.surrogate_count = max(0, base.surrogate_count - refinement.external_success_count)
+    base.fallback_used = base.fallback_count > 0
     if refined_count == 0:
         base.warnings = _dedupe(base.warnings + refinement.warnings + ["external_refinement_no_candidates"])
+        _finalize_stage_execution_mode(base, surrogate_mode=base_surrogate_mode)
         return
 
     if refinement.adapter_mode.startswith("rdkit_surrogate"):
@@ -1191,6 +1492,7 @@ def _mark_external_refinement_summary(
                 "external_refinement_no_external_results",
             ]
         )
+        _finalize_stage_execution_mode(base, surrogate_mode=refinement.adapter_mode)
         return
 
     base.adapter_mode = (
@@ -1206,19 +1508,29 @@ def _mark_external_refinement_summary(
             f"external_refinement_adapter_mode={refinement.adapter_mode}",
         ]
     )
+    _finalize_stage_execution_mode(base, surrogate_mode=base_surrogate_mode)
 
 
 def _assessment_failure_reasons(
     db: Session,
     molecule: Molecule,
     synthesis_route: SynthesisRoute | None = None,
+    round_id: str | None = None,
 ) -> list[str]:
     reasons: list[str] = []
-    conformer = db.query(ConformerResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    conformer = (
+        db.query(ConformerResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if conformer is None or not conformer.conformer_generated:
         reasons.append("assessment_conformer_failed")
 
-    docking = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    docking = (
+        db.query(DockingResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if docking is not None and not _is_surrogate_docking_result(docking):
         docking_labels = docking.labels or []
         if "bad_pose" in docking_labels or (docking.clash_count or 0) >= 2:
@@ -1226,13 +1538,21 @@ def _assessment_failure_reasons(
         elif docking.cnn_score is not None and float(docking.cnn_score) < 0.35:
             reasons.append("assessment_bad_pose")
 
-    admet = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    admet = (
+        db.query(ADMETResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if admet is not None and not _is_surrogate_admet_result(admet):
         admet_labels = admet.labels or []
         if "admet_blocker" in admet_labels or admet.hERG_risk == "high_risk" or admet.Ames_risk == "high_risk":
             reasons.append("assessment_admet_blocker")
 
-    synthesis = synthesis_route or db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    synthesis = synthesis_route or (
+        db.query(SynthesisRoute)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if synthesis is not None and not _is_surrogate_synthesis_result(synthesis) and not synthesis.route_found:
         reasons.append("assessment_route_not_found")
 
@@ -1378,10 +1698,15 @@ def _upsert_conformer_result(
     db: Session,
     molecule: Molecule,
     payload: dict[str, Any],
+    round_id: str | None = None,
 ) -> ConformerResult:
-    result = db.query(ConformerResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    result = (
+        db.query(ConformerResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if result is None:
-        result = ConformerResult(molecule_id=molecule.molecule_id)
+        result = ConformerResult(molecule_id=molecule.molecule_id, round_id=round_id)
         db.add(result)
 
     result.conformer_generated = bool(payload.get("conformer_generated"))
@@ -1404,6 +1729,8 @@ def _upsert_docking_result(
     descriptors: DescriptorSnapshot,
     key_residues: list[str],
     fallback_warnings: list[str] | None = None,
+    external_tools_requested: bool = False,
+    round_id: str | None = None,
 ) -> DockingResult:
     key_hbond_count = min(
         len(key_residues) or 2,
@@ -1432,6 +1759,9 @@ def _upsert_docking_result(
     ligand_efficiency = vina_score / max(descriptors.heavy_atom_count, 1)
 
     labels = ["external_docking_adapter_pending", "rdkit_surrogate_docking"]
+    if external_tools_requested:
+        labels.append("external_docking_adapter_failed")
+        labels.append("external_docking_fallback_used")
     labels.extend(_external_docking_fallback_labels(fallback_warnings or []))
     labels.append("docking_strong" if vina_score <= -8.0 else "docking_weak")
     labels.append("pose_confident" if cnn_score >= 0.6 else "pose_uncertain")
@@ -1443,9 +1773,13 @@ def _upsert_docking_result(
     if ligand_efficiency <= -0.3:
         labels.append("good_ligand_efficiency")
 
-    result = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    result = (
+        db.query(DockingResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if result is None:
-        result = DockingResult(molecule_id=molecule.molecule_id)
+        result = DockingResult(molecule_id=molecule.molecule_id, round_id=round_id)
         db.add(result)
 
     result.tool_run_id = None
@@ -1463,6 +1797,12 @@ def _upsert_docking_result(
         "model_name": None,
         "input_hash": _smiles_input_hash(molecule.smiles),
         "status": "surrogate_only",
+        "execution_mode": "surrogate_fallback" if external_tools_requested else "surrogate_only",
+        "evidence_tier": "surrogate",
+        "external_tool_requested": external_tools_requested,
+        "external_tool_used": False,
+        "surrogate_used": True,
+        "fallback_used": external_tools_requested,
         "result_kind": "non_docking_coarse_estimate",
         "estimated_affinity_like_score": vina_score,
         "estimated_pose_confidence": cnn_score,
@@ -1499,6 +1839,7 @@ def _upsert_external_docking_result(
     descriptors: DescriptorSnapshot,
     key_residues: list[str],
     external_result: DockingToolResult,
+    round_id: str | None = None,
 ) -> DockingResult:
     vina_score = external_result.vina_score
     if vina_score is None:
@@ -1508,6 +1849,8 @@ def _upsert_external_docking_result(
     labels = list(external_result.labels or [])
     if not labels:
         labels = ["external_docking_adapter_used", f"{external_result.tool_name}_adapter"]
+    elif "external_docking_adapter_used" not in labels:
+        labels.append("external_docking_adapter_used")
     labels.append(external_result.adapter_mode)
     if vina_score is not None:
         labels.append("docking_strong" if vina_score <= -8.0 else "docking_weak")
@@ -1519,9 +1862,13 @@ def _upsert_external_docking_result(
         labels.append("diffdock_confidence_recorded")
     labels.append("pose_interactions_not_computed")
 
-    result = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    result = (
+        db.query(DockingResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if result is None:
-        result = DockingResult(molecule_id=molecule.molecule_id)
+        result = DockingResult(molecule_id=molecule.molecule_id, round_id=round_id)
         db.add(result)
 
     result.tool_run_id = external_result.adapter_mode
@@ -1537,6 +1884,12 @@ def _upsert_external_docking_result(
         "tool_name": external_result.tool_name,
         "input_hash": _smiles_input_hash(molecule.smiles),
         "status": "success",
+        "execution_mode": "external_tool",
+        "evidence_tier": "external_tool",
+        "external_tool_requested": True,
+        "external_tool_used": True,
+        "surrogate_used": False,
+        "fallback_used": False,
         "result_kind": "external_docking",
         "cnn_affinity": external_result.cnn_affinity,
         "diffdock_confidence": external_result.diffdock_confidence,
@@ -1564,6 +1917,9 @@ def _upsert_admet_result(
     molecule: Molecule,
     descriptors: DescriptorSnapshot,
     tool_status: dict[str, Any],
+    external_tools_requested: bool = False,
+    fallback_warnings: list[str] | None = None,
+    round_id: str | None = None,
 ) -> ADMETResult:
     catalog_available, catalog_matches = find_rdkit_filter_matches(molecule.smiles)
     alert_penalty = min(len(catalog_matches) * 0.12, 0.36)
@@ -1587,6 +1943,8 @@ def _upsert_admet_result(
     ames_risk = _risk_label(ames_probability)
 
     labels = ["external_admet_adapter_pending", "rdkit_surrogate_admet"]
+    if external_tools_requested:
+        labels.extend(["external_admet_adapter_failed", "external_admet_fallback_used"])
     labels.extend([herg_risk, ames_risk])
     if herg_risk == "high_risk" or ames_risk == "high_risk":
         labels.append("admet_blocker")
@@ -1595,9 +1953,13 @@ def _upsert_admet_result(
     else:
         labels.append("admet_clean")
 
-    result = db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    result = (
+        db.query(ADMETResult)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if result is None:
-        result = ADMETResult(molecule_id=molecule.molecule_id)
+        result = ADMETResult(molecule_id=molecule.molecule_id, round_id=round_id)
         db.add(result)
 
     result.hERG_probability = round(herg_probability, 3)
@@ -1615,7 +1977,14 @@ def _upsert_admet_result(
         "model_name": None,
         "input_hash": _smiles_input_hash(molecule.smiles),
         "status": "surrogate_only",
+        "execution_mode": "surrogate_fallback" if external_tools_requested else "surrogate_only",
+        "evidence_tier": "surrogate",
+        "external_tool_requested": external_tools_requested,
+        "external_tool_used": False,
+        "surrogate_used": True,
+        "fallback_used": external_tools_requested,
         "result_kind": "non_admet_coarse_estimate",
+        "warnings": fallback_warnings or [],
         "tool_status": {
             key: tool_status[key]
             for key in ["admetlab", "chemprop", "deepchem", "rdkit"]
@@ -1676,6 +2045,7 @@ def _upsert_external_synthesis_route(
     external_result: AiZynthFinderResult,
     max_synthesis_steps: int,
     prefer_buyable_building_blocks: bool,
+    round_id: str | None = None,
 ) -> SynthesisRoute:
     sa_score = _sa_score(descriptors)
     sc_score = round(_clamp(sa_score + descriptors.ring_count * 0.2, 1.0, 10.0), 3)
@@ -1700,9 +2070,13 @@ def _upsert_external_synthesis_route(
         ]
     )
 
-    result = db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    result = (
+        db.query(SynthesisRoute)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if result is None:
-        result = SynthesisRoute(molecule_id=molecule.molecule_id)
+        result = SynthesisRoute(molecule_id=molecule.molecule_id, round_id=round_id)
         db.add(result)
 
     result.route_found = route_found
@@ -1747,6 +2121,12 @@ def _upsert_external_synthesis_route(
         ),
         "input_hash": _smiles_input_hash(molecule.smiles),
         "status": "success" if external_result.success else "failed",
+        "execution_mode": "external_tool",
+        "evidence_tier": "retrosynthesis_tool",
+        "external_tool_requested": True,
+        "external_tool_used": True,
+        "surrogate_used": False,
+        "fallback_used": False,
         "result_kind": (
             "external_retrosynthesis_route"
             if has_route_details
@@ -1763,6 +2143,9 @@ def _upsert_synthesis_route(
     tool_status: dict[str, Any],
     max_synthesis_steps: int,
     prefer_buyable_building_blocks: bool,
+    external_tools_requested: bool = False,
+    fallback_warnings: list[str] | None = None,
+    round_id: str | None = None,
 ) -> SynthesisRoute:
     sa_score = _sa_score(descriptors)
     sc_score = round(_clamp(sa_score + descriptors.ring_count * 0.2, 1.0, 10.0), 3)
@@ -1790,10 +2173,16 @@ def _upsert_synthesis_route(
     if hazardous_reaction_count:
         labels.append("hazardous_route")
     labels.extend(["external_retrosynthesis_adapter_pending", "rdkit_surrogate_synthesis"])
+    if external_tools_requested:
+        labels.extend(["external_retrosynthesis_adapter_failed", "external_retrosynthesis_fallback_used"])
 
-    result = db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    result = (
+        db.query(SynthesisRoute)
+        .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+        .one_or_none()
+    )
     if result is None:
-        result = SynthesisRoute(molecule_id=molecule.molecule_id)
+        result = SynthesisRoute(molecule_id=molecule.molecule_id, round_id=round_id)
         db.add(result)
 
     result.route_found = False
@@ -1808,7 +2197,14 @@ def _upsert_synthesis_route(
         "model_name": None,
         "input_hash": _smiles_input_hash(molecule.smiles),
         "status": "surrogate_only",
+        "execution_mode": "surrogate_fallback" if external_tools_requested else "surrogate_only",
+        "evidence_tier": "surrogate",
+        "external_tool_requested": external_tools_requested,
+        "external_tool_used": False,
+        "surrogate_used": True,
+        "fallback_used": external_tools_requested,
         "result_kind": "non_retrosynthesis_coarse_estimate",
+        "warnings": fallback_warnings or [],
         "tool_status": {
             key: tool_status[key]
             for key in ["aizynthfinder", "askcos", "rdkit"]
@@ -1905,10 +2301,12 @@ def _create_agent_run(
     adapter_mode: str,
     input_json: dict[str, Any],
     tool_status: dict[str, Any],
+    round_id: str | None = None,
 ) -> AgentRun:
     run = AgentRun(
         agent_run_id=new_id("RUN"),
         project_id=project.project_id,
+        round_id=round_id,
         agent_name=agent_name,
         model_name="tool-adapter",
         status="running",
@@ -1991,6 +2389,14 @@ def _progress_payload(
         "percent": percent,
         "current_molecule_id": current_molecule_id,
         "adapter_mode": summary.adapter_mode,
+        "execution_mode": summary.execution_mode,
+        "external_tools_requested": summary.external_tools_requested,
+        "external_tools_enabled": summary.external_tools_enabled,
+        "external_attempted_count": summary.external_attempted_count,
+        "external_success_count": summary.external_success_count,
+        "surrogate_count": summary.surrogate_count,
+        "fallback_count": summary.fallback_count,
+        "fallback_used": summary.fallback_used,
         "evaluated_count": summary.evaluated_count,
         "passed_count": summary.generated_count,
         "failed_count": summary.failed_count,

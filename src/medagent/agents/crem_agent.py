@@ -6,3 +6,4 @@ from medagent.domain.schemas import AgentName
 
 class CremAgent(GenerationAgent):
     agent_name: AgentName = "crem"
+    requires_task_seeds: bool = True

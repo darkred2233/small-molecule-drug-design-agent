@@ -42,6 +42,11 @@ class GenerationBatch:
     warnings: list[str] = field(default_factory=list)
     candidate_source_counts: dict[str, int] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
+    execution_mode: str = "not_run"
+    external_tools_requested: bool = False
+    external_tool_used: bool = False
+    surrogate_used: bool = False
+    fallback_used: bool = False
 
 
 @dataclass
@@ -58,6 +63,11 @@ class StrategyGenerationSummary:
     warnings: list[str] = field(default_factory=list)
     candidate_source_counts: dict[str, int] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
+    execution_mode: str = "not_run"
+    external_tools_requested: bool = False
+    external_tool_used: bool = False
+    surrogate_used: bool = False
+    fallback_used: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +83,11 @@ class StrategyGenerationSummary:
             "warnings": self.warnings,
             "candidate_source_counts": self.candidate_source_counts,
             "provenance": self.provenance,
+            "execution_mode": self.execution_mode,
+            "external_tools_requested": self.external_tools_requested,
+            "external_tool_used": self.external_tool_used,
+            "surrogate_used": self.surrogate_used,
+            "fallback_used": self.fallback_used,
         }
 
 
@@ -110,6 +125,7 @@ class MoleculeGenerationSummary:
             "adapter_mode": self.adapter_mode,
             "tool_status": self.tool_status,
             "warnings": self.warnings,
+            "execution_summary": _generation_execution_summary(self),
         }
 
 
@@ -170,6 +186,11 @@ class RdkitScoredReinvent4Strategy:
                                 warnings=list(dict.fromkeys(result.warnings)),
                                 candidate_source_counts=_candidate_source_counts(candidates),
                                 provenance=result.provenance,
+                                execution_mode="external_tool",
+                                external_tools_requested=True,
+                                external_tool_used=True,
+                                surrogate_used=False,
+                                fallback_used=False,
                             )
                         fallback_warnings.append(
                             "reinvent4_external_candidates_rejected_by_generation_constraints"
@@ -223,6 +244,11 @@ class RdkitScoredReinvent4Strategy:
                 "external_tool_status": reinvent4_status,
                 "fallback_toolchain": ["rdkit", "datamol"],
             },
+            execution_mode="surrogate_fallback",
+            external_tools_requested=True,
+            external_tool_used=False,
+            surrogate_used=True,
+            fallback_used=True,
         )
 
 
@@ -288,6 +314,36 @@ class CremFragmentStrategy:
             tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "crem"]),
             warnings=warnings,
             candidate_source_counts=_candidate_source_counts(candidates),
+            provenance={
+                "execution_mode": (
+                    "native_tool"
+                    if adapter_mode == "crem_fragment_database"
+                    else (
+                        "mixed_native_surrogate"
+                        if adapter_mode == "crem_fragment_database_with_rdkit_surrogate_fill"
+                        else "surrogate_fallback"
+                    )
+                ),
+                "fallback_toolchain": ["rdkit", "datamol"]
+                if "surrogate" in adapter_mode
+                else [],
+            },
+            execution_mode=(
+                "native_tool"
+                if adapter_mode == "crem_fragment_database"
+                else (
+                    "mixed_native_surrogate"
+                    if adapter_mode == "crem_fragment_database_with_rdkit_surrogate_fill"
+                    else "surrogate_fallback"
+                )
+            ),
+            external_tools_requested=True,
+            external_tool_used=adapter_mode in {
+                "crem_fragment_database",
+                "crem_fragment_database_with_rdkit_surrogate_fill",
+            },
+            surrogate_used="surrogate" in adapter_mode,
+            fallback_used="surrogate" in adapter_mode,
         )
 
 
@@ -353,10 +409,15 @@ class RdkitGrowLinkAutoGrow4Strategy:
                                     tool_status=_strategy_tool_status(
                                         tool_status, ["rdkit", "datamol", "autogrow4"]
                                     ),
-                                    warnings=list(dict.fromkeys(result.warnings)),
-                                    candidate_source_counts=_candidate_source_counts(candidates),
-                                    provenance=result.provenance,
-                                )
+                                warnings=list(dict.fromkeys(result.warnings)),
+                                candidate_source_counts=_candidate_source_counts(candidates),
+                                provenance=result.provenance,
+                                execution_mode="external_tool",
+                                external_tools_requested=True,
+                                external_tool_used=True,
+                                surrogate_used=False,
+                                fallback_used=False,
+                            )
                             fallback_warnings.append(
                                 "autogrow4_external_candidates_rejected_by_generation_constraints"
                             )
@@ -413,6 +474,11 @@ class RdkitGrowLinkAutoGrow4Strategy:
                 "external_tool_status": autogrow4_status,
                 "fallback_toolchain": ["rdkit", "datamol"],
             },
+            execution_mode="surrogate_fallback",
+            external_tools_requested=True,
+            external_tool_used=False,
+            surrogate_used=True,
+            fallback_used=True,
         )
 
 
@@ -505,6 +571,11 @@ def generate_project_molecules(
         strategy_summary.warnings = batch.warnings
         strategy_summary.candidate_source_counts = batch.candidate_source_counts
         strategy_summary.provenance = batch.provenance
+        strategy_summary.execution_mode = batch.execution_mode
+        strategy_summary.external_tools_requested = batch.external_tools_requested
+        strategy_summary.external_tool_used = batch.external_tool_used
+        strategy_summary.surrogate_used = batch.surrogate_used
+        strategy_summary.fallback_used = batch.fallback_used
         strategy_summary.proposed_count = len(batch.candidates)
         summary.generated_count += len(batch.candidates)
         summary.warnings.extend(
@@ -534,6 +605,7 @@ def generate_project_molecules(
                         "candidate_generated",
                         "requires_structure_validation",
                         f"generator_strategy_{strategy_name}",
+                        f"generation_execution_{batch.execution_mode}",
                     ],
                     list(candidate.labels),
                 ),
@@ -552,6 +624,7 @@ def generate_project_molecules(
     agent_run.output_json = {
         **summary.as_dict(),
         "toolchain_mode": TOOLCHAIN_MODE,
+        "execution_summary": _generation_execution_summary(summary),
         "external_adapters_connected": {
             "reinvent4": bool(tool_status["reinvent4"]["available"]),
             "crem_database": bool(tool_status["crem"]["database_available"]),
@@ -561,6 +634,32 @@ def generate_project_molecules(
     project.status = "molecules_generated"
     db.commit()
     return summary.as_dict()
+
+
+def _generation_execution_summary(summary: MoleculeGenerationSummary) -> dict[str, Any]:
+    strategy_modes = {
+        strategy: {
+            "adapter_mode": item.adapter_mode,
+            "execution_mode": item.execution_mode,
+            "external_tool_used": item.external_tool_used,
+            "surrogate_used": item.surrogate_used,
+            "fallback_used": item.fallback_used,
+            "stored_count": item.stored_count,
+        }
+        for strategy, item in summary.strategy_summaries.items()
+    }
+    return {
+        "has_external_tool_results": any(
+            item.external_tool_used for item in summary.strategy_summaries.values()
+        ),
+        "has_surrogate_results": any(
+            item.surrogate_used for item in summary.strategy_summaries.values()
+        ),
+        "fallback_used": any(
+            item.fallback_used for item in summary.strategy_summaries.values()
+        ),
+        "strategy_modes": strategy_modes,
+    }
 
 
 def collect_generation_seed_smiles(
@@ -892,6 +991,12 @@ def _satisfies_generation_constraints(
         if not _within_numeric_constraint(descriptors, "hba", constraints, "min_hba", "max_hba"):
             return False
 
+    # SAR-derived scaffold constraint: molecule must contain at least one protected motif
+    protected_motifs = constraints.get("protected_motifs")
+    if protected_motifs and isinstance(protected_motifs, list):
+        if not _has_any_substructure(smiles, protected_motifs):
+            return False
+
     max_tanimoto = _optional_float(constraints.get("max_tanimoto_to_seed"))
     min_tanimoto = _optional_float(constraints.get("min_tanimoto_to_seed"))
     if max_tanimoto is None and min_tanimoto is None:
@@ -905,6 +1010,30 @@ def _satisfies_generation_constraints(
     if min_tanimoto is not None and similarity < min_tanimoto:
         return False
     return True
+
+
+def _has_any_substructure(smiles: str, smarts_list: list[str]) -> bool:
+    """Check if a molecule contains at least one of the given substructures.
+
+    Silently skips unparseable SMARTS patterns.
+    """
+    try:
+        from rdkit import Chem
+    except ImportError:
+        return True  # Can't check, don't block
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return True  # Can't parse, don't block
+
+    for smarts in smarts_list:
+        try:
+            query = Chem.MolFromSmarts(smarts)
+            if query is not None and mol.HasSubstructMatch(query):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _within_numeric_constraint(
@@ -1028,6 +1157,8 @@ def _candidate_tool_labels(
     labels = [
         "external_generation_adapter_pending",
         "external_generation_fallback_used",
+        "generation_fallback_used",
+        "surrogate_generation_adapter_used",
         external_pending_label,
     ]
     if tool_status["rdkit"]["available"]:
@@ -1074,11 +1205,23 @@ def _external_generation_candidates(
                 strategy=strategy,
                 seed_smiles=seeds[0] if seeds else "",
                 rationale=rationale,
-                labels=tuple(labels),
+                labels=tuple(
+                    _merge_labels(
+                        [
+                            "external_generation_adapter_used",
+                            f"{strategy}_external_tool",
+                        ],
+                        list(labels),
+                    )
+                ),
                 score=scores[index] if index < len(scores) else None,
                 metadata={
                     "adapter_mode": adapter_mode,
                     "candidate_source": source,
+                    "execution_mode": "external_tool",
+                    "external_tool_used": True,
+                    "surrogate_used": False,
+                    "fallback_used": False,
                     "tool_score_semantics": provenance.get("score_semantics"),
                     "tool_provenance": provenance,
                 },

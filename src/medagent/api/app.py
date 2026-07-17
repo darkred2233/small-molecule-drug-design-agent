@@ -1197,6 +1197,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status=item.status,
                 labels=item.labels,
                 source_agent=item.source_agent,
+                round_id=item.round_id,
             )
             for item in molecules
         ]
@@ -1399,6 +1400,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             prefer_buyable_building_blocks=request.prefer_buyable_building_blocks,
             enable_external_synthesis_routes=request.enable_external_synthesis_routes,
             skip_ranking=request.skip_ranking,
+            round_id=request.round_id,
         )
 
     @app.get(
@@ -1407,9 +1409,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["candidate-assessment"],
         summary="List project conformer generation results",
     )
-    def list_conformer_results(project_id: str, db: Session = Depends(get_db)):
+    def list_conformer_results(
+        project_id: str,
+        round_id: str | None = None,
+        db: Session = Depends(get_db),
+    ):
         project = _get_project(db, project_id)
-        return [_conformer_result_to_read(result) for result in list_project_conformer_results(db, project)]
+        return [
+            _conformer_result_to_read(result)
+            for result in list_project_conformer_results(db, project, round_id=round_id)
+        ]
 
     @app.get(
         "/projects/{project_id}/docking-results",
@@ -1417,9 +1426,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["candidate-assessment"],
         summary="List project docking results",
     )
-    def list_docking_results(project_id: str, db: Session = Depends(get_db)):
+    def list_docking_results(
+        project_id: str,
+        round_id: str | None = None,
+        db: Session = Depends(get_db),
+    ):
         project = _get_project(db, project_id)
-        return [_docking_result_to_read(result) for result in list_project_docking_results(db, project)]
+        return [
+            _docking_result_to_read(result)
+            for result in list_project_docking_results(db, project, round_id=round_id)
+        ]
 
     @app.get(
         "/projects/{project_id}/molecules/{molecule_id}/docking/pose",
@@ -1464,9 +1480,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["candidate-assessment"],
         summary="List project ADMET results",
     )
-    def list_admet_results(project_id: str, db: Session = Depends(get_db)):
+    def list_admet_results(
+        project_id: str,
+        round_id: str | None = None,
+        db: Session = Depends(get_db),
+    ):
         project = _get_project(db, project_id)
-        return [_admet_result_to_read(result) for result in list_project_admet_results(db, project)]
+        return [
+            _admet_result_to_read(result)
+            for result in list_project_admet_results(db, project, round_id=round_id)
+        ]
 
     @app.get(
         "/projects/{project_id}/synthesis-routes",
@@ -1474,9 +1497,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["candidate-assessment"],
         summary="List project synthesis route assessments",
     )
-    def list_synthesis_routes(project_id: str, db: Session = Depends(get_db)):
+    def list_synthesis_routes(
+        project_id: str,
+        round_id: str | None = None,
+        db: Session = Depends(get_db),
+    ):
         project = _get_project(db, project_id)
-        return [_synthesis_route_to_read(result) for result in list_project_synthesis_routes(db, project)]
+        return [
+            _synthesis_route_to_read(result)
+            for result in list_project_synthesis_routes(db, project, round_id=round_id)
+        ]
 
     @app.post(
         "/projects/{project_id}/rankings/generate",
@@ -1497,6 +1527,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             molecule_ids=request.molecule_ids,
             max_molecules=request.max_molecules,
             top_n=request.top_n,
+            round_id=request.round_id,
         )
         return {"project_id": project.project_id, "ranking": summary.as_dict()}
 
@@ -1506,9 +1537,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["candidate-assessment"],
         summary="List project candidate rankings",
     )
-    def list_rankings(project_id: str, db: Session = Depends(get_db)):
+    def list_rankings(
+        project_id: str,
+        round_id: str | None = None,
+        db: Session = Depends(get_db),
+    ):
         project = _get_project(db, project_id)
-        return [_ranking_to_read(result) for result in list_project_rankings(db, project)]
+        return [_ranking_to_read(result) for result in list_project_rankings(db, project, round_id=round_id)]
 
     @app.post(
         "/projects/{project_id}/decision-cards/generate",
@@ -1635,6 +1670,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status=molecule.status,
             labels=molecule.labels,
             source_agent=molecule.source_agent,
+            round_id=molecule.round_id,
         )
 
     @app.get(
@@ -1761,11 +1797,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from medagent.api.projects_router import router as projects_router
     from medagent.api.files_router import router as files_router
     from medagent.api.tools_router import router as tools_router
+    from medagent.api.rounds_router import router as rounds_router
+    from medagent.api.resources_router import router as resources_router
 
     app.include_router(chat_router)
     app.include_router(projects_router)
     app.include_router(files_router)
     app.include_router(tools_router)
+    app.include_router(rounds_router)
+    app.include_router(resources_router)
 
     return app
 
@@ -2255,6 +2295,7 @@ def _rule_filter_result_to_read(result: RuleFilterResult) -> RuleFilterResultRea
 def _conformer_result_to_read(result) -> ConformerResultRead:
     return ConformerResultRead(
         molecule_id=result.molecule_id,
+        round_id=result.round_id,
         conformer_generated=result.conformer_generated,
         conformer_count=result.conformer_count,
         lowest_energy=result.lowest_energy,
@@ -2271,6 +2312,7 @@ def _conformer_result_to_read(result) -> ConformerResultRead:
 def _docking_result_to_read(result) -> DockingResultRead:
     return DockingResultRead(
         molecule_id=result.molecule_id,
+        round_id=result.round_id,
         vina_score=result.vina_score,
         cnn_score=result.cnn_score,
         diffdock_confidence=result.diffdock_confidence,
@@ -2285,6 +2327,7 @@ def _docking_result_to_read(result) -> DockingResultRead:
 def _admet_result_to_read(result) -> ADMETResultRead:
     return ADMETResultRead(
         molecule_id=result.molecule_id,
+        round_id=result.round_id,
         hERG_probability=result.hERG_probability,
         hERG_risk=result.hERG_risk,
         Ames_probability=result.Ames_probability,
@@ -2300,6 +2343,7 @@ def _admet_result_to_read(result) -> ADMETResultRead:
 def _synthesis_route_to_read(result) -> SynthesisRouteRead:
     return SynthesisRouteRead(
         molecule_id=result.molecule_id,
+        round_id=result.round_id,
         route_found=result.route_found,
         route_steps=result.route_steps,
         route_confidence=result.route_confidence,
@@ -2312,6 +2356,7 @@ def _synthesis_route_to_read(result) -> SynthesisRouteRead:
 def _ranking_to_read(result) -> RankingRead:
     return RankingRead(
         molecule_id=result.molecule_id,
+        round_id=result.round_id,
         rank=result.rank,
         pro_score=result.pro_score,
         con_score=result.con_score,
@@ -2406,6 +2451,7 @@ def _project_status(db: Session, project: Project) -> ProjectStatus:
         agent_runs=[
             {
                 "agent_run_id": run.agent_run_id,
+                "round_id": run.round_id,
                 "agent_name": run.agent_name,
                 "model_name": run.model_name,
                 "status": run.status,

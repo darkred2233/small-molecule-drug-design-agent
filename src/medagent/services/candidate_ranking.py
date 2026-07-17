@@ -46,6 +46,15 @@ class RankingSummary:
     skipped_molecule_ids: list[str] = field(default_factory=list)
     failed_molecule_ids: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    round_id: str | None = None
+    execution_mode: str = "internal_heuristic"
+    external_tools_requested: bool = False
+    external_tools_enabled: bool = False
+    external_attempted_count: int = 0
+    external_success_count: int = 0
+    surrogate_count: int = 0
+    fallback_count: int = 0
+    fallback_used: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -60,6 +69,15 @@ class RankingSummary:
             "skipped_molecule_ids": self.skipped_molecule_ids,
             "failed_molecule_ids": self.failed_molecule_ids,
             "warnings": self.warnings,
+            "round_id": self.round_id,
+            "execution_mode": self.execution_mode,
+            "external_tools_requested": self.external_tools_requested,
+            "external_tools_enabled": self.external_tools_enabled,
+            "external_attempted_count": self.external_attempted_count,
+            "external_success_count": self.external_success_count,
+            "surrogate_count": self.surrogate_count,
+            "fallback_count": self.fallback_count,
+            "fallback_used": self.fallback_used,
         }
 
 
@@ -102,8 +120,15 @@ def generate_project_rankings(
     max_molecules: int = 50,
     top_n: int | None = None,
     tool_status: dict[str, Any] | None = None,
+    round_id: str | None = None,
 ) -> RankingSummary:
-    selected_molecules = molecules or _select_ranking_molecules(db, project, molecule_ids, max_molecules)
+    selected_molecules = molecules or _select_ranking_molecules(
+        db,
+        project,
+        molecule_ids,
+        max_molecules,
+        round_id=round_id,
+    )
     top_n = top_n or max_molecules
     selected_ids = [molecule.molecule_id for molecule in selected_molecules]
     external_refinement_present = any(
@@ -116,21 +141,24 @@ def generate_project_rankings(
             "molecule_ids": selected_ids,
             "max_molecules": max_molecules,
             "top_n": top_n,
+            "round_id": round_id,
             "source": "candidate_assessment",
             "tool_status": tool_status or {},
         },
+        round_id=round_id,
     )
     summary = RankingSummary(
         agent_run_id=agent_run.agent_run_id,
         adapter_mode=RANKING_ADAPTER_MODE,
         requested_count=len(selected_molecules),
+        round_id=round_id,
     )
 
     try:
         scored_molecules: list[ScoredMolecule] = []
         warnings: list[str] = []
         for molecule in selected_molecules:
-            bundle = _load_evidence_bundle(db, molecule)
+            bundle = _load_evidence_bundle(db, molecule, round_id=round_id)
             scored = _score_molecule(
                 molecule,
                 bundle,
@@ -150,7 +178,7 @@ def generate_project_rankings(
             ),
         )
         stored = ranked[:top_n]
-        _replace_project_rankings(db, project, stored)
+        _replace_project_rankings(db, project, stored, round_id=round_id)
 
         summary.generated_count = len(stored)
         summary.molecule_ids = [item.molecule.molecule_id for item in stored]
@@ -163,13 +191,18 @@ def generate_project_rankings(
         raise
 
 
-def list_project_rankings(db: Session, project: Project) -> list[Ranking]:
-    return (
+def list_project_rankings(
+    db: Session,
+    project: Project,
+    round_id: str | None = None,
+) -> list[Ranking]:
+    query = (
         db.query(Ranking)
         .filter(Ranking.project_id == project.project_id)
-        .order_by(Ranking.rank.asc(), Ranking.id.asc())
-        .all()
     )
+    if round_id is not None:
+        query = query.filter(Ranking.round_id == round_id)
+    return query.order_by(Ranking.rank.asc(), Ranking.id.asc()).all()
 
 
 def _select_ranking_molecules(
@@ -177,8 +210,11 @@ def _select_ranking_molecules(
     project: Project,
     molecule_ids: list[str] | None,
     max_molecules: int,
+    round_id: str | None = None,
 ) -> list[Molecule]:
     query = db.query(Molecule).filter_by(project_id=project.project_id)
+    if round_id is not None:
+        query = query.filter_by(round_id=round_id)
     if molecule_ids:
         query = query.filter(Molecule.molecule_id.in_(molecule_ids))
     else:
@@ -186,13 +222,29 @@ def _select_ranking_molecules(
     return query.order_by(Molecule.id.asc()).limit(max_molecules).all()
 
 
-def _load_evidence_bundle(db: Session, molecule: Molecule) -> EvidenceBundle:
+def _load_evidence_bundle(
+    db: Session,
+    molecule: Molecule,
+    round_id: str | None = None,
+) -> EvidenceBundle:
     return EvidenceBundle(
         properties=db.query(MoleculeProperty).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
         rule_filter=db.query(RuleFilterResult).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
-        docking=db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
-        admet=db.query(ADMETResult).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
-        synthesis=db.query(SynthesisRoute).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
+        docking=(
+            db.query(DockingResult)
+            .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+            .one_or_none()
+        ),
+        admet=(
+            db.query(ADMETResult)
+            .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+            .one_or_none()
+        ),
+        synthesis=(
+            db.query(SynthesisRoute)
+            .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
+            .one_or_none()
+        ),
         critique=db.query(Critique).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
         rag_evidence=(
             db.query(EvidenceLink)
@@ -800,8 +852,14 @@ def _replace_project_rankings(
     db: Session,
     project: Project,
     ranked_molecules: list[ScoredMolecule],
+    round_id: str | None = None,
 ) -> None:
-    db.query(Ranking).filter(Ranking.project_id == project.project_id).delete(synchronize_session=False)
+    query = db.query(Ranking).filter(Ranking.project_id == project.project_id)
+    if round_id is None:
+        query = query.filter(Ranking.round_id.is_(None))
+    else:
+        query = query.filter(Ranking.round_id == round_id)
+    query.delete(synchronize_session=False)
     for index, scored in enumerate(ranked_molecules, start=1):
         if scored.final_decision == "reject":
             if scored.molecule.status not in TERMINAL_FAILURE_STATUSES:
@@ -815,6 +873,7 @@ def _replace_project_rankings(
             Ranking(
                 project_id=project.project_id,
                 molecule_id=scored.molecule.molecule_id,
+                round_id=round_id,
                 rank=index,
                 pro_score=scored.pro_score,
                 con_score=scored.con_score,
@@ -835,10 +894,16 @@ def _missing_evidence_warnings(score_breakdown: dict[str, Any]) -> list[str]:
     return warnings
 
 
-def _create_agent_run(db: Session, project: Project, input_json: dict[str, Any]) -> AgentRun:
+def _create_agent_run(
+    db: Session,
+    project: Project,
+    input_json: dict[str, Any],
+    round_id: str | None = None,
+) -> AgentRun:
     run = AgentRun(
         agent_run_id=new_id("RUN"),
         project_id=project.project_id,
+        round_id=round_id,
         agent_name=RANKING_AGENT_NAME,
         model_name="heuristic-ranker",
         status="running",

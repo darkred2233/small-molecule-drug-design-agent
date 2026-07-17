@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from medagent.agents import generation_base
 from medagent.agents.generation import AutoGrow4Agent, CremAgent, Reinvent4Agent
 from medagent.domain.schemas import AgentTask
@@ -38,8 +40,29 @@ class FakeStrategyAdapter:
 
 
 def test_reinvent4_agent_returns_agent_result_with_provenance(monkeypatch):
-    fake_adapter = FakeStrategyAdapter("reinvent4")
-    monkeypatch.setitem(generation_base.STRATEGY_ADAPTERS, "reinvent4", fake_adapter)
+    requests = []
+
+    monkeypatch.setattr(
+        "medagent.services.reinvent4_adapter.check_reinvent4_available",
+        lambda: {"available": True, "mode": "test", "warning": None},
+    )
+
+    def fake_run_reinvent4(request, reinvent4_status):
+        requests.append((request, reinvent4_status))
+        return SimpleNamespace(
+            success=True,
+            generated_smiles=["CCO"],
+            scores=[0.7],
+            labels=["test_generated"],
+            warnings=["test_warning"],
+            adapter_mode="test_reinvent4_adapter",
+            provenance={"execution_mode": "external_tool"},
+        )
+
+    monkeypatch.setattr(
+        "medagent.services.reinvent4_adapter.run_reinvent4_generation",
+        fake_run_reinvent4,
+    )
 
     result = Reinvent4Agent().run(
         AgentTask(
@@ -54,12 +77,13 @@ def test_reinvent4_agent_returns_agent_result_with_provenance(monkeypatch):
     assert result.status == "completed"
     assert result.success is True
     assert result.warnings == ["test_warning"]
-    assert fake_adapter.calls[0]["requested_count"] == 1
+    assert requests[0][0].num_molecules == 1
     assert result.molecules[0].smiles == "CCO"
     assert result.molecules[0].provenance["agent"] == "reinvent4"
     assert result.molecules[0].provenance["round"] == 2
-    assert result.molecules[0].provenance["method"] == "test_strategy"
-    assert result.molecules[0].provenance["adapter_mode"] == "test_adapter"
+    assert result.molecules[0].provenance["method"] == "test_reinvent4_adapter"
+    assert result.molecules[0].provenance["adapter_mode"] == "test_reinvent4_adapter"
+    assert result.molecules[0].provenance["execution_mode"] == "external_tool"
 
 
 def test_crem_agent_returns_agent_result_with_provenance(monkeypatch):
@@ -118,7 +142,7 @@ def test_autogrow4_agent_skips_when_receptor_or_grid_is_missing(monkeypatch):
 
     assert result.status == "skipped"
     assert result.success is False
-    assert result.failure_reason == "autogrow4_requires_receptor_file"
+    assert result.failure_reason == "autogrow4_requires_receptor_file_or_resource_bundle"
     assert fake_adapter.calls == []
 
 

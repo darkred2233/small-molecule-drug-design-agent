@@ -20,6 +20,7 @@ class GenerationAgent:
     """Base wrapper for a molecule generation strategy."""
 
     agent_name: AgentName
+    requires_task_seeds: bool = False  # 各 agent 自行声明是否需要 seed_molecules
 
     def run(self, task: AgentTask) -> AgentResult:
         if task.agent != self.agent_name:
@@ -34,7 +35,7 @@ class GenerationAgent:
         if requested_count <= 0:
             return _skipped_result(task, "generation_budget_is_zero")
 
-        if not task.seed_molecules:
+        if self.requires_task_seeds and not task.seed_molecules:
             return _failed_result(
                 task,
                 self.agent_name,
@@ -98,20 +99,33 @@ def _agent_molecules(task: AgentTask, batch: GenerationBatch) -> list[AgentMolec
         if candidate.score is not None:
             metadata["score"] = candidate.score
         metadata["labels"] = list(candidate.labels)
+        metadata.setdefault("execution_mode", batch.execution_mode)
+        metadata.setdefault("external_tool_used", batch.external_tool_used)
+        metadata.setdefault("surrogate_used", batch.surrogate_used)
+        metadata.setdefault("fallback_used", batch.fallback_used)
+        provenance: dict[str, Any] = {
+            "agent": task.agent,
+            "round": task.round,
+            "method": metadata.get("candidate_source") or batch.adapter_mode,
+            "seed": candidate.seed_smiles,
+            "adapter_mode": batch.adapter_mode,
+            "execution_mode": batch.execution_mode,
+            "external_tool_used": batch.external_tool_used,
+            "surrogate_used": batch.surrogate_used,
+            "fallback_used": batch.fallback_used,
+            "tool_status": batch.tool_status,
+            "tool_provenance": metadata.get("tool_provenance") or batch.provenance,
+            "source_strategy": candidate.strategy,
+        }
+        if task.round_id:
+            provenance["round_id"] = task.round_id
+        if task.campaign_run_id:
+            provenance["campaign_run_id"] = task.campaign_run_id
         molecules.append(
             AgentMoleculeCandidate(
                 smiles=candidate.smiles,
                 rationale=candidate.rationale,
-                provenance={
-                    "agent": task.agent,
-                    "round": task.round,
-                    "method": metadata.get("candidate_source") or batch.adapter_mode,
-                    "seed": candidate.seed_smiles,
-                    "adapter_mode": batch.adapter_mode,
-                    "tool_status": batch.tool_status,
-                    "tool_provenance": metadata.get("tool_provenance") or batch.provenance,
-                    "source_strategy": candidate.strategy,
-                },
+                provenance=provenance,
                 metadata=metadata,
             )
         )

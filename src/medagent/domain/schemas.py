@@ -150,6 +150,11 @@ class AgentTask(BaseModel):
     budget: AgentBudget = Field(default="medium", title="预算等级")
     sar_context: list[str] = Field(default_factory=list, title="SAR 上下文")
     evaluation_context: dict[str, Any] = Field(default_factory=dict, title="评估上下文")
+    # Round + Campaign 扩展字段
+    round_id: str | None = Field(default=None, title="轮次 ID")
+    campaign_run_id: str | None = Field(default=None, title="Campaign 运行 ID")
+    campaign_config: dict[str, Any] | None = Field(default=None, title="Campaign 配置")
+    resource_bundle: dict[str, Any] | None = Field(default=None, title="资源包（如 AutoGrow4ResourceBundle）")
 
 
 class AgentMoleculeCandidate(BaseModel):
@@ -384,6 +389,7 @@ class SeedLigandRead(BaseModel):
 
 
 class AgentRunRead(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     agent_run_id: str = Field(title="Agent 运行编号")
     agent_name: str = Field(title="Agent 名称")
     model_name: str | None = Field(title="模型名称")
@@ -407,6 +413,7 @@ class RunPipelineRequest(BaseModel):
 
 
 class MoleculeRead(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     molecule_id: str = Field(title="分子编号")
     smiles: str = Field(title="SMILES")
     scaffold: str | None = Field(title="骨架")
@@ -461,6 +468,25 @@ class MoleculeGenerationStrategySummary(BaseModel):
     )
 
 
+    execution_mode: str = Field(default="not_run", title="Generation execution mode")
+    external_tools_requested: bool = Field(
+        default=False,
+        title="Whether an external generator was requested",
+    )
+    external_tool_used: bool = Field(
+        default=False,
+        title="Whether an external generator produced results",
+    )
+    surrogate_used: bool = Field(
+        default=False,
+        title="Whether a local surrogate generator produced results",
+    )
+    fallback_used: bool = Field(
+        default=False,
+        title="Whether generation fell back from external to surrogate",
+    )
+
+
 class MoleculeGenerationResponse(BaseModel):
     agent_run_id: str = Field(title="Generator agent run id")
     requested_count: int = Field(title="Requested molecule count")
@@ -477,6 +503,12 @@ class MoleculeGenerationResponse(BaseModel):
     adapter_mode: str = Field(title="Generation adapter mode")
     tool_status: dict[str, Any] = Field(default_factory=dict, title="Generation tool status")
     warnings: list[str] = Field(default_factory=list, title="Generation warnings")
+
+
+    execution_summary: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Generation execution summary",
+    )
 
 
 class MoleculeValidationResponse(BaseModel):
@@ -526,6 +558,7 @@ class RuleFilterResultRead(BaseModel):
 
 
 class CandidateAssessmentRunRequest(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     molecule_ids: list[str] | None = Field(default=None, title="Molecule ids to evaluate")
     max_molecules: int = Field(default=50, ge=1, le=500, title="Maximum molecules to evaluate")
     top_n: int | None = Field(default=None, ge=1, le=500, title="Maximum rankings to store")
@@ -598,6 +631,29 @@ class AssessmentStageSummary(BaseModel):
     warnings: list[str] = Field(default_factory=list, title="Warnings")
 
 
+    round_id: str | None = Field(default=None, title="Round id")
+    execution_mode: str = Field(default="not_run", title="Execution mode")
+    external_tools_requested: bool = Field(
+        default=False,
+        title="Whether external tools were requested",
+    )
+    external_tools_enabled: bool = Field(
+        default=False,
+        title="Whether external tools were available/enabled for this stage",
+    )
+    external_attempted_count: int = Field(
+        default=0,
+        title="External tool attempt count",
+    )
+    external_success_count: int = Field(
+        default=0,
+        title="External tool success count",
+    )
+    surrogate_count: int = Field(default=0, title="Surrogate result count")
+    fallback_count: int = Field(default=0, title="Fallback result count")
+    fallback_used: bool = Field(default=False, title="Whether fallback was used")
+
+
 class CoarseScreenSummary(BaseModel):
     requested_count: int = Field(title="Coarse-screen requested molecule count")
     passed_count: int = Field(title="Coarse-screen passed molecule count")
@@ -611,12 +667,22 @@ class CoarseScreenSummary(BaseModel):
 
 
 class CandidateAssessmentRunResponse(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     project_id: str = Field(title="Project id")
     assessment_mode: Literal["fast", "external", "full"] = Field(
         default="external",
         title="Candidate assessment mode",
     )
     external_top_n: int = Field(default=10, title="External refinement top N")
+    external_synthesis_routes_enabled: bool = Field(
+        default=True,
+        title="Whether external retrosynthesis route prediction was enabled",
+    )
+    ranking_skipped: bool = Field(default=False, title="Whether ranking was skipped")
+    runtime_policy: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Assessment runtime policy",
+    )
     conformer: AssessmentStageSummary = Field(title="Conformer generation summary")
     docking: AssessmentStageSummary = Field(title="Docking summary")
     admet: AssessmentStageSummary = Field(title="ADMET summary")
@@ -627,6 +693,7 @@ class CandidateAssessmentRunResponse(BaseModel):
 
 
 class RankingGenerateRequest(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     molecule_ids: list[str] | None = Field(default=None, title="Molecule ids to rank")
     max_molecules: int = Field(default=50, ge=1, le=500, title="Maximum molecules to rank")
     top_n: int = Field(default=50, ge=1, le=500, title="Maximum rankings to store")
@@ -638,6 +705,7 @@ class RankingRunResponse(BaseModel):
 
 
 class ConformerResultRead(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     molecule_id: str = Field(title="Molecule id")
     conformer_generated: bool = Field(title="Whether conformer was generated")
     conformer_count: int | None = Field(title="Conformer count")
@@ -652,6 +720,7 @@ class ConformerResultRead(BaseModel):
 
 
 class DockingResultRead(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     molecule_id: str = Field(title="Molecule id")
     vina_score: float | None = Field(title="Vina score")
     cnn_score: float | None = Field(title="GNINA CNN score")
@@ -664,6 +733,7 @@ class DockingResultRead(BaseModel):
 
 
 class ADMETResultRead(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     molecule_id: str = Field(title="Molecule id")
     hERG_probability: float | None = Field(title="hERG probability")
     hERG_risk: str | None = Field(title="hERG risk")
@@ -677,6 +747,7 @@ class ADMETResultRead(BaseModel):
 
 
 class SynthesisRouteRead(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     molecule_id: str = Field(title="Molecule id")
     route_found: bool = Field(title="Whether route was found")
     route_steps: int | None = Field(title="Route steps")
@@ -687,6 +758,7 @@ class SynthesisRouteRead(BaseModel):
 
 
 class RankingRead(BaseModel):
+    round_id: str | None = Field(default=None, title="Round id")
     molecule_id: str = Field(title="Molecule id")
     rank: int = Field(title="Rank")
     pro_score: float | None = Field(title="Positive evidence score")
@@ -812,3 +884,152 @@ class RagCollectResponse(BaseModel):
     chunk_count: int = Field(title="Indexed chunk count")
     documents: list[dict[str, Any]] = Field(title="Indexed document summaries")
     warnings: list[str] = Field(default_factory=list, title="Warnings")
+
+
+# ---------------------------------------------------------------------------
+# Round + Campaign schemas
+# ---------------------------------------------------------------------------
+
+RoundStatus = Literal["draft", "ready", "running", "completed", "failed", "cancelled"]
+CampaignStatus = Literal["pending", "running", "completed", "failed", "skipped"]
+SearchIntensity = Literal["quick", "normal", "heavy"]
+SourcePoolPolicy = Literal["auto", "target_ligands", "previous_top", "user_uploaded"]
+Reinvent4Mode = Literal["rl_only", "light_tl_then_rl", "tl_then_rl"]
+
+
+class TargetLigandRead(BaseModel):
+    target_ligand_id: str = Field(title="配体编号")
+    target_id: str = Field(title="靶点编号")
+    name: str | None = Field(title="名称")
+    smiles: str = Field(title="SMILES")
+    canonical_smiles: str | None = Field(title="标准 SMILES")
+    inchi_key: str | None = Field(title="InChIKey")
+    source: str = Field(title="来源")
+    source_id: str | None = Field(title="来源编号")
+    activity_value: float | None = Field(title="活性值")
+    activity_unit: str | None = Field(title="活性单位")
+    activity_type: str | None = Field(title="活性类型")
+    pchembl_value: float | None = Field(title="pChEMBL 值")
+    assay_type: str | None = Field(title="实验类型")
+    confidence_level: str = Field(title="置信度")
+
+
+class ProjectResourceRead(BaseModel):
+    resource_id: str = Field(title="资源编号")
+    project_id: str | None = Field(title="项目编号")
+    target_id: str | None = Field(title="靶点编号")
+    resource_type: str = Field(title="资源类型")
+    scope: str = Field(title="作用域")
+    name: str = Field(title="资源名称")
+    file_path: str | None = Field(title="文件路径")
+    metadata_json: dict[str, Any] | None = Field(title="元数据")
+    confidence_level: str | None = Field(title="置信度")
+    source_url: str | None = Field(title="来源 URL")
+
+
+class ProjectRoundRead(BaseModel):
+    round_id: str = Field(title="轮次编号")
+    project_id: str = Field(title="项目编号")
+    round_number: int = Field(title="轮次序号")
+    status: str = Field(title="轮次状态")
+    parent_round_id: str | None = Field(title="父轮次编号")
+    user_conditions_json: dict[str, Any] | None = Field(title="用户条件")
+    run_plan_snapshot_json: dict[str, Any] | None = Field(title="运行计划快照")
+    started_at: datetime | None = Field(title="开始时间")
+    completed_at: datetime | None = Field(title="完成时间")
+    created_at: datetime = Field(title="创建时间")
+
+
+class RoundCreate(BaseModel):
+    round_number: int = Field(ge=1, title="轮次序号")
+    parent_round_id: str | None = Field(default=None, title="父轮次编号")
+    user_conditions_json: dict[str, Any] | None = Field(default=None, title="用户条件")
+
+
+class RoundStartRequest(BaseModel):
+    run_plan_override: dict[str, Any] | None = Field(default=None, title="运行计划覆盖")
+
+
+class CremSeedAllocation(BaseModel):
+    seed_molecule_id: str = Field(title="种子分子编号")
+    requested_count: int = Field(ge=1, le=500, title="请求生成数量")
+
+
+class CremCampaignConfig(BaseModel):
+    enabled: bool = Field(default=True, title="是否启用")
+    seed_allocations: list[CremSeedAllocation] = Field(default_factory=list, title="种子分配")
+    edit_depth: int = Field(default=2, ge=1, le=5, title="编辑深度")
+
+
+class Reinvent4CampaignConfig(BaseModel):
+    enabled: bool = Field(default=True, title="是否启用")
+    mode: Reinvent4Mode = Field(default="rl_only", title="运行模式")
+    rl_steps: int = Field(default=30, ge=5, le=200, title="RL 训练步数")
+    batch_size: int = Field(default=128, ge=16, le=1024, title="RL batch size")
+    sample_count: int = Field(default=100, ge=10, le=1000, title="生成候选数")
+    tl_epochs: int | None = Field(default=None, ge=1, le=100, title="TL epochs")
+    reward_profile: str = Field(default="default", title="reward 配置名")
+    seed_similarity_min: float = Field(default=0.35, ge=0, le=1, title="seed 相似度下限")
+    seed_similarity_max: float = Field(default=0.75, ge=0, le=1, title="seed 相似度上限")
+    seed_similarity_penalty_low: float = Field(default=0.25, ge=0, le=1, title="低相似度惩罚阈值")
+    seed_similarity_penalty_high: float = Field(default=0.85, ge=0, le=1, title="高相似度惩罚阈值")
+    property_targets: dict[str, Any] = Field(default_factory=dict, title="理化性质目标范围")
+    enable_docking_rerank: bool = Field(default=False, title="是否启用 docking 后处理 rerank")
+    docking_rerank_top_n: int = Field(default=50, ge=10, le=200, title="docking rerank 取 top N")
+
+
+class AutoGrow4CampaignConfig(BaseModel):
+    enabled: bool = Field(default=True, title="是否启用")
+    generations: int = Field(default=5, ge=1, le=50, title="遗传代数")
+    search_intensity: SearchIntensity = Field(default="normal", title="搜索强度")
+    source_pool_policy: SourcePoolPolicy = Field(default="auto", title="source pool 策略")
+    receptor_resource_id: str | None = Field(default=None, title="receptor 资源编号")
+    binding_site_id: str | None = Field(default=None, title="binding site 编号")
+
+
+class AutoGrow4ResourceBundle(BaseModel):
+    receptor_file: str = Field(title="receptor .pdb 文件路径")
+    prepared_receptor_file: str | None = Field(default=None, title="prepared receptor 文件路径")
+    binding_site_id: str | None = Field(default=None, title="binding site 编号")
+    grid_center: list[float] = Field(title="docking grid center [x, y, z]")
+    grid_size: list[float] = Field(title="docking grid size [sx, sy, sz]")
+    source_compounds_file: str = Field(title="source_compounds.smi 文件路径")
+    source_compound_count: int = Field(title="source compound 数量")
+    docking_config: dict[str, Any] = Field(default_factory=dict, title="docking 配置")
+    provenance: dict[str, Any] = Field(default_factory=dict, title="来源记录")
+
+
+class CampaignRunRead(BaseModel):
+    campaign_run_id: str = Field(title="Campaign 运行编号")
+    round_id: str = Field(title="轮次编号")
+    project_id: str = Field(title="项目编号")
+    method: str = Field(title="生成方法")
+    status: str = Field(title="运行状态")
+    config_json: dict[str, Any] | None = Field(title="配置")
+    resource_bundle_json: dict[str, Any] | None = Field(title="资源包")
+    input_molecule_ids: list[str] = Field(title="输入分子编号")
+    output_molecule_ids: list[str] = Field(title="输出分子编号")
+    metrics_json: dict[str, Any] | None = Field(title="运行指标")
+    warnings_json: list[str] = Field(title="警告")
+    started_at: datetime | None = Field(title="开始时间")
+    completed_at: datetime | None = Field(title="完成时间")
+    created_at: datetime = Field(title="创建时间")
+
+
+class SelfRefutationRecommendation(BaseModel):
+    main_failure_modes: list[str] = Field(default_factory=list, title="主要失败模式")
+    property_diagnostics: dict[str, Any] = Field(default_factory=dict, title="理化性质诊断")
+    next_round_recommendations: list[dict[str, Any]] = Field(
+        default_factory=list, title="下一轮建议"
+    )
+    campaign_patch_suggestions: dict[str, Any] = Field(
+        default_factory=dict, title="Campaign 配置修改建议"
+    )
+    requires_user_confirmation: bool = Field(default=True, title="是否需要用户确认")
+
+
+class CampaignConfig(BaseModel):
+    """所有 campaign 配置的容器。"""
+    crem: CremCampaignConfig = Field(default_factory=CremCampaignConfig, title="CReM 配置")
+    reinvent4: Reinvent4CampaignConfig = Field(default_factory=Reinvent4CampaignConfig, title="REINVENT4 配置")
+    autogrow4: AutoGrow4CampaignConfig = Field(default_factory=AutoGrow4CampaignConfig, title="AutoGrow4 配置")
