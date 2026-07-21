@@ -322,6 +322,87 @@ class LLMClient:
 
         return self.providers[provider].complete(request, retry_count=retry_count)
 
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: dict[str, Any],
+        provider: str = "qwen",
+        model: str | None = None,
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+        retry_count: int = 3,
+    ) -> dict[str, Any]:
+        """生成结构化 JSON 输出。
+
+        Args:
+            prompt: 提示词
+            schema: JSON Schema
+            provider: LLM 提供商
+            model: 模型名称
+            temperature: 温度
+            max_tokens: 最大 token 数
+            retry_count: 重试次数
+
+        Returns:
+            符合 schema 的 JSON 对象
+        """
+        import json
+
+        # 构建系统提示词
+        system_prompt = (
+            "你是一个专业的药物设计助手。请根据用户要求生成策略建议。\n"
+            "你的输出必须是严格符合以下 JSON Schema 的 JSON 对象，不要包含任何其他文本。\n\n"
+            f"JSON Schema:\n```json\n{json.dumps(schema, indent=2, ensure_ascii=False)}\n```"
+        )
+
+        messages = [
+            LLMMessage(role="system", content=system_prompt),
+            LLMMessage(role="user", content=prompt),
+        ]
+
+        # 调用 LLM
+        response = self.complete(
+            messages=messages,
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            retry_count=retry_count,
+        )
+
+        # 解析 JSON 响应
+        try:
+            # 尝试提取 JSON 代码块
+            content = response.content.strip()
+
+            # 移除可能的 markdown 代码块标记
+            if content.startswith("```json"):
+                content = content[7:]
+            elif content.startswith("```"):
+                content = content[3:]
+
+            if content.endswith("```"):
+                content = content[:-3]
+
+            content = content.strip()
+
+            # 解析 JSON
+            result = json.loads(content)
+            return result
+
+        except json.JSONDecodeError as e:
+            # JSON 解析失败，返回默认结构
+            return {
+                "objective": "生成策略（JSON 解析失败）",
+                "campaign_config": {
+                    "crem": {"enabled": False},
+                    "reinvent4": {"enabled": True, "num_molecules": 100, "mode": "sampling"},
+                    "autogrow4": {"enabled": False},
+                },
+                "rationale": f"LLM 输出解析失败: {str(e)}。已使用默认配置。",
+                "warnings": [f"JSON 解析错误: {str(e)}"],
+            }
+
     def stream(
         self,
         messages: list[LLMMessage],

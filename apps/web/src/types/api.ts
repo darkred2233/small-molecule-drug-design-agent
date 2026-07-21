@@ -15,9 +15,7 @@ export interface Project {
     | 'pipeline_queued'
     | 'pipeline_running'
     | 'pipeline_completed'
-    | 'pipeline_failed'
-    | 'iterative_running'
-    | 'iterative_completed';
+    | 'pipeline_failed';
   created_at: string;
   updated_at?: string;
 }
@@ -134,73 +132,11 @@ export interface ChatRequest {
 
 export type AgentName = 'reinvent4' | 'crem' | 'autogrow4';
 export type AgentBudget = 'low' | 'medium' | 'high';
-export type AgentEnabled = boolean | 'conditional';
-export type RunPlanStatus = 'draft' | 'approved' | 'running' | 'completed' | 'failed';
-export type ExplorationLevel = 'low' | 'medium' | 'high';
-export type SynthesisRouteScope = 'disabled' | 'every_round_top_n' | 'final_round_top_n';
-
-export interface RunPlanAgentConfig {
-  enabled: AgentEnabled;
-  role: string;
-  budget: AgentBudget;
-  requested_count: number;
-  condition?: string | null;
-}
-
-export interface RunPlanEvaluation {
-  mode: 'fast' | 'external_top_n' | 'full';
-  top_n: number;
-  use_docking: boolean;
-  use_admet: boolean;
-  use_synthesis: boolean;
-  synthesis_route_scope: SynthesisRouteScope;
-  use_filters: boolean;
-}
-
-export interface RunPlanStopping {
-  min_score_improvement: number;
-  max_total_molecules: number;
-  max_tool_failures: number;
-}
-
-export interface RunPlan {
-  status: RunPlanStatus;
-  objective: string;
-  auto_run: boolean;
-  max_rounds: number;
-  next_round_seed_count: number;
-  seed_smiles: string[];
-  exploration_level: ExplorationLevel;
-  agents: Record<AgentName, RunPlanAgentConfig>;
-  constraints: Record<string, any>;
-  evaluation: RunPlanEvaluation;
-  stopping: RunPlanStopping;
-  decision_trace: Array<Record<string, any>>;
-  evidence_chain: Array<Record<string, any>>;
-  warnings: string[];
-}
-
-export interface RunPlanChange {
-  path: string;
-  old_value: any;
-  new_value: any;
-  affects_next_round: boolean;
-}
-
-export interface RunPlanPatch {
-  reason: string;
-  changes: RunPlanChange[];
-  requires_confirmation: boolean;
-  warnings: string[];
-}
 
 export interface ChatResponse {
   reply: string;
   intent: string;
   created_constraints: string[];
-  run_plan?: RunPlan | null;
-  plan_patch?: RunPlanPatch | null;
-  plan_diff: RunPlanChange[];
   suggested_execution: boolean;
   requires_confirmation: boolean;
   warnings: string[];
@@ -789,7 +725,7 @@ export interface FinalChineseReport {
   generated_at?: string;
   project_objective?: string | null;
   executive_summary: string[];
-  run_plan_summary?: Record<string, any>;
+  execution_config_summary?: Record<string, any>;
   round_summaries?: Array<Record<string, any>>;
   top_molecules?: Array<Record<string, any>>;
   sar_summary?: Record<string, any>;

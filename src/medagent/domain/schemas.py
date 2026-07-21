@@ -50,10 +50,6 @@ class ConstraintRead(BaseModel):
 
 AgentName = Literal["reinvent4", "crem", "autogrow4"]
 AgentBudget = Literal["low", "medium", "high"]
-AgentEnabled = bool | Literal["conditional"]
-RunPlanStatus = Literal["draft", "approved", "running", "completed", "failed"]
-ExplorationLevel = Literal["low", "medium", "high"]
-SynthesisRouteScope = Literal["disabled", "every_round_top_n", "final_round_top_n"]
 EvidenceType = Literal[
     "admet_prediction",
     "advisor_rule",
@@ -64,82 +60,6 @@ EvidenceType = Literal[
     "synthesis_score",
     "tool_log",
 ]
-
-
-class RunPlanAgentConfig(BaseModel):
-    enabled: AgentEnabled = Field(title="Agent 是否启用")
-    role: str = Field(title="Agent 在本计划中的角色")
-    budget: AgentBudget = Field(default="medium", title="Agent 预算等级")
-    requested_count: int = Field(default=0, ge=0, le=500, title="每轮请求生成数量")
-    condition: str | None = Field(default=None, title="条件启用说明")
-
-
-class RunPlanEvaluation(BaseModel):
-    mode: Literal["fast", "external_top_n", "full"] = Field(
-        default="external_top_n",
-        title="评估模式",
-    )
-    top_n: int = Field(default=30, ge=1, le=500, title="进入外部评估或重点解读的候选数量")
-    use_docking: bool = Field(default=True, title="是否使用 docking/pose 证据")
-    use_admet: bool = Field(default=True, title="是否使用 ADMET 预测")
-    use_synthesis: bool = Field(default=True, title="是否使用合成可行性评估")
-    synthesis_route_scope: SynthesisRouteScope = Field(
-        default="final_round_top_n",
-        title="合成路线预测范围",
-        description=(
-            "use_synthesis controls every-round feasibility/SA checks; this field controls "
-            "retrosynthesis route prediction, which defaults to the final round Top N only."
-        ),
-    )
-    use_filters: bool = Field(default=True, title="是否使用规则过滤")
-
-
-class RunPlanStopping(BaseModel):
-    min_score_improvement: float = Field(
-        default=0.0,
-        ge=0,
-        title="最低综合分提升阈值",
-        description="Set to 0 to disable score-improvement early stopping.",
-    )
-    max_total_molecules: int = Field(default=300, ge=1, le=5000, title="项目总候选分子上限")
-    max_tool_failures: int = Field(default=3, ge=1, title="连续工具失败停止阈值")
-
-
-class RunPlan(BaseModel):
-    status: RunPlanStatus = Field(default="draft", title="计划状态")
-    objective: str = Field(title="自然语言优化目标")
-    auto_run: bool = Field(default=False, title="确认后是否自动运行")
-    max_rounds: int = Field(default=3, ge=1, le=20, title="最大自动优化轮数")
-    next_round_seed_count: int = Field(default=10, ge=1, le=100, title="下一轮自动继承 Top 种子数")
-    seed_smiles: list[str] = Field(default_factory=list, title="额外手动种子 SMILES")
-    exploration_level: ExplorationLevel = Field(default="medium", title="探索强度")
-    agents: dict[AgentName, RunPlanAgentConfig] = Field(title="生成 Agent 配置")
-    constraints: dict[str, Any] = Field(default_factory=dict, title="执行约束")
-    evaluation: RunPlanEvaluation = Field(default_factory=RunPlanEvaluation, title="评估配置")
-    stopping: RunPlanStopping = Field(default_factory=RunPlanStopping, title="停止条件")
-    decision_trace: list[dict[str, Any]] = Field(
-        default_factory=list,
-        title="可审计决策记录",
-    )
-    evidence_chain: list[dict[str, Any]] = Field(
-        default_factory=list,
-        title="计划级证据链",
-    )
-    warnings: list[str] = Field(default_factory=list, title="计划警告")
-
-
-class RunPlanChange(BaseModel):
-    path: str = Field(title="被修改的 RunPlan 字段路径")
-    old_value: Any = Field(default=None, title="旧值")
-    new_value: Any = Field(default=None, title="新值")
-    affects_next_round: bool = Field(default=True, title="是否影响下一轮执行")
-
-
-class RunPlanPatch(BaseModel):
-    reason: str = Field(title="生成此 patch 的原因")
-    changes: list[RunPlanChange] = Field(default_factory=list, title="字段变更")
-    requires_confirmation: bool = Field(default=True, title="是否需要用户确认")
-    warnings: list[str] = Field(default_factory=list, title="patch 警告")
 
 
 class AgentTask(BaseModel):
@@ -189,12 +109,9 @@ class ChatResponse(BaseModel):
     reply: str = Field(title="Agent 回复")
     intent: str = Field(title="识别意图")
     created_constraints: list[str] = Field(default_factory=list, title="新建约束编号")
-    run_plan: RunPlan | None = Field(default=None, title="当前 RunPlan")
-    plan_patch: RunPlanPatch | None = Field(default=None, title="计划修改 patch")
-    plan_diff: list[RunPlanChange] = Field(default_factory=list, title="计划差异")
     suggested_execution: bool = Field(default=False, title="是否建议执行")
     requires_confirmation: bool = Field(default=False, title="是否需要用户确认")
-    warnings: list[str] = Field(default_factory=list, title="计划 Agent 警告")
+    warnings: list[str] = Field(default_factory=list, title="Agent 警告")
 
 
 class BuiltinDrugRead(BaseModel):
@@ -404,14 +321,6 @@ class ProjectStatus(BaseModel):
     agent_runs: list[AgentRunRead] = Field(title="Agent 运行记录")
 
 
-class RunPipelineRequest(BaseModel):
-    mode: str = Field(default="iterative", title="运行模式")
-    generation_config: dict[str, Any] = Field(
-        default_factory=dict,
-        title="Legacy generation config override converted into RunPlan",
-    )
-
-
 class MoleculeRead(BaseModel):
     round_id: str | None = Field(default=None, title="Round id")
     molecule_id: str = Field(title="分子编号")
@@ -420,6 +329,11 @@ class MoleculeRead(BaseModel):
     status: str = Field(title="分子状态")
     labels: list[str] = Field(title="标签")
     source_agent: str | None = Field(default=None, title="来源 Agent")
+    campaign_run_id: str | None = Field(default=None, title="Campaign 运行编号")
+    generation_method: str | None = Field(default=None, title="生成方法")
+    parent_molecule_ids: list[str] = Field(default_factory=list, title="父分子编号")
+    provenance_json: dict[str, Any] = Field(default_factory=dict, title="生成溯源")
+    generation_metadata_json: dict[str, Any] = Field(default_factory=dict, title="生成元数据")
 
 
 class MoleculeImportResponse(BaseModel):
@@ -428,87 +342,6 @@ class MoleculeImportResponse(BaseModel):
     invalid_count: int = Field(title="非法跳过数量")
     imported_molecule_ids: list[str] = Field(title="已导入分子编号")
     skipped: list[dict[str, Any]] = Field(title="跳过明细")
-
-
-class MoleculeGenerationRequest(BaseModel):
-    generation_size: int = Field(default=30, ge=1, le=500, title="Requested molecule count")
-    strategies: list[Literal["reinvent4", "crem", "autogrow4"]] = Field(
-        default_factory=lambda: ["reinvent4", "crem", "autogrow4"],
-        title="Generation strategies",
-    )
-    strategy_counts: dict[str, int] = Field(
-        default_factory=dict,
-        title="Per-strategy requested molecule count",
-    )
-    constraints: dict[str, Any] = Field(default_factory=dict, title="Generation constraints")
-    include_target_library_seeds: bool = Field(
-        default=True,
-        title="Use built-in target-drug library as fallback seeds",
-    )
-
-
-class MoleculeGenerationStrategySummary(BaseModel):
-    requested_count: int = Field(title="Requested count")
-    proposed_count: int = Field(title="Proposed candidate count")
-    stored_count: int = Field(title="Stored molecule count")
-    duplicate_count: int = Field(title="Duplicate candidate count")
-    invalid_count: int = Field(title="Invalid candidate count")
-    seed_count: int = Field(title="Seed count")
-    molecule_ids: list[str] = Field(title="Stored molecule ids")
-    adapter_mode: str = Field(title="Generation adapter mode")
-    tool_status: dict[str, Any] = Field(default_factory=dict, title="Generation tool status")
-    warnings: list[str] = Field(default_factory=list, title="Generation warnings")
-    candidate_source_counts: dict[str, int] = Field(
-        default_factory=dict,
-        title="Candidate source counts",
-    )
-    provenance: dict[str, Any] = Field(
-        default_factory=dict,
-        title="External tool or fallback provenance",
-    )
-
-
-    execution_mode: str = Field(default="not_run", title="Generation execution mode")
-    external_tools_requested: bool = Field(
-        default=False,
-        title="Whether an external generator was requested",
-    )
-    external_tool_used: bool = Field(
-        default=False,
-        title="Whether an external generator produced results",
-    )
-    surrogate_used: bool = Field(
-        default=False,
-        title="Whether a local surrogate generator produced results",
-    )
-    fallback_used: bool = Field(
-        default=False,
-        title="Whether generation fell back from external to surrogate",
-    )
-
-
-class MoleculeGenerationResponse(BaseModel):
-    agent_run_id: str = Field(title="Generator agent run id")
-    requested_count: int = Field(title="Requested molecule count")
-    generated_count: int = Field(title="Generated candidate count")
-    stored_count: int = Field(title="Stored molecule count")
-    duplicate_count: int = Field(title="Duplicate candidate count")
-    invalid_count: int = Field(title="Invalid candidate count")
-    seed_count: int = Field(title="Seed count")
-    failed_reason_summary: dict[str, int] = Field(title="Failure reason summary")
-    molecule_ids: list[str] = Field(title="Stored molecule ids")
-    strategy_summaries: dict[str, MoleculeGenerationStrategySummary] = Field(
-        title="Per-strategy generation summaries"
-    )
-    adapter_mode: str = Field(title="Generation adapter mode")
-    tool_status: dict[str, Any] = Field(default_factory=dict, title="Generation tool status")
-    warnings: list[str] = Field(default_factory=list, title="Generation warnings")
-
-
-    execution_summary: dict[str, Any] = Field(
-        default_factory=dict,
-        title="Generation execution summary",
-    )
 
 
 class MoleculeValidationResponse(BaseModel):
@@ -607,6 +440,9 @@ class CandidateAssessmentRunRequest(BaseModel):
             "external retrosynthesis route prediction."
         ),
     )
+    skip_docking: bool = Field(default=False, title="Skip docking assessment")
+    skip_admet: bool = Field(default=False, title="Skip ADMET assessment")
+    skip_synthesis: bool = Field(default=False, title="Skip synthesis assessment")
     skip_ranking: bool = Field(
         default=False,
         title="Skip candidate ranking",
@@ -678,6 +514,7 @@ class CandidateAssessmentRunResponse(BaseModel):
         default=True,
         title="Whether external retrosynthesis route prediction was enabled",
     )
+    skipped_stages: list[str] = Field(default_factory=list, title="Skipped assessment stages")
     ranking_skipped: bool = Field(default=False, title="Whether ranking was skipped")
     runtime_policy: dict[str, Any] = Field(
         default_factory=dict,
@@ -934,7 +771,7 @@ class ProjectRoundRead(BaseModel):
     status: str = Field(title="轮次状态")
     parent_round_id: str | None = Field(title="父轮次编号")
     user_conditions_json: dict[str, Any] | None = Field(title="用户条件")
-    run_plan_snapshot_json: dict[str, Any] | None = Field(title="运行计划快照")
+    execution_config_snapshot_json: dict[str, Any] | None = Field(title="执行配置快照")
     started_at: datetime | None = Field(title="开始时间")
     completed_at: datetime | None = Field(title="完成时间")
     created_at: datetime = Field(title="创建时间")
@@ -947,7 +784,8 @@ class RoundCreate(BaseModel):
 
 
 class RoundStartRequest(BaseModel):
-    run_plan_override: dict[str, Any] | None = Field(default=None, title="运行计划覆盖")
+    campaign_config: dict[str, Any] | None = Field(default=None, title="本轮生成配置")
+    assessment_config: dict[str, Any] | None = Field(default=None, title="本轮评估配置")
 
 
 class CremSeedAllocation(BaseModel):
@@ -957,6 +795,7 @@ class CremSeedAllocation(BaseModel):
 
 class CremCampaignConfig(BaseModel):
     enabled: bool = Field(default=True, title="是否启用")
+    num_molecules: int = Field(default=100, ge=0, le=500, title="生成候选数")
     seed_allocations: list[CremSeedAllocation] = Field(default_factory=list, title="种子分配")
     edit_depth: int = Field(default=2, ge=1, le=5, title="编辑深度")
 
@@ -966,7 +805,7 @@ class Reinvent4CampaignConfig(BaseModel):
     mode: Reinvent4Mode = Field(default="rl_only", title="运行模式")
     rl_steps: int = Field(default=30, ge=5, le=200, title="RL 训练步数")
     batch_size: int = Field(default=128, ge=16, le=1024, title="RL batch size")
-    sample_count: int = Field(default=100, ge=10, le=1000, title="生成候选数")
+    sample_count: int = Field(default=100, ge=0, le=1000, title="生成候选数")
     tl_epochs: int | None = Field(default=None, ge=1, le=100, title="TL epochs")
     reward_profile: str = Field(default="default", title="reward 配置名")
     seed_similarity_min: float = Field(default=0.35, ge=0, le=1, title="seed 相似度下限")
@@ -980,6 +819,7 @@ class Reinvent4CampaignConfig(BaseModel):
 
 class AutoGrow4CampaignConfig(BaseModel):
     enabled: bool = Field(default=True, title="是否启用")
+    num_molecules: int = Field(default=100, ge=0, le=300, title="生成候选数")
     generations: int = Field(default=5, ge=1, le=50, title="遗传代数")
     search_intensity: SearchIntensity = Field(default="normal", title="搜索强度")
     source_pool_policy: SourcePoolPolicy = Field(default="auto", title="source pool 策略")
@@ -1033,3 +873,76 @@ class CampaignConfig(BaseModel):
     crem: CremCampaignConfig = Field(default_factory=CremCampaignConfig, title="CReM 配置")
     reinvent4: Reinvent4CampaignConfig = Field(default_factory=Reinvent4CampaignConfig, title="REINVENT4 配置")
     autogrow4: AutoGrow4CampaignConfig = Field(default_factory=AutoGrow4CampaignConfig, title="AutoGrow4 配置")
+
+
+# ============================================================================
+# Round Strategy Schemas - 轮次策略相关
+# ============================================================================
+
+
+class RoundStrategyDraftRequest(BaseModel):
+    """生成策略草稿请求。"""
+    user_message: str | None = Field(default=None, title="用户自然语言要求")
+    user_overrides: dict[str, Any] | None = Field(default=None, title="用户手动覆盖配置")
+
+
+class RoundStrategyReviseRequest(BaseModel):
+    """用自然语言要求中枢 Agent 修改当前策略。"""
+
+    user_message: str = Field(min_length=1, title="用户修改要求")
+    user_overrides: dict[str, Any] | None = Field(default=None, title="用户手动覆盖配置")
+
+
+class SeedPolicyRead(BaseModel):
+    """种子选择策略。"""
+    source: str = Field(title="种子来源", description="all_seeds, top_from_previous, mixed")
+    top_n: int | None = Field(default=None, title="从上轮选 Top N")
+    molecule_ids: list[str] = Field(default_factory=list, title="指定进入下一轮的分子")
+    description: str | None = Field(default=None, title="策略说明")
+
+
+class PropertyConstraintsRead(BaseModel):
+    """理化性质约束。"""
+    mw_range: list[float] | None = Field(default=None, title="分子量范围 [min, max]")
+    logp_range: list[float] | None = Field(default=None, title="LogP 范围 [min, max]")
+    tpsa_range: list[float] | None = Field(default=None, title="TPSA 范围 [min, max]")
+    hbd_range: list[int] | None = Field(default=None, title="氢键供体范围 [min, max]")
+    hba_range: list[int] | None = Field(default=None, title="氢键受体范围 [min, max]")
+
+
+class AssessmentConfigRead(BaseModel):
+    """评估配置。"""
+    mode: str = Field(title="评估模式", description="all 或 external_top_n")
+    top_n: int | None = Field(default=None, title="评估 Top N 分子")
+    skip_docking: bool = Field(default=False, title="跳过对接评估")
+    skip_admet: bool = Field(default=False, title="跳过 ADMET 评估")
+    skip_synthesis: bool = Field(default=False, title="跳过合成评估")
+
+
+class RoundStrategyDraftRead(BaseModel):
+    """轮次策略草稿（LLM 生成的策略）。"""
+    round_id: str = Field(title="轮次编号")
+    round_number: int = Field(title="轮次序号")
+    objective: str = Field(title="本轮目标")
+    campaign_config: dict[str, Any] = Field(title="生成配置")
+    seed_policy: SeedPolicyRead | None = Field(default=None, title="种子选择策略")
+    property_constraints: PropertyConstraintsRead | None = Field(default=None, title="理化性质约束")
+    assessment_config: AssessmentConfigRead | None = Field(default=None, title="评估配置")
+    rationale: str = Field(title="策略理由")
+    warnings: list[str] = Field(default_factory=list, title="警告信息")
+    requires_user_confirmation: bool = Field(default=True, title="是否需要用户确认")
+    created_at: datetime = Field(title="创建时间")
+
+
+class RoundStrategyConfirmRequest(BaseModel):
+    """策略确认请求。"""
+    confirmed: bool = Field(title="是否确认")
+    user_modifications: dict[str, Any] | None = Field(default=None, title="用户修改")
+
+
+class RoundStrategyExecuteResponse(BaseModel):
+    """策略执行响应。"""
+    round_id: str = Field(title="轮次编号")
+    status: str = Field(title="执行状态")
+    message: str = Field(title="执行消息")
+    result: dict[str, Any] | None = Field(default=None, title="执行结果")

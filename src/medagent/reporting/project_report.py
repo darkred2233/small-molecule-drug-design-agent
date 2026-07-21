@@ -73,11 +73,6 @@ def build_project_report(db: Session, project: Project) -> dict[str, Any]:
     evidence_context = _rag_evidence_context(db, evidence_links)
     target_agent_analysis = _latest_agent_output(db, project, "target_agent")
     sar_agent_analysis = _latest_agent_output(db, project, "sar_agent")
-    iterative_orchestrator_output = _latest_agent_output(
-        db,
-        project,
-        "iterative_orchestrator_agent",
-    )
 
     report = {
         "project_summary": {
@@ -161,7 +156,6 @@ def build_project_report(db: Session, project: Project) -> dict[str, Any]:
             "source": "project_report_service",
             "report_schema_version": "2.0",
             "score_semantics": "heuristic_not_probability_unless_explicitly_stated",
-            "iterative_orchestrator": iterative_orchestrator_output,
         },
     }
     attach_narrative_layer(report)

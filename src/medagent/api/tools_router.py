@@ -23,7 +23,6 @@ from medagent.services.aizynthfinder_adapter import aizynthfinder_tool_status
 from medagent.services.autogrow4_adapter import autogrow4_tool_status
 from medagent.services.docking_adapters import (
     DockingToolRequest,
-    check_diffdock_available,
     check_gnina_available,
     check_vina_available,
     run_external_docking,
@@ -40,12 +39,11 @@ router = APIRouter(prefix="/tools", tags=["计算工具"])
 # ============================================================================
 
 class ToolStatusResponse(BaseModel):
-    """工具状态响应"""
+    """Availability of the supported compute tools."""
     rdkit: dict[str, Any] = Field(description="RDKit状态")
     chemprop: dict[str, Any] = Field(description="Chemprop状态")
     gnina: dict[str, Any] = Field(description="GNINA状态")
     vina: dict[str, Any] = Field(description="Vina状态")
-    diffdock: dict[str, Any] = Field(description="DiffDock状态")
     reinvent4: dict[str, Any] = Field(description="REINVENT4状态")
     autogrow4: dict[str, Any] = Field(description="AutoGrow4状态")
     aizynthfinder: dict[str, Any] = Field(description="AiZynthFinder状态")
@@ -146,7 +144,6 @@ async def get_tools_status():
 
     gnina_status = check_gnina_available()
     vina_status = check_vina_available()
-    diffdock_status = check_diffdock_available()
 
     # 检查生成工具
     reinvent4_status = reinvent4_tool_status()
@@ -159,7 +156,6 @@ async def get_tools_status():
         chemprop_status.get("available", False),
         gnina_status.get("available", False),
         vina_status.get("available", False),
-        diffdock_status.get("available", False),
         reinvent4_status.get("available", False),
         autogrow4_status.get("available", False),
         aizynthfinder_status.get("available", False),
@@ -170,12 +166,11 @@ async def get_tools_status():
         chemprop=chemprop_status,
         gnina=gnina_status,
         vina=vina_status,
-        diffdock=diffdock_status,
         reinvent4=reinvent4_status,
         autogrow4=autogrow4_status,
         aizynthfinder=aizynthfinder_status,
         summary={
-            "total_tools": 8,
+            "total_tools": 7,
             "available_tools": available_count,
             "critical_missing": [] if rdkit_status.get("available") else ["RDKit"],
         }
@@ -285,14 +280,12 @@ async def run_docking(request: DockingRunRequest):
     支持的工具（按优先级）：
     1. GNINA（推荐）- 带CNN评分
     2. AutoDock Vina - 标准对接
-    3. DiffDock - 基于扩散模型
 
     系统会自动选择第一个可用的工具
     """
     tool_status = {
         "gnina": check_gnina_available(),
         "vina": check_vina_available(),
-        "diffdock": check_diffdock_available(),
     }
 
     # 创建对接请求
@@ -313,7 +306,7 @@ async def run_docking(request: DockingRunRequest):
     if result is None:
         raise HTTPException(
             status_code=503,
-            detail="没有可用的对接工具。请安装GNINA、Vina或DiffDock。"
+            detail="没有可用的对接工具。请安装GNINA或Vina。"
         )
 
     from dataclasses import asdict

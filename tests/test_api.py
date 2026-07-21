@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -11,6 +10,7 @@ from medagent.db.models import (
     AgentRun,
     AdvisorSuggestion,
     BindingSite,
+    CampaignRun,
     ConformerResult,
     ConversationMessage,
     Critique,
@@ -20,12 +20,14 @@ from medagent.db.models import (
     Molecule,
     MoleculeProperty,
     OptimizationConstraint,
-    Project,
+    ProjectResource,
+    ProjectRound,
     RagChunk,
     RagDocument,
     Ranking,
     ReasoningTrace,
     RuleFilterResult,
+    RoundReport,
     SeedLigand,
     SynthesisRoute,
     Target,
@@ -102,7 +104,7 @@ def test_create_project_and_parse_constraints(tmp_path):
         assert chat_response.status_code == 200
         body = chat_response.json()
         assert body["created_constraints"]
-        assert body["intent"] in {"avoid_risk", "keep_scaffold", "update_run_plan"}
+        assert body["intent"] in {"avoid_risk", "keep_scaffold"}
 
         constraints_response = client.get(f"/projects/{project_id}/constraints")
         constraints = constraints_response.json()
@@ -111,67 +113,6 @@ def test_create_project_and_parse_constraints(tmp_path):
             "penalty",
             "protected_motif",
             "editable_region",
-        }
-
-
-def test_chat_returns_run_plan_patch_for_herg_optimization(tmp_path):
-    with make_client(tmp_path) as client:
-        project_id = client.post(
-            "/projects",
-            json={"name": "Chat RunPlan", "objective": "优化 EGFR seed"},
-        ).json()["project_id"]
-
-        response = client.post(
-            f"/projects/{project_id}/chat",
-            json={"message": "帮我围绕这个 seed 自动优化三轮，优先降低 hERG。"},
-        )
-
-        assert response.status_code == 200
-        body = response.json()
-        assert body["intent"] == "update_run_plan"
-        assert body["run_plan"]["max_rounds"] == 3
-        assert body["run_plan"]["auto_run"] is True
-        assert body["run_plan"]["constraints"]["reduce_hERG"] is True
-        assert body["suggested_execution"] is True
-        assert body["requires_confirmation"] is True
-        assert {change["path"] for change in body["plan_diff"]} >= {
-            "auto_run",
-            "constraints.reduce_hERG",
-        }
-
-        persisted = client.get(f"/projects/{project_id}/run-plan").json()
-        assert persisted["auto_run"] is True
-        assert persisted["constraints"]["reduce_hERG"] is True
-
-
-def test_chat_returns_run_plan_patch_to_disable_autogrow4(tmp_path):
-    with make_client(tmp_path) as client:
-        project_id = client.post(
-            "/projects",
-            json={"name": "Chat AutoGrow4 patch"},
-        ).json()["project_id"]
-
-        response = client.post(
-            f"/projects/{project_id}/chat",
-            json={"message": "下一轮不要跑 AutoGrow4，先用 CReM 做保守修改。"},
-        )
-
-        assert response.status_code == 200
-        body = response.json()
-        assert body["intent"] == "update_run_plan"
-        assert body["plan_patch"] is not None
-        assert body["run_plan"]["agents"]["autogrow4"]["enabled"] is False
-        assert body["run_plan"]["agents"]["autogrow4"]["condition"] is None
-        assert body["run_plan"]["agents"]["crem"]["enabled"] is True
-        assert body["run_plan"]["agents"]["crem"]["budget"] == "high"
-        assert body["run_plan"]["auto_run"] is False
-        assert body["suggested_execution"] is False
-        assert {
-            (change["path"], change["new_value"])
-            for change in body["plan_diff"]
-        } >= {
-            ("agents.autogrow4.enabled", False),
-            ("agents.crem.budget", "high"),
         }
 
 
@@ -203,42 +144,6 @@ def test_project_router_uses_current_project_schema(tmp_path):
         detail_response = client.get(f"/projects/{project_id}")
         assert detail_response.status_code == 200
         assert detail_response.json()["objective"] == "verify project router schema"
-
-
-def test_create_project_exposes_default_run_plan(tmp_path):
-    with make_client(tmp_path) as client:
-        project_response = client.post(
-            "/projects",
-            json={
-                "name": "RunPlan project",
-                "objective": "降低 hERG 风险，同时保留核心骨架",
-                "generation_config": {
-                    "strategy_counts": {"reinvent4": 50, "crem": 25, "autogrow4": 10},
-                    "assessment_mode": "external",
-                    "external_top_n": 12,
-                    "generation_constraints": {"max_logp": 4.5, "max_sa_score": 5.0},
-                },
-            },
-        )
-        project_id = project_response.json()["project_id"]
-
-        response = client.get(f"/projects/{project_id}/run-plan")
-
-        assert response.status_code == 200
-        run_plan = response.json()
-        assert run_plan["status"] == "draft"
-        assert run_plan["objective"] == "降低 hERG 风险，同时保留核心骨架"
-        assert run_plan["agents"]["reinvent4"]["budget"] == "high"
-        assert run_plan["agents"]["reinvent4"]["requested_count"] == 50
-        assert run_plan["agents"]["crem"]["budget"] == "medium"
-        assert run_plan["agents"]["crem"]["requested_count"] == 25
-        assert run_plan["agents"]["autogrow4"]["enabled"] == "conditional"
-        assert run_plan["agents"]["autogrow4"]["requested_count"] == 10
-        assert run_plan["next_round_seed_count"] == 10
-        assert run_plan["evaluation"]["mode"] == "external_top_n"
-        assert run_plan["evaluation"]["top_n"] == 12
-        assert run_plan["constraints"]["max_logp"] == 4.5
-        assert run_plan["constraints"]["max_sa_score"] == 5.0
 
 
 def test_create_project_uses_selected_seed_ligands(tmp_path):
@@ -468,9 +373,43 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
                         project_id=project_id,
                         label="delete",
                     ),
+                    ProjectRound(
+                        round_id="ROUND-DELETE-1",
+                        project_id=project_id,
+                        round_number=1,
+                        status="completed",
+                    ),
+                    ProjectRound(
+                        round_id="ROUND-DELETE-2",
+                        project_id=project_id,
+                        round_number=2,
+                        status="draft",
+                        parent_round_id="ROUND-DELETE-1",
+                    ),
+                    CampaignRun(
+                        campaign_run_id="CAMPAIGN-DELETE",
+                        project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        method="crem",
+                    ),
+                    RoundReport(
+                        report_id="REPORT-DELETE",
+                        project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        report_json={"status": "delete"},
+                    ),
+                    ProjectResource(
+                        resource_id="RESOURCE-DELETE",
+                        project_id=project_id,
+                        resource_type="source_compound_library",
+                        scope="project",
+                        name="delete resource",
+                    ),
                     Molecule(
                         molecule_id="MOL-DELETE",
                         project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        campaign_run_id="CAMPAIGN-DELETE",
                         smiles="CCO",
                     ),
                     MoleculeProperty(molecule_id="MOL-DELETE", mw=46.07),
@@ -510,6 +449,7 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
                     AgentRun(
                         agent_run_id="RUN-DELETE",
                         project_id=project_id,
+                        round_id="ROUND-DELETE-1",
                         agent_name="cleanup_agent",
                     ),
                     ReasoningTrace(
@@ -538,6 +478,7 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
                     Ranking(
                         project_id=project_id,
                         molecule_id="MOL-DELETE",
+                        round_id="ROUND-DELETE-1",
                         rank=1,
                         final_decision="remove",
                         score_breakdown={},
@@ -581,6 +522,10 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
                 DecisionCard,
                 AdvisorSuggestion,
                 Ranking,
+                RoundReport,
+                CampaignRun,
+                ProjectResource,
+                ProjectRound,
                 BindingSite,
                 SeedLigand,
             ]:
@@ -598,82 +543,236 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
             assert db.query(EvidenceLink).filter_by(evidence_id="EVD-DELETE").count() == 0
 
 
-def test_pipeline_dry_run_mode_is_retired(tmp_path):
-    with make_client(tmp_path) as client:
-        project_id = client.post("/projects", json={"name": "KRAS program"}).json()["project_id"]
-
-        response = client.post(f"/projects/{project_id}/run", json={"mode": "dry_run"})
-
-        assert response.status_code == 410
-        assert "iterative" in response.json()["detail"]
-
-
-def test_pipeline_iterative_mode_and_endpoint_call_orchestrator(tmp_path, monkeypatch):
-    calls = []
-
-    def fake_run_iterative(self, db, project):
-        calls.append(project.project_id)
-        project.status = "iterative_completed"
-        db.add(project)
-        db.commit()
-        return []
-
-    monkeypatch.setattr(api_app.PipelineOrchestrator, "run_iterative", fake_run_iterative)
-
-    with make_client(tmp_path) as client:
-        project_id = client.post("/projects", json={"name": "Iterative API"}).json()["project_id"]
-
-        response = client.post(
-            f"/projects/{project_id}/run",
-            json={
-                "mode": "iterative",
-                "generation_config": {
-                    "strategy_counts": {"reinvent4": 0, "crem": 1, "autogrow4": 0},
-                    "assessment_mode": "fast",
-                    "max_rounds": 2,
-                },
-            },
-        )
-        endpoint_response = client.post(f"/projects/{project_id}/run-iterative")
-
-        assert response.status_code == 202
-        assert response.json()["status"] == "iterative_completed"
-        assert endpoint_response.status_code == 202
-        assert calls == [project_id, project_id]
-
-        with api_app.SessionLocal() as db:
-            project = db.query(Project).filter_by(project_id=project_id).one()
-            run_plan = project.constraints_json["run_plan"]
-
-        assert run_plan["max_rounds"] == 2
-        assert run_plan["agents"]["crem"]["enabled"] is True
-        assert run_plan["agents"]["crem"]["requested_count"] == 1
-        assert run_plan["agents"]["reinvent4"]["enabled"] is False
-        assert run_plan["agents"]["reinvent4"]["requested_count"] == 0
-
-
-def test_create_round_endpoint_is_removed(tmp_path):
+def test_create_round_endpoint_creates_draft(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post("/projects", json={"name": "Repeated rounds"}).json()["project_id"]
-        generation_config = {
-            "strategy_counts": {"reinvent4": 2, "crem": 3, "autogrow4": 0},
-            "top_n": 4,
-            "max_assessment_molecules": 8,
-            "assessment_mode": "fast",
-            "external_top_n": 4,
-        }
 
         first_response = client.post(
             f"/projects/{project_id}/rounds",
-            json={"generation_config": generation_config},
+            json={"round_number": 1, "user_conditions_json": {"objective": "首轮探索"}},
         )
         second_response = client.post(
             f"/projects/{project_id}/rounds",
-            json={"generation_config": generation_config},
+            json={"round_number": 2, "parent_round_id": first_response.json()["round_id"]},
         )
 
-        assert first_response.status_code == 404
-        assert second_response.status_code == 404
+        assert first_response.status_code == 201
+        assert first_response.json()["status"] == "draft"
+        assert first_response.json()["execution_config_snapshot_json"] is None
+        assert second_response.status_code == 201
+        assert second_response.json()["parent_round_id"] == first_response.json()["round_id"]
+
+
+def test_strategy_revision_persists_history_and_agent_audit(tmp_path, monkeypatch):
+    import medagent.llm.client as llm_module
+    from medagent.db.models import AgentRun, ProjectRound
+
+    class FakeStrategyLLM:
+        def generate_structured(self, prompt, **kwargs):
+            revised = "Current strategy to revise" in prompt
+            return {
+                "objective": "Revised objective" if revised else "Initial objective",
+                "campaign_config": {
+                    "crem": {"enabled": True, "num_molecules": 100, "edit_depth": 2},
+                    "reinvent4": {"enabled": False, "sample_count": 0},
+                    "autogrow4": {"enabled": False, "num_molecules": 0},
+                },
+                "seed_policy": {"source": "all_seeds"},
+                "assessment_config": {"mode": "external_top_n", "top_n": 20},
+                "rationale": "Use the available seed ligands.",
+                "warnings": [],
+                "requires_user_confirmation": True,
+            }
+
+    monkeypatch.setattr(llm_module, "get_llm_client", lambda: FakeStrategyLLM())
+
+    with make_client(tmp_path) as client:
+        project_id = client.post(
+            "/projects",
+            json={"name": "Strategy revision", "target_id": "TGT-EGFR"},
+        ).json()["project_id"]
+        round_id = client.post(
+            f"/projects/{project_id}/rounds",
+            json={"round_number": 1},
+        ).json()["round_id"]
+
+        draft_response = client.post(
+            f"/projects/{project_id}/rounds/{round_id}/strategy/draft",
+            json={"user_message": "Start conservatively"},
+        )
+        assert draft_response.status_code == 201
+
+        revise_response = client.post(
+            f"/projects/{project_id}/rounds/{round_id}/strategy/revise",
+            json={
+                "user_message": "Increase the CReM exploration budget",
+                "user_overrides": {
+                    "campaign_config": {"crem": {"num_molecules": 120}}
+                },
+            },
+        )
+        assert revise_response.status_code == 200
+        assert revise_response.json()["objective"] == "Revised objective"
+        assert revise_response.json()["campaign_config"]["crem"]["num_molecules"] == 120
+        assert revise_response.json()["requires_user_confirmation"] is True
+
+        with api_app.SessionLocal() as db:
+            round_obj = db.query(ProjectRound).filter_by(round_id=round_id).one()
+            revisions = round_obj.user_conditions_json["strategy_revision_history"]
+            audit = db.query(AgentRun).filter_by(
+                round_id=round_id,
+                agent_name="round_strategy_revision",
+            ).one()
+
+        assert len(revisions) == 1
+        assert revisions[0]["user_message"] == "Increase the CReM exploration budget"
+        assert revisions[0]["previous_strategy"]["objective"] == "Initial objective"
+        assert audit.status == "completed"
+
+
+def test_round_molecule_critique_uses_current_evidence_schema_and_writes_audit(
+    tmp_path,
+    monkeypatch,
+):
+    import medagent.services.llm_critique as critique_module
+
+    class FakeSettings:
+        self_refutation_provider = "deepseek"
+        self_refutation_model = "deepseek-critique-test"
+
+    class FakeResponse:
+        content = (
+            "主要风险：\n"
+            "1. hERG 风险偏高 - 证据：hERG_probability=0.72\n"
+            "严重程度：中等\n"
+            "改进建议：\n"
+            "优先降低 hERG 风险并保留对接构象。"
+        )
+
+    class FakeCritiqueLLM:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, **kwargs):
+            self.calls.append(kwargs)
+            return FakeResponse()
+
+    fake_client = FakeCritiqueLLM()
+    monkeypatch.setattr(critique_module, "get_llm_client", lambda: fake_client)
+    monkeypatch.setattr(critique_module, "get_settings", lambda: FakeSettings())
+
+    with make_client(tmp_path) as client:
+        project_id = client.post(
+            "/projects",
+            json={
+                "name": "Critique evidence schema",
+                "target_id": "TGT-EGFR",
+                "objective": "Reduce hERG risk while preserving potency",
+            },
+        ).json()["project_id"]
+        round_id = client.post(
+            f"/projects/{project_id}/rounds",
+            json={"round_number": 1},
+        ).json()["round_id"]
+
+        molecule_id = "MOL-CRITIQUE-CURRENT-SCHEMA"
+        with api_app.SessionLocal() as db:
+            db.add(
+                Molecule(
+                    molecule_id=molecule_id,
+                    project_id=project_id,
+                    round_id=round_id,
+                    smiles="CCOc1ncnc2ccccc12",
+                    source_agent="generator_agent:crem",
+                    generation_method="crem",
+                    status="candidate_assessed",
+                )
+            )
+            db.flush()
+            db.add_all([
+                RuleFilterResult(
+                    filter_result_id="FILTER-CRITIQUE-CURRENT-SCHEMA",
+                    project_id=project_id,
+                    molecule_id=molecule_id,
+                    round_id=round_id,
+                    rule_set="basic_drug_likeness_v1",
+                    decision="warning",
+                    failed_rules=["mw_above_target"],
+                    warnings=["review_molecular_weight"],
+                    properties_snapshot={"mw": 520.4},
+                ),
+                DockingResult(
+                    molecule_id=molecule_id,
+                    round_id=round_id,
+                    tool_run_id="TOOL-GNINA-CRITIQUE",
+                    vina_score=-8.2,
+                    cnn_score=0.74,
+                    key_hbond_count=2,
+                    clash_count=1,
+                    raw_output={"tool_name": "gnina"},
+                ),
+                ADMETResult(
+                    molecule_id=molecule_id,
+                    round_id=round_id,
+                    hERG_probability=0.72,
+                    hERG_risk="high",
+                    Ames_probability=0.08,
+                    Ames_risk="low",
+                    solubility="moderate",
+                    permeability="high",
+                    admet_risk_score=0.61,
+                    labels=["herg_risk"],
+                    raw_output={"tool_name": "chemprop"},
+                ),
+                SynthesisRoute(
+                    molecule_id=molecule_id,
+                    round_id=round_id,
+                    route_found=True,
+                    route_steps=4,
+                    route_confidence=0.81,
+                    buyable_building_blocks=3,
+                    route_json={"tool_name": "aizynthfinder"},
+                ),
+            ])
+            db.commit()
+
+        response = client.post(
+            f"/projects/{project_id}/rounds/{round_id}/molecules/{molecule_id}/critique"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["has_critique"] is True
+        assert payload["llm_provider"] == "deepseek"
+        assert payload["llm_model"] == "deepseek-critique-test"
+        assert set(payload["evidence_sources"]) == {
+            "rule_filter",
+            "docking_gnina",
+            "admet_chemprop",
+            "synthesis_aizynthfinder",
+        }
+        assert payload["critique"]["risks"]
+
+        assert len(fake_client.calls) == 1
+        llm_call = fake_client.calls[0]
+        assert llm_call["provider"] == "deepseek"
+        assert llm_call["model"] == "deepseek-critique-test"
+        prompt = llm_call["messages"][1].content
+        assert "Vina -8.2, CNN 0.74" in prompt
+        assert '"hERG_probability": 0.72' in prompt
+        assert "路线 True, 步数 4, 置信度 0.81" in prompt
+
+        with api_app.SessionLocal() as db:
+            audit = db.query(AgentRun).filter_by(
+                project_id=project_id,
+                round_id=round_id,
+                agent_name="llm_critique_agent",
+            ).one()
+
+        assert audit.status == "completed"
+        assert audit.model_name == "deepseek-critique-test"
+        assert audit.input_json["llm_provider"] == "deepseek"
+        assert audit.output_json["has_critique"] is True
 
 
 def test_report_top_candidates_include_generation_method(tmp_path):
@@ -847,42 +946,6 @@ $$$$
         ]
 
 
-def test_pipeline_full_mode_is_retired(tmp_path):
-    with make_client(tmp_path) as client:
-        project_id = client.post(
-            "/projects",
-            json={
-                "name": "Full pipeline",
-                "target_id": "TGT-EGFR",
-                "objective": "run the executable agent workflow",
-                "generation_config": {
-                    "strategy_counts": {"reinvent4": 1, "crem": 1, "autogrow4": 0},
-                    "top_n": 2,
-                    "max_assessment_molecules": 4,
-                    "assessment_mode": "fast",
-                    "generate_when_seeds_exist": True,
-                },
-            },
-        ).json()["project_id"]
-
-        upload_response = client.post(
-            f"/projects/{project_id}/files",
-            files={
-                "file": (
-                    "pipeline_seed.smi",
-                    b"CCO ethanol\nCc1ccccc1 toluene\n",
-                    "text/plain",
-                )
-            },
-        )
-        assert upload_response.status_code == 202
-
-        response = client.post(f"/projects/{project_id}/run", json={"mode": "full"})
-
-        assert response.status_code == 410
-        assert "iterative" in response.json()["detail"]
-
-
 def test_advisor_apply_requires_existing_advice(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post(
@@ -965,5 +1028,9 @@ def test_advisor_apply_accepts_document_shaped_advice(tmp_path):
             item for item in constraints if item["label"] == "advisor_cLogP"
         )["operator"] == "target_range"
 
-        round_response = client.post(f"/projects/{project_id}/rounds")
-        assert round_response.status_code == 404
+        round_response = client.post(
+            f"/projects/{project_id}/rounds",
+            json={"round_number": 1, "user_conditions_json": applied["generation_payload"]},
+        )
+        assert round_response.status_code == 201
+        assert round_response.json()["user_conditions_json"]["generation_request"]["generation_size"] == 500

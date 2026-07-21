@@ -25,6 +25,10 @@ from medagent.db.models import (
     RagDocument,
     Ranking,
     ReasoningTrace,
+    CampaignRun,
+    ProjectResource,
+    ProjectRound,
+    RoundReport,
     RuleFilterResult,
     SeedLigand,
     SynthesisRoute,
@@ -141,17 +145,29 @@ def delete_project_data(db: Session, project: Project) -> dict[str, int]:
     counts["advisor_suggestions"] = _delete(
         db.query(AdvisorSuggestion).filter(AdvisorSuggestion.project_id == project_id)
     )
-    counts["binding_sites"] = _delete(
-        db.query(BindingSite).filter(BindingSite.project_id == project_id)
+    counts["round_reports"] = _delete(
+        db.query(RoundReport).filter(RoundReport.project_id == project_id)
     )
-    counts["seed_ligands"] = _delete(
-        db.query(SeedLigand).filter(SeedLigand.project_id == project_id)
+    counts["campaign_runs"] = _delete(
+        db.query(CampaignRun).filter(CampaignRun.project_id == project_id)
+    )
+    counts["project_resources"] = _delete(
+        db.query(ProjectResource).filter(ProjectResource.project_id == project_id)
     )
     if molecule_ids:
         counts["molecules"] = _delete(
             db.query(Molecule).filter(Molecule.molecule_id.in_(molecule_ids))
         )
 
+    round_query = db.query(ProjectRound).filter(ProjectRound.project_id == project_id)
+    round_query.update({ProjectRound.parent_round_id: None}, synchronize_session=False)
+    counts["project_rounds"] = _delete(round_query)
+    counts["binding_sites"] = _delete(
+        db.query(BindingSite).filter(BindingSite.project_id == project_id)
+    )
+    counts["seed_ligands"] = _delete(
+        db.query(SeedLigand).filter(SeedLigand.project_id == project_id)
+    )
     db.delete(project)
     counts["projects"] = 1
     return counts

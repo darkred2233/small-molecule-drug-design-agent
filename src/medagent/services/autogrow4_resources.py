@@ -17,7 +17,6 @@ from sqlalchemy.orm import Session
 
 from medagent.db.models import BindingSite, Project, ProjectResource, SeedLigand, TargetDrugLibrary
 from medagent.domain.schemas import AutoGrow4CampaignConfig, AutoGrow4ResourceBundle
-from medagent.services.ids import new_id
 
 
 # search_intensity 映射

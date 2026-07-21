@@ -33,7 +33,7 @@ def list_target_ligands(project_id: str, db: Session = Depends(get_db)) -> list[
     ligands = db.query(TargetLigand).filter(
         TargetLigand.target_id == project.target_id,
     ).all()
-    return [_ligand_to_read(l) for l in ligands]
+    return [_ligand_to_read(ligand) for ligand in ligands]
 
 
 @router.post("/collect-target-pack")
@@ -109,20 +109,20 @@ def _resource_to_read(r: ProjectResource) -> ProjectResourceRead:
     )
 
 
-def _ligand_to_read(l: TargetLigand) -> TargetLigandRead:
+def _ligand_to_read(ligand: TargetLigand) -> TargetLigandRead:
     return TargetLigandRead(
-        target_ligand_id=l.target_ligand_id,
-        target_id=l.target_id,
-        name=l.name,
-        smiles=l.smiles,
-        canonical_smiles=l.canonical_smiles,
-        inchi_key=l.inchi_key,
-        source=l.source,
-        source_id=l.source_id,
-        activity_value=l.activity_value,
-        activity_unit=l.activity_unit,
-        activity_type=l.activity_type,
-        pchembl_value=l.pchembl_value,
-        assay_type=l.assay_type,
-        confidence_level=l.confidence_level,
+        target_ligand_id=ligand.target_ligand_id,
+        target_id=ligand.target_id,
+        name=ligand.name,
+        smiles=ligand.smiles,
+        canonical_smiles=ligand.canonical_smiles,
+        inchi_key=ligand.inchi_key,
+        source=ligand.source,
+        source_id=ligand.source_id,
+        activity_value=ligand.activity_value,
+        activity_unit=ligand.activity_unit,
+        activity_type=ligand.activity_type,
+        pchembl_value=ligand.pchembl_value,
+        assay_type=ligand.assay_type,
+        confidence_level=ligand.confidence_level,
     )

@@ -5,13 +5,10 @@ Receptor-guided genetic search. 不强制 task.seed_molecules，
 """
 
 from pathlib import Path
-from typing import Any
 
 from medagent.agents.generation_base import (
-    BUDGET_REQUESTED_COUNTS,
     GenerationAgent,
     _agent_molecules,
-    _bounded_int,
     _failed_result,
     _skipped_result,
     grid_values,

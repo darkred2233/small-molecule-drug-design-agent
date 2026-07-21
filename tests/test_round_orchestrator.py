@@ -1,36 +1,6 @@
 from types import SimpleNamespace
 
-from medagent.domain.schemas import (
-    RunPlan,
-    RunPlanAgentConfig,
-    RunPlanEvaluation,
-)
 from medagent.pipeline.round_orchestrator import RoundOrchestrator
-
-
-def _plan_with_evaluation(mode: str = "external_top_n", top_n: int = 7) -> RunPlan:
-    return RunPlan(
-        status="approved",
-        objective="Round-scoped orchestration test.",
-        agents={
-            "reinvent4": RunPlanAgentConfig(
-                enabled=False,
-                role="Global exploration",
-                requested_count=0,
-            ),
-            "crem": RunPlanAgentConfig(
-                enabled=True,
-                role="Local SAR expansion",
-                requested_count=1,
-            ),
-            "autogrow4": RunPlanAgentConfig(
-                enabled=False,
-                role="Docking-guided search",
-                requested_count=0,
-            ),
-        },
-        evaluation=RunPlanEvaluation(mode=mode, top_n=top_n),
-    )
 
 
 def test_round_assessment_maps_external_top_n_and_passes_round_id(monkeypatch):
@@ -55,7 +25,7 @@ def test_round_assessment_maps_external_top_n_and_passes_round_id(monkeypatch):
         None,
         project,
         round_obj,
-        _plan_with_evaluation(),
+        {"mode": "external_top_n", "top_n": 7},
     )
 
     assert result["assessment"] == "ok"

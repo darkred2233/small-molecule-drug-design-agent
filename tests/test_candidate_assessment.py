@@ -347,6 +347,35 @@ def test_candidate_assessment_can_skip_ranking(tmp_path):
         assert client.get(f"/projects/{project_id}/rankings").json() == []
 
 
+def test_candidate_assessment_can_skip_docking_admet_and_synthesis(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = create_filtered_project(client)
+
+        response = client.post(
+            f"/projects/{project_id}/candidate-assessment/run",
+            json={
+                "assessment_mode": "fast",
+                "max_molecules": 2,
+                "top_n": 2,
+                "skip_docking": True,
+                "skip_admet": True,
+                "skip_synthesis": True,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["skipped_stages"] == ["docking", "admet", "synthesis"]
+        for stage in body["skipped_stages"]:
+            assert body[stage]["adapter_mode"] == f"{stage}_skipped"
+            assert body[stage]["evaluated_count"] == 0
+            assert body[stage]["skipped_count"] == 2
+            assert body[stage]["warnings"] == [f"{stage}_skipped_by_strategy"]
+        assert client.get(f"/projects/{project_id}/docking-results").json() == []
+        assert client.get(f"/projects/{project_id}/admet-results").json() == []
+        assert client.get(f"/projects/{project_id}/synthesis-routes").json() == []
+
+
 def test_external_assessment_runs_available_admet_model_for_all_candidates(tmp_path, monkeypatch):
     status = _minimal_tool_status_with_external()
     status["gnina"]["available"] = False
@@ -789,7 +818,7 @@ def test_candidate_assessment_prepares_pdbqt_inputs_for_vina_when_gnina_unavaila
         assert all(tool_status["vina"]["available"] for _, tool_status in docking_requests)
 
 
-def test_external_assessment_persists_diffdock_confidence_without_cnn_score(tmp_path, monkeypatch):
+def test_external_assessment_does_not_use_diffdock_from_default_path(tmp_path, monkeypatch):
     status = _minimal_tool_status_with_external()
     status["gnina"]["available"] = False
     status["diffdock"] = {
@@ -802,11 +831,10 @@ def test_external_assessment_persists_diffdock_confidence_without_cnn_score(tmp_
     status["aizynthfinder"]["available"] = False
     status["aizynthfinder"]["model_configured"] = False
     monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", lambda: status)
-    monkeypatch.setattr(
-        candidate_assessment,
-        "run_external_docking",
-        lambda request, tool_status: _successful_diffdock_result(tmp_path, request),
-    )
+    def unexpected_diffdock(*_args, **_kwargs):
+        raise AssertionError("DiffDock must not run from the default assessment path")
+
+    monkeypatch.setattr(candidate_assessment, "run_external_docking", unexpected_diffdock)
 
     receptor_file = tmp_path / "egfr_receptor.pdb"
     receptor_file.write_text("HEADER    TEST RECEPTOR\n", encoding="utf-8")
@@ -827,17 +855,12 @@ def test_external_assessment_persists_diffdock_confidence_without_cnn_score(tmp_
         )
 
         assert response.status_code == 200
+        body = response.json()
+        assert body["docking"]["adapter_mode"] == "rdkit_surrogate_docking"
+        assert "external_docking_tools_not_installed" in body["docking"]["warnings"]
         results = client.get(f"/projects/{project_id}/docking-results").json()
-        refined = [item for item in results if "diffdock_adapter" in item["labels"]]
-        assert len(refined) == 1
-        assert refined[0]["cnn_score"] is None
-        assert refined[0]["diffdock_confidence"] == 1.25
-        assert refined[0]["raw_output"]["selected_pose_rank"] == 1
-        assert refined[0]["raw_output"]["pose_count"] == 10
-        assert (
-            refined[0]["raw_output"]["pose_selection_method"]
-            == "diffdock_rank_1_by_confidence"
-        )
+        assert all("diffdock_adapter" not in item["labels"] for item in results)
+        assert all(item["diffdock_confidence"] is None for item in results)
 
 
 def test_existing_vina_receptor_ignores_flexible_pdbqt_cache(tmp_path):

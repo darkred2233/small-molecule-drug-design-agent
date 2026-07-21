@@ -39,7 +39,6 @@ from medagent.services.candidate_ranking import generate_project_rankings
 from medagent.services.docking_adapters import (
     DockingToolRequest,
     DockingToolResult,
-    check_diffdock_available,
     check_gnina_available,
     check_vina_available,
     run_external_docking,
@@ -237,6 +236,9 @@ def run_project_candidate_assessment(
     max_synthesis_steps: int = 5,
     prefer_buyable_building_blocks: bool = True,
     enable_external_synthesis_routes: bool = True,
+    skip_docking: bool = False,
+    skip_admet: bool = False,
+    skip_synthesis: bool = False,
     skip_ranking: bool = False,
     round_id: str | None = None,
 ) -> dict[str, Any]:
@@ -245,38 +247,50 @@ def run_project_candidate_assessment(
     tool_status = candidate_assessment_tool_status()
     ranking_top_n = top_n or max_molecules
     conformer = generate_project_conformers(db, project, molecules, tool_status, round_id=round_id)
-    docking = run_project_docking(
-        db,
-        project,
-        molecules,
-        tool_status,
-        allow_external_tools=False,
-        binding_site_id=binding_site_id,
-        protein_file=protein_file,
-        prepared_ligand_files=prepared_ligand_files,
-        grid_center=grid_center,
-        grid_size=grid_size,
-        key_residues=key_residues or [],
-        round_id=round_id,
+    docking = (
+        _skipped_stage_summary(molecules, "docking", round_id)
+        if skip_docking
+        else run_project_docking(
+            db,
+            project,
+            molecules,
+            tool_status,
+            allow_external_tools=False,
+            binding_site_id=binding_site_id,
+            protein_file=protein_file,
+            prepared_ligand_files=prepared_ligand_files,
+            grid_center=grid_center,
+            grid_size=grid_size,
+            key_residues=key_residues or [],
+            round_id=round_id,
+        )
     )
-    admet = run_project_admet(
-        db,
-        project,
-        molecules,
-        tool_status,
-        allow_external_tools=False,
-        admet_properties=admet_properties or [],
-        round_id=round_id,
+    admet = (
+        _skipped_stage_summary(molecules, "admet", round_id)
+        if skip_admet
+        else run_project_admet(
+            db,
+            project,
+            molecules,
+            tool_status,
+            allow_external_tools=False,
+            admet_properties=admet_properties or [],
+            round_id=round_id,
+        )
     )
-    synthesis = run_project_synthesis(
-        db,
-        project,
-        molecules,
-        tool_status,
-        allow_external_tools=False,
-        max_synthesis_steps=max_synthesis_steps,
-        prefer_buyable_building_blocks=prefer_buyable_building_blocks,
-        round_id=round_id,
+    synthesis = (
+        _skipped_stage_summary(molecules, "synthesis", round_id)
+        if skip_synthesis
+        else run_project_synthesis(
+            db,
+            project,
+            molecules,
+            tool_status,
+            allow_external_tools=False,
+            max_synthesis_steps=max_synthesis_steps,
+            prefer_buyable_building_blocks=prefer_buyable_building_blocks,
+            round_id=round_id,
+        )
     )
     coarse_screen = _apply_coarse_screen_labels(db, molecules, round_id=round_id)
     ranking = _skipped_ranking_summary(molecules, ranking_top_n, round_id=round_id) if skip_ranking else generate_project_rankings(
@@ -300,35 +314,42 @@ def run_project_candidate_assessment(
             ranking,
             external_top_n=external_top_n if assessment_mode == "external" else len(coarse_passed_molecules),
         )
-        _mark_coarse_screen_summary(docking, coarse_screen, assessment_mode, len(refinement_molecules))
-        _mark_coarse_screen_summary(admet, coarse_screen, assessment_mode, len(refinement_molecules))
-        _mark_coarse_screen_summary(synthesis, coarse_screen, assessment_mode, len(refinement_molecules))
+        if not skip_docking:
+            _mark_coarse_screen_summary(docking, coarse_screen, assessment_mode, len(refinement_molecules))
+        if not skip_admet:
+            _mark_coarse_screen_summary(admet, coarse_screen, assessment_mode, len(refinement_molecules))
+        if not skip_synthesis:
+            _mark_coarse_screen_summary(synthesis, coarse_screen, assessment_mode, len(refinement_molecules))
         if refinement_molecules:
-            docking_refinement = run_project_docking(
-                db,
-                project,
-                refinement_molecules,
-                tool_status,
-                allow_external_tools=True,
-                binding_site_id=binding_site_id,
-                protein_file=protein_file,
-                prepared_ligand_files=prepared_ligand_files,
-                grid_center=grid_center,
-                grid_size=grid_size,
-                key_residues=key_residues or [],
-                round_id=round_id,
-            )
-            admet_refinement = run_project_admet(
-                db,
-                project,
-                refinement_molecules,
-                tool_status,
-                allow_external_tools=True,
-                admet_properties=admet_properties or [],
-                round_id=round_id,
-            )
+            docking_refinement = None
+            if not skip_docking:
+                docking_refinement = run_project_docking(
+                    db,
+                    project,
+                    refinement_molecules,
+                    tool_status,
+                    allow_external_tools=True,
+                    binding_site_id=binding_site_id,
+                    protein_file=protein_file,
+                    prepared_ligand_files=prepared_ligand_files,
+                    grid_center=grid_center,
+                    grid_size=grid_size,
+                    key_residues=key_residues or [],
+                    round_id=round_id,
+                )
+            admet_refinement = None
+            if not skip_admet:
+                admet_refinement = run_project_admet(
+                    db,
+                    project,
+                    refinement_molecules,
+                    tool_status,
+                    allow_external_tools=True,
+                    admet_properties=admet_properties or [],
+                    round_id=round_id,
+                )
             synthesis_refinement = None
-            if enable_external_synthesis_routes:
+            if not skip_synthesis and enable_external_synthesis_routes:
                 synthesis_refinement = run_project_synthesis(
                     db,
                     project,
@@ -339,15 +360,17 @@ def run_project_candidate_assessment(
                     prefer_buyable_building_blocks=prefer_buyable_building_blocks,
                     round_id=round_id,
                 )
-            else:
+            elif not skip_synthesis:
                 synthesis.warnings = _dedupe(
                     synthesis.warnings
                     + ["external_retrosynthesis_skipped_by_synthesis_route_scope"]
                 )
             _apply_external_refinement_labels(db, coarse_passed_molecules, refinement_molecules, round_id=round_id)
             refinement_scope = "top_n" if assessment_mode == "external" else "full"
-            _mark_external_refinement_summary(docking, docking_refinement, refinement_scope=refinement_scope)
-            _mark_external_refinement_summary(admet, admet_refinement, refinement_scope=refinement_scope)
+            if docking_refinement is not None:
+                _mark_external_refinement_summary(docking, docking_refinement, refinement_scope=refinement_scope)
+            if admet_refinement is not None:
+                _mark_external_refinement_summary(admet, admet_refinement, refinement_scope=refinement_scope)
             if synthesis_refinement is not None:
                 _mark_external_refinement_summary(
                     synthesis,
@@ -372,6 +395,15 @@ def run_project_candidate_assessment(
         "assessment_mode": assessment_mode,
         "external_top_n": external_top_n,
         "external_synthesis_routes_enabled": enable_external_synthesis_routes,
+        "skipped_stages": [
+            stage
+            for stage, skipped in (
+                ("docking", skip_docking),
+                ("admet", skip_admet),
+                ("synthesis", skip_synthesis),
+            )
+            if skipped
+        ],
         "ranking_skipped": skip_ranking,
         "runtime_policy": _assessment_runtime_policy(
             assessment_mode=assessment_mode,
@@ -1196,7 +1228,11 @@ def candidate_assessment_tool_status() -> dict[str, Any]:
         "rdkit": _package_status("rdkit"),
         "gnina": check_gnina_available(),
         "vina": check_vina_available(),
-        "diffdock": check_diffdock_available(),
+        "diffdock": {
+            "available": False,
+            "disabled_by_policy": True,
+            "warning": "diffdock_removed_from_default_assessment_path",
+        },
         "oddt": _package_status("oddt"),
         "admetlab": _package_status("admetlab"),
         "chemprop": chemprop_tool_status(),
@@ -1322,6 +1358,24 @@ def _skipped_ranking_summary(
         molecule_ids=ordered_ids[:top_n],
         skipped_molecule_ids=ordered_ids,
         warnings=["ranking_skipped_by_request"],
+        round_id=round_id,
+        execution_mode="skipped",
+    )
+
+
+def _skipped_stage_summary(
+    molecules: list[Molecule],
+    stage: str,
+    round_id: str | None = None,
+) -> StageSummary:
+    molecule_ids = [molecule.molecule_id for molecule in molecules]
+    return StageSummary(
+        agent_run_id=f"RUN-{stage.upper()}-SKIPPED",
+        adapter_mode=f"{stage}_skipped",
+        requested_count=len(molecules),
+        skipped_count=len(molecules),
+        skipped_molecule_ids=molecule_ids,
+        warnings=[f"{stage}_skipped_by_strategy"],
         round_id=round_id,
         execution_mode="skipped",
     )
@@ -2593,8 +2647,6 @@ def _attempt_external_docking(
             labels=["external_docking_adapter_failed"],
             warnings=["prepared_ligand_file_not_found"],
         )
-    original_protein_file = protein_file
-    original_ligand_file = ligand_file
     preparation_warnings: list[str] = []
     attempted_vina_preparation = _should_prepare_vina_inputs(
         tool_status,
@@ -2630,26 +2682,6 @@ def _attempt_external_docking(
         molecule_id=molecule.molecule_id,
     )
     selected_tool = select_docking_tool(request, tool_status)
-    if selected_tool == "diffdock":
-        diffdock_input = original_ligand_file if attempted_vina_preparation else ligand_file
-        ligand_file = _diffdock_ligand_file(project, molecule, diffdock_input)
-        if ligand_file is None:
-            return DockingToolResult(
-                adapter_mode="external_docking_unavailable",
-                tool_name="diffdock",
-                success=False,
-                labels=["external_docking_adapter_failed", "diffdock_adapter"],
-                warnings=_dedupe(
-                    preparation_warnings + ["diffdock_ligand_sdf_generation_failed"]
-                ),
-            )
-        request = replace(
-            request,
-            receptor_file=original_protein_file,
-            ligand_file=ligand_file,
-        )
-        if attempted_vina_preparation:
-            preparation_warnings.append("vina_preparation_failed_diffdock_used")
     if selected_tool:
         request = replace(
             request,
@@ -2692,10 +2724,6 @@ def _should_prepare_vina_inputs(
     if not tool_status.get("vina", {}).get("available"):
         return False
     if tool_status.get("gnina", {}).get("available"):
-        return False
-    if tool_status.get("diffdock", {}).get("available") and (
-        not _is_vector3(grid_center) or not _is_vector3(grid_size)
-    ):
         return False
     receptor_ready = is_valid_vina_receptor_pdbqt(Path(receptor_file))
     ligand_ready = bool(ligand_file) and is_valid_vina_ligand_pdbqt(Path(ligand_file))
@@ -2916,10 +2944,7 @@ def _external_docking_setup_warnings(
         warnings.append("protein_file_required_for_external_docking")
     elif not Path(protein_file).exists():
         warnings.append("protein_file_not_found")
-    if (
-        not tool_status.get("diffdock", {}).get("available")
-        and (not _is_vector3(grid_center) or not _is_vector3(grid_size))
-    ):
+    if not _is_vector3(grid_center) or not _is_vector3(grid_size):
         warnings.append("grid_center_and_grid_size_required_for_external_docking")
     return warnings
 
@@ -2934,10 +2959,8 @@ def _external_docking_ready(
         _external_docking_available(tool_status)
         and protein_file
         and Path(protein_file).exists()
-        and (
-            tool_status.get("diffdock", {}).get("available")
-            or (_is_vector3(grid_center) and _is_vector3(grid_size))
-        )
+        and _is_vector3(grid_center)
+        and _is_vector3(grid_size)
     )
 
 
@@ -3002,7 +3025,6 @@ def _external_docking_available(tool_status: dict[str, Any]) -> bool:
     return bool(
         tool_status["gnina"]["available"]
         or tool_status["vina"]["available"]
-        or tool_status["diffdock"]["available"]
     )
 
 

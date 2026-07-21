@@ -13,7 +13,6 @@ from medagent.services.bootstrap import (
 )
 from medagent.services.ids import new_id
 from medagent.services.project_deletion import cleanup_project_artifacts, delete_project_data
-from medagent.services.run_plan import ensure_project_run_plan
 
 router = APIRouter(prefix="/projects", tags=["项目管理"])
 
@@ -42,7 +41,6 @@ def create_project(
         constraints_json=constraints_json,
         status="created",
     )
-    ensure_project_run_plan(new_project)
 
     db.add(new_project)
     db.flush()

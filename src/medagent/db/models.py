@@ -162,10 +162,15 @@ class Molecule(TimestampMixin, Base):
     molecule_id: Mapped[str] = mapped_column(String(80), unique=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
     round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    campaign_run_id: Mapped[str | None] = mapped_column(String(80), index=True)
     smiles: Mapped[str] = mapped_column(Text)
     inchi_key: Mapped[str | None] = mapped_column(String(120), index=True)
     scaffold: Mapped[str | None] = mapped_column(String(160), index=True)
     source_agent: Mapped[str | None] = mapped_column(String(120))
+    generation_method: Mapped[str | None] = mapped_column(String(80), index=True)
+    parent_molecule_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    provenance_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    generation_metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(80), default="generated")
     labels: Mapped[list[str]] = mapped_column(JSON, default=list)
 
@@ -476,7 +481,7 @@ class ProjectRound(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(40), default="draft")  # draft/ready/running/completed/failed/cancelled
     parent_round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"))
     user_conditions_json: Mapped[dict | None] = mapped_column(JSON, default=None)
-    run_plan_snapshot_json: Mapped[dict | None] = mapped_column(JSON, default=None)
+    execution_config_snapshot_json: Mapped[dict | None] = mapped_column(JSON, default=None)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -503,3 +508,18 @@ class CampaignRun(TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     round: Mapped["ProjectRound"] = relationship(back_populates="campaigns")
+
+
+class RoundReport(TimestampMixin, Base):
+    """持久化的单轮报告快照。"""
+
+    __tablename__ = "round_reports"
+    __table_args__ = (UniqueConstraint("round_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    report_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="completed")
+    report_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))

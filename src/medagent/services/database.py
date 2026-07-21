@@ -98,6 +98,14 @@ def ensure_relational_schema(engine: Engine) -> None:
             _advisor_suggestion_columns(engine.dialect.name),
         )
 
+    if "project_rounds" in table_names:
+        _ensure_missing_columns(
+            engine,
+            "project_rounds",
+            _project_round_columns(engine.dialect.name),
+        )
+        _migrate_round_execution_config_snapshot(engine)
+
     if "rag_chunks" in table_names:
         _ensure_missing_columns(
             engine,
@@ -187,6 +195,26 @@ def _advisor_suggestion_columns(dialect_name: str) -> list[tuple[str, str]]:
         ("next_round_constraints", json_list),
         ("suggested_generation_config", json_dict),
     ]
+
+
+def _project_round_columns(dialect_name: str) -> list[tuple[str, str]]:
+    json_type = "JSONB DEFAULT NULL" if dialect_name == "postgresql" else "JSON DEFAULT NULL"
+    return [("execution_config_snapshot_json", json_type)]
+
+
+def _migrate_round_execution_config_snapshot(engine: Engine) -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("project_rounds")}
+    if "run_plan_snapshot_json" not in columns or "execution_config_snapshot_json" not in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE project_rounds "
+                "SET execution_config_snapshot_json = run_plan_snapshot_json "
+                "WHERE execution_config_snapshot_json IS NULL "
+                "AND run_plan_snapshot_json IS NOT NULL"
+            )
+        )
 
 
 def _rag_chunk_columns(dialect_name: str) -> list[tuple[str, str]]:

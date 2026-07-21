@@ -31,10 +31,6 @@ export const moleculesApi = {
   importSeeds: (projectId: string) =>
     apiClient.post(`/projects/${projectId}/molecules/import-seeds`, {}),
 
-  // Generate molecules
-  generate: (projectId: string, config?: any) =>
-    apiClient.post(`/projects/${projectId}/molecules/generate`, config || {}),
-
   // Validate molecules
   validate: (projectId: string) =>
     apiClient.post(`/projects/${projectId}/molecules/validate`, {}),

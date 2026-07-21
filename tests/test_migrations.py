@@ -9,6 +9,7 @@ from migrations.add_seed_ligand_activity_type import (
 from migrations.add_llm_critique_fields import (
     apply_migration as apply_critique_provenance_migration,
 )
+from migrations.add_round_provenance import apply_migration as apply_round_provenance_migration
 from migrations.run_all import apply_all
 
 
@@ -121,7 +122,27 @@ def test_apply_all_is_idempotent_on_current_schema(tmp_path):
         "docking_diffdock_confidence": False,
         "seed_ligand_activity_type": False,
         "llm_critique_fields": [],
+        "round_provenance": {"added_columns": [], "round_reports_created": False},
     }
 
     assert apply_all(database_url) == expected
     assert apply_all(database_url) == expected
+
+
+def test_round_provenance_migration_adds_lineage_fields_and_report_table(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'round-provenance.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(bind=engine)
+
+    result = apply_round_provenance_migration(database_url)
+    assert result["added_columns"] == []
+    assert result["round_reports_created"] is False
+    columns = {column["name"] for column in inspect(engine).get_columns("molecules")}
+    assert {
+        "campaign_run_id",
+        "generation_method",
+        "parent_molecule_ids",
+        "provenance_json",
+        "generation_metadata_json",
+    } <= columns
+    assert inspect(engine).has_table("round_reports")

@@ -9,7 +9,6 @@ from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from medagent.agents.conversation import ConversationAgent
-from medagent.agents.planner import PlannerAgent
 from medagent.configs.settings import Settings, get_settings
 from medagent.db.models import (
     ADMETResult,
@@ -54,8 +53,6 @@ from medagent.domain.schemas import (
     DecisionCardRead,
     DockingResultRead,
     FileParseResult,
-    MoleculeGenerationRequest,
-    MoleculeGenerationResponse,
     MoleculeImportResponse,
     MoleculePropertyRead,
     MoleculeRead,
@@ -79,8 +76,6 @@ from medagent.domain.schemas import (
     ReasoningTraceRead,
     RuleFilterResponse,
     RuleFilterResultRead,
-    RunPlan,
-    RunPipelineRequest,
     SeedLigandRead,
     SynthesisRouteRead,
     UploadedFileRead,
@@ -115,13 +110,11 @@ from medagent.services.file_ingestion import (
     save_upload_file,
 )
 from medagent.services.ids import new_id
-from medagent.services.molecule_generation import generate_project_molecules
 from medagent.services.molecule_import import import_seed_ligands_as_molecules
 from medagent.services.molecule_validation import (
     molecule_property_metadata_for_read,
     validate_project_molecules,
 )
-from medagent.pipeline.orchestrator import PipelineOrchestrator
 from medagent.reporting.project_report import build_project_report
 from medagent.services.narrative import (
     NARRATIVE_SCHEMA_VERSION,
@@ -136,7 +129,6 @@ from medagent.services.receptor_preparation import (
     list_project_binding_sites,
     prepare_project_receptor,
 )
-from medagent.services.run_plan import ensure_project_run_plan, save_project_run_plan
 from medagent.services.rule_filtering import filter_project_molecules
 
 SessionLocal: sessionmaker[Session]
@@ -161,7 +153,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="小分子药物设计 Agent",
         description=(
             "面向小分子药物设计流程的智能体后端。当前已完成关系数据库、内置靶点-药物库、"
-            "项目创建、自然语言约束解析、RAG 建库检索、RunPlan 多轮迭代和候选分子评估。"
+            "项目创建、自然语言约束解析、RAG 建库检索、轮次/Campaign 流程和候选分子评估。"
         ),
         version="0.1.0",
         docs_url=None,
@@ -170,7 +162,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_tags=[
             {"name": "系统状态", "description": "服务健康检查和数据库摘要。"},
             {"name": "内置靶点库", "description": "查询 MVP 内置靶点和代表药物。"},
-            {"name": "项目管理", "description": "创建项目、查询项目状态、启动 RunPlan 多轮迭代流程。"},
+            {"name": "项目管理", "description": "创建项目、查询项目状态和查看轮次运行记录。"},
             {"name": "对话与约束", "description": "把自然语言优化方向转为结构化约束。"},
             {"name": "文件与导入", "description": "上传资料并创建知识导入任务。"},
             {"name": "RAG", "description": "构建、爬取、查询 RAG 证据库和 evidence links。"},
@@ -315,7 +307,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 <div class="wrap hero">
                   <div>
                     <h1>小分子药物设计 Agent</h1>
-                    <p>中文 API 控制台。当前阶段已完成关系数据库、内置靶点-药物库、项目创建、约束解析、RAG 建库检索和 RunPlan 多轮迭代流程。</p>
+                    <p>中文 API 控制台。当前阶段已完成关系数据库、内置靶点-药物库、项目创建、约束解析、RAG 建库检索和轮次/Campaign 流程。</p>
                   </div>
                   <nav class="actions">
                     <a class="button primary" href="/docs">打开接口文档</a>
@@ -341,7 +333,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   </article>
                   <article class="card">
                     <h2>流程运行</h2>
-                    <p>使用 <code>PUT /projects/{id}/run-plan</code> 保存操控台计划，再用 <code>POST /projects/{id}/run-iterative</code> 启动多轮优化。</p>
+                    <p>使用 <code>POST /projects/{id}/rounds</code> 创建轮次草稿，再用 <code>POST /projects/{id}/rounds/{round_id}/start</code> 启动本轮优化。</p>
                   </article>
                 </section>
               </main>
@@ -487,7 +479,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
               <header>
                 <div class="wrap">
                   <h1>接口文档</h1>
-                  <p>所有业务说明已中文化。当前后端支持内置靶点库、关系数据库摘要、项目创建、自然语言约束解析、RunPlan 多轮运行和结果查询。</p>
+                  <p>所有业务说明已中文化。当前后端支持内置靶点库、关系数据库摘要、项目创建、自然语言约束解析、轮次运行和结果查询。</p>
                   <nav>
                     <a class="button primary" href="/">返回首页</a>
                     <a class="button" href="/swagger">打开 Swagger 调试页</a>
@@ -537,9 +529,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     <p>把“降低 hERG 风险、保留母核、只改 R6 位”等自然语言转成结构化约束。</p>
                   </article>
                   <article class="card">
-                    <div class="route"><span class="method post">POST</span><code>/projects/{project_id}/run</code></div>
+                    <div class="route"><span class="method post">POST</span><code>/projects/{project_id}/rounds/{round_id}/start</code></div>
                     <h2>启动迭代流程运行</h2>
-                    <p>按当前 RunPlan 启动多轮优化；旧 <code>dry_run</code> 和 <code>full</code> 流程已退役。</p>
+                    <p>按本轮 Campaign 配置启动生成、评估、排序和自我反驳。</p>
                   </article>
                   <article class="card">
                     <div class="route"><span class="method get">GET</span><code>/projects/{project_id}/status</code></div>
@@ -669,7 +661,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             objective=payload.objective,
             constraints_json=constraints_json,
         )
-        ensure_project_run_plan(project)
         db.add(project)
         db.flush()
         if payload.seed_ligands:
@@ -690,12 +681,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         project = _get_project(db, project_id)
         agent = ConversationAgent()
         parsed = agent.parse(payload.message)
-        current_run_plan = ensure_project_run_plan(project)
-        planner_agent = PlannerAgent(use_llm=bool(app_settings.dashscope_api_key))
-        planner_result = planner_agent.plan(payload.message, current_plan=current_run_plan)
-        save_project_run_plan(project, planner_result.run_plan)
-        response_intent = planner_result.intent if planner_result.intent == "update_run_plan" else parsed.intent
-        response_reply = planner_result.reply if planner_result.intent == "update_run_plan" else parsed.reply
+        response_intent = parsed.intent
+        response_reply = parsed.reply
+        suggested_execution = parsed.intent == "run_pipeline"
+        requires_confirmation = suggested_execution
+        warnings: list[str] = []
+        if suggested_execution:
+            warnings.append("请在轮次页面确认本轮生成配置后启动，不再使用旧固定计划自动循环。")
 
         message = ConversationMessage(
             message_id=new_id("MSG"),
@@ -732,11 +724,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 intent=response_intent,
                 extracted_payload={
                     "created_constraints": created_constraints,
-                    "plan_patch": _schema_to_payload(planner_result.plan_patch),
-                    "plan_diff": [_schema_to_payload(change) for change in planner_result.plan_diff],
-                    "suggested_execution": planner_result.suggested_execution,
-                    "requires_confirmation": planner_result.requires_confirmation,
-                    "warnings": planner_result.warnings,
+                    "suggested_execution": suggested_execution,
+                    "requires_confirmation": requires_confirmation,
+                    "warnings": warnings,
                 },
             )
         )
@@ -745,39 +735,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             reply=response_reply,
             intent=response_intent,
             created_constraints=created_constraints,
-            run_plan=planner_result.run_plan,
-            plan_patch=planner_result.plan_patch,
-            plan_diff=planner_result.plan_diff,
-            suggested_execution=planner_result.suggested_execution,
-            requires_confirmation=planner_result.requires_confirmation,
-            warnings=planner_result.warnings,
+            suggested_execution=suggested_execution,
+            requires_confirmation=requires_confirmation,
+            warnings=warnings,
         )
-
-    @app.get(
-        "/projects/{project_id}/run-plan",
-        response_model=RunPlan,
-        tags=["项目管理"],
-        summary="查看当前 RunPlan",
-    )
-    def get_run_plan(project_id: str, db: Session = Depends(get_db)):
-        project = _get_project(db, project_id)
-        run_plan = ensure_project_run_plan(project)
-        db.commit()
-        return run_plan
-
-    @app.put(
-        "/projects/{project_id}/run-plan",
-        response_model=RunPlan,
-        tags=["项目管理"],
-        summary="保存当前 RunPlan 草稿",
-    )
-    def update_run_plan(project_id: str, payload: RunPlan, db: Session = Depends(get_db)):
-        project = _get_project(db, project_id)
-        save_project_run_plan(project, payload)
-        db.add(project)
-        db.commit()
-        db.refresh(project)
-        return ensure_project_run_plan(project)
 
     @app.post(
         "/projects/{project_id}/files",
@@ -1086,51 +1047,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return _file_parse_result(uploaded_file)
 
     @app.post(
-        "/projects/{project_id}/run",
-        response_model=ProjectStatus,
-        status_code=202,
-        tags=["项目管理"],
-        summary="启动项目流程",
-    )
-    def run_pipeline(
-        project_id: str,
-        payload: RunPipelineRequest | None = None,
-        db: Session = Depends(get_db),
-    ):
-        project = _get_project(db, project_id)
-        requested = payload or RunPipelineRequest()
-        if requested.mode != "iterative":
-            raise HTTPException(
-                status_code=410,
-                detail="旧 dry_run/full 流程已停用；请使用 iterative RunPlan 流程。",
-            )
-        if requested.generation_config:
-            _merge_pipeline_config(project, requested.generation_config)
-            ensure_project_run_plan(project, requested.generation_config, overwrite=True)
-            db.commit()
-        else:
-            ensure_project_run_plan(project)
-            db.commit()
-        PipelineOrchestrator(app_settings).run_iterative(db, project)
-        db.refresh(project)
-        return _project_status(db, project)
-
-    @app.post(
-        "/projects/{project_id}/run-iterative",
-        response_model=ProjectStatus,
-        status_code=202,
-        tags=["项目管理"],
-        summary="按 RunPlan 启动多轮优化",
-    )
-    def run_iterative(project_id: str, db: Session = Depends(get_db)):
-        project = _get_project(db, project_id)
-        ensure_project_run_plan(project)
-        db.commit()
-        PipelineOrchestrator(app_settings).run_iterative(db, project)
-        db.refresh(project)
-        return _project_status(db, project)
-
-    @app.post(
         "/projects/{project_id}/advisor/apply",
         response_model=AdvisorApplyResponse,
         status_code=202,
@@ -1198,6 +1114,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 labels=item.labels,
                 source_agent=item.source_agent,
                 round_id=item.round_id,
+                campaign_run_id=item.campaign_run_id,
+                generation_method=item.generation_method,
+                parent_molecule_ids=item.parent_molecule_ids or [],
+                provenance_json=item.provenance_json or {},
+                generation_metadata_json=item.generation_metadata_json or {},
             )
             for item in molecules
         ]
@@ -1223,33 +1144,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def import_seed_molecules(project_id: str, db: Session = Depends(get_db)):
         project = _get_project(db, project_id)
         return import_seed_ligands_as_molecules(db, project)
-
-    @app.post(
-        "/projects/{project_id}/molecules/generate",
-        response_model=MoleculeGenerationResponse,
-        status_code=201,
-        tags=["结果查询"],
-        summary="生成三类候选分子",
-    )
-    def generate_molecules(
-        project_id: str,
-        payload: MoleculeGenerationRequest | None = None,
-        db: Session = Depends(get_db),
-    ):
-        project = _get_project(db, project_id)
-        request = payload or MoleculeGenerationRequest()
-        try:
-            return generate_project_molecules(
-                db=db,
-                project=project,
-                generation_size=request.generation_size,
-                strategies=request.strategies,
-                strategy_counts=request.strategy_counts,
-                constraints=request.constraints,
-                include_target_library_seeds=request.include_target_library_seeds,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post(
         "/projects/{project_id}/molecules/validate",
@@ -1399,6 +1293,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_synthesis_steps=request.max_synthesis_steps,
             prefer_buyable_building_blocks=request.prefer_buyable_building_blocks,
             enable_external_synthesis_routes=request.enable_external_synthesis_routes,
+            skip_docking=request.skip_docking,
+            skip_admet=request.skip_admet,
+            skip_synthesis=request.skip_synthesis,
             skip_ranking=request.skip_ranking,
             round_id=request.round_id,
         )
@@ -1671,6 +1568,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             labels=molecule.labels,
             source_agent=molecule.source_agent,
             round_id=molecule.round_id,
+            campaign_run_id=molecule.campaign_run_id,
+            generation_method=molecule.generation_method,
+            parent_molecule_ids=molecule.parent_molecule_ids or [],
+            provenance_json=molecule.provenance_json or {},
+            generation_metadata_json=molecule.generation_metadata_json or {},
         )
 
     @app.get(
@@ -1818,28 +1720,6 @@ def _merge_project_config(
     if generation_config:
         merged["pipeline_config"] = generation_config
     return merged
-
-
-def _merge_pipeline_config(
-    project: Project,
-    generation_config: dict[str, object] | None,
-) -> dict[str, object]:
-    constraints_json = dict(project.constraints_json or {})
-    existing = constraints_json.get("pipeline_config")
-    pipeline_config = dict(existing) if isinstance(existing, dict) else {}
-    override = generation_config if isinstance(generation_config, dict) else {}
-    for key, value in override.items():
-        if key in {"strategy_counts", "generation_constraints"} and isinstance(value, dict):
-            previous = pipeline_config.get(key)
-            merged_value = dict(previous) if isinstance(previous, dict) else {}
-            merged_value.update(value)
-            pipeline_config[key] = merged_value
-            continue
-        pipeline_config[key] = value
-    if override:
-        constraints_json["pipeline_config"] = pipeline_config
-        project.constraints_json = constraints_json
-    return pipeline_config
 
 
 def _safe_filename(value: str) -> str:

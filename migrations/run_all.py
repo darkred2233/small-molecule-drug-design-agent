@@ -20,6 +20,7 @@ def apply_all(database_url: str | None = None) -> dict[str, object]:
     )
     from migrations.add_docking_raw_output import apply_migration as add_docking_raw_output
     from migrations.add_llm_critique_fields import apply_migration as add_llm_critique_fields
+    from migrations.add_round_provenance import apply_migration as add_round_provenance
     from migrations.add_seed_ligand_activity_type import apply_migration as add_activity_type
 
     url = database_url or os.getenv("MEDAGENT_DATABASE_URL") or get_settings().database_url
@@ -28,6 +29,7 @@ def apply_all(database_url: str | None = None) -> dict[str, object]:
         "docking_diffdock_confidence": add_diffdock_confidence(url),
         "seed_ligand_activity_type": add_activity_type(url),
         "llm_critique_fields": add_llm_critique_fields(url),
+        "round_provenance": add_round_provenance(url),
     }
 
 

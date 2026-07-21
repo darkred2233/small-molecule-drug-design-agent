@@ -9,27 +9,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
-def test_pipeline_tasks_direct():
-    """Test pipeline tasks module directly."""
-    # Direct import without going through __init__
-    import importlib.util
+def test_round_orchestrator_direct():
+    """Test the current round orchestration entry point."""
+    from medagent.pipeline import RoundOrchestrator
 
-    spec = importlib.util.spec_from_file_location(
-        "tasks",
-        "src/medagent/pipeline/tasks.py"
-    )
-    assert spec is not None
+    for method in (
+        "create_round_draft",
+        "start_round",
+        "run_round_assessment",
+        "run_round_ranking",
+        "run_round",
+    ):
+        assert callable(getattr(RoundOrchestrator, method, None))
 
-    # Check module has expected attributes
-    with open("src/medagent/pipeline/tasks.py", encoding="utf-8") as f:
-        content = f.read()
-        assert "TASK_REGISTRY" in content
-        assert "TASK_CONFIGS" in content
-        assert "knowledge_ingestion_task" in content
-        assert "molecule_generation_task" in content
-        assert "candidate_assessment_task" in content
-
-    print("✓ Pipeline tasks.py: all expected functions present")
+    print("✓ RoundOrchestrator: all expected lifecycle methods present")
 
 
 def test_pipeline_recovery_direct():
@@ -126,7 +119,7 @@ def main():
     print("=" * 60)
 
     try:
-        test_pipeline_tasks_direct()
+        test_round_orchestrator_direct()
         test_pipeline_recovery_direct()
         test_reporting_cards_direct()
         test_reporting_tables_direct()
@@ -140,7 +133,7 @@ def main():
         print("✓ All modules created successfully!")
         print()
         print("Summary of additions:")
-        print("  - pipeline/tasks.py: Prefect task definitions (11 tasks)")
+        print("  - pipeline/round_orchestrator.py: round lifecycle orchestration")
         print("  - pipeline/recovery.py: Checkpoint and recovery system")
         print("  - reporting/cards.py: Decision card formatting")
         print("  - reporting/tables.py: Table generation utilities")

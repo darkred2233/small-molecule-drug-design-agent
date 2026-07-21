@@ -14,7 +14,6 @@ from typing import Any
 from medagent.agents.generation_base import (
     BUDGET_REQUESTED_COUNTS,
     GenerationAgent,
-    _agent_molecules,
     _bounded_int,
     _failed_result,
     _skipped_result,

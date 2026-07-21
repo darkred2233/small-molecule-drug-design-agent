@@ -172,7 +172,7 @@ def build_final_report_from_report(
             _top_candidate_sentence(top_narratives),
             "以下结论只基于系统中已存在的 docking、ADMET、合成、RAG 和排序证据。",
         ],
-        "run_plan_summary": _run_plan_summary(report),
+        "execution_config_summary": _execution_config_summary(report),
         "round_summaries": round_summaries,
         "top_molecules": [
             {
@@ -429,27 +429,19 @@ def _evidence_refs(candidate: dict[str, Any]) -> list[dict[str, Any]]:
     return refs
 
 
-def _run_plan_summary(report: dict[str, Any]) -> dict[str, Any]:
+def _execution_config_summary(report: dict[str, Any]) -> dict[str, Any]:
     project_summary = report.get("project_summary") or {}
     return {
         "project_id": project_summary.get("project_id"),
         "objective": project_summary.get("objective"),
         "status": project_summary.get("status"),
-        "note": "RunPlan 快照保存在项目 constraints_json.run_plan；本报告只复述已入库证据。",
+        "note": "轮次执行配置快照保存在 ProjectRound.execution_config_snapshot_json；本报告只复述已入库证据。",
     }
 
 
 def _round_summaries(report: dict[str, Any]) -> list[dict[str, Any]]:
-    iterative_output = (report.get("technical_appendix") or {}).get("iterative_orchestrator") or {}
-    if isinstance(iterative_output, dict):
-        rounds = iterative_output.get("rounds") or []
-        if isinstance(rounds, list):
-            return rounds
-    for run in report.get("technical_appendix", {}).get("agent_runs", []) or []:
-        if run.get("agent_name") == "iterative_orchestrator_agent":
-            output = run.get("output_json") or {}
-            return output.get("rounds") or []
-    return []
+    rounds = report.get("round_summaries") or []
+    return rounds if isinstance(rounds, list) else []
 
 
 def _sar_summary(report: dict[str, Any]) -> dict[str, Any]:

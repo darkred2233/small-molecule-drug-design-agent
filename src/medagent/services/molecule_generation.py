@@ -7,14 +7,10 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from medagent.db.models import AgentRun, Molecule, Project, SeedLigand, TargetDrugLibrary
-from medagent.services.ids import new_id
+from medagent.db.models import Project, SeedLigand, TargetDrugLibrary
 from medagent.services.molecule_import import is_lightly_valid_smiles, normalize_smiles
 
 
-GENERATOR_AGENT_NAME = "generator_agent"
-GENERATION_STRATEGIES = ("reinvent4", "crem", "autogrow4")
-TOOLCHAIN_MODE = "rdkit_datamol_generation_toolchain"
 TARGET_FALLBACK_SEED_SMILES = {
     "TGT-EGFR": [
         "COc1cc(N(C)CCN(C)C)c(NC(=O)C=C)c2ncnc(Nc3ccc(F)c(Cl)c3)c12",
@@ -47,86 +43,6 @@ class GenerationBatch:
     external_tool_used: bool = False
     surrogate_used: bool = False
     fallback_used: bool = False
-
-
-@dataclass
-class StrategyGenerationSummary:
-    requested_count: int = 0
-    proposed_count: int = 0
-    stored_count: int = 0
-    duplicate_count: int = 0
-    invalid_count: int = 0
-    seed_count: int = 0
-    molecule_ids: list[str] = field(default_factory=list)
-    adapter_mode: str = "not_run"
-    tool_status: dict[str, Any] = field(default_factory=dict)
-    warnings: list[str] = field(default_factory=list)
-    candidate_source_counts: dict[str, int] = field(default_factory=dict)
-    provenance: dict[str, Any] = field(default_factory=dict)
-    execution_mode: str = "not_run"
-    external_tools_requested: bool = False
-    external_tool_used: bool = False
-    surrogate_used: bool = False
-    fallback_used: bool = False
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "requested_count": self.requested_count,
-            "proposed_count": self.proposed_count,
-            "stored_count": self.stored_count,
-            "duplicate_count": self.duplicate_count,
-            "invalid_count": self.invalid_count,
-            "seed_count": self.seed_count,
-            "molecule_ids": self.molecule_ids,
-            "adapter_mode": self.adapter_mode,
-            "tool_status": self.tool_status,
-            "warnings": self.warnings,
-            "candidate_source_counts": self.candidate_source_counts,
-            "provenance": self.provenance,
-            "execution_mode": self.execution_mode,
-            "external_tools_requested": self.external_tools_requested,
-            "external_tool_used": self.external_tool_used,
-            "surrogate_used": self.surrogate_used,
-            "fallback_used": self.fallback_used,
-        }
-
-
-@dataclass
-class MoleculeGenerationSummary:
-    agent_run_id: str
-    requested_count: int
-    generated_count: int = 0
-    stored_count: int = 0
-    duplicate_count: int = 0
-    invalid_count: int = 0
-    seed_count: int = 0
-    failed_reason_summary: dict[str, int] = field(default_factory=dict)
-    molecule_ids: list[str] = field(default_factory=list)
-    strategy_summaries: dict[str, StrategyGenerationSummary] = field(default_factory=dict)
-    adapter_mode: str = TOOLCHAIN_MODE
-    tool_status: dict[str, Any] = field(default_factory=dict)
-    warnings: list[str] = field(default_factory=list)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "agent_run_id": self.agent_run_id,
-            "requested_count": self.requested_count,
-            "generated_count": self.generated_count,
-            "stored_count": self.stored_count,
-            "duplicate_count": self.duplicate_count,
-            "invalid_count": self.invalid_count,
-            "seed_count": self.seed_count,
-            "failed_reason_summary": self.failed_reason_summary,
-            "molecule_ids": self.molecule_ids,
-            "strategy_summaries": {
-                strategy: summary.as_dict()
-                for strategy, summary in self.strategy_summaries.items()
-            },
-            "adapter_mode": self.adapter_mode,
-            "tool_status": self.tool_status,
-            "warnings": self.warnings,
-            "execution_summary": _generation_execution_summary(self),
-        }
 
 
 class RdkitScoredReinvent4Strategy:
@@ -489,179 +405,6 @@ STRATEGY_ADAPTERS = {
 }
 
 
-def generate_project_molecules(
-    db: Session,
-    project: Project,
-    generation_size: int,
-    strategies: list[str] | None = None,
-    strategy_counts: dict[str, int] | None = None,
-    constraints: dict[str, Any] | None = None,
-    include_target_library_seeds: bool = True,
-    agent_run_name: str = GENERATOR_AGENT_NAME,
-) -> dict[str, Any]:
-    selected_strategies = _normalize_strategies(strategies)
-    requested_by_strategy = _resolve_strategy_counts(
-        generation_size,
-        selected_strategies,
-        strategy_counts,
-    )
-    selected_strategies = [
-        strategy for strategy in selected_strategies if requested_by_strategy.get(strategy, 0) > 0
-    ]
-    generation_size = sum(requested_by_strategy[strategy] for strategy in selected_strategies)
-    normalized_constraints = constraints or {}
-    tool_status = generation_tool_status()
-    seeds = collect_generation_seed_smiles(
-        db,
-        project,
-        include_target_library_seeds=include_target_library_seeds,
-    )
-    if not seeds:
-        raise ValueError("generation_requires_at_least_one_seed_ligand")
-
-    agent_run = AgentRun(
-        agent_run_id=new_id("RUN"),
-        project_id=project.project_id,
-        agent_name=agent_run_name,
-        model_name="tool-adapter",
-        status="running",
-        input_json={
-            "project_id": project.project_id,
-            "generation_size": generation_size,
-            "strategies": selected_strategies,
-            "strategy_counts": requested_by_strategy,
-            "constraints": normalized_constraints,
-            "seed_count": len(seeds),
-            "include_target_library_seeds": include_target_library_seeds,
-            "tool_status": tool_status,
-        },
-        output_json={},
-    )
-    db.add(agent_run)
-    db.flush()
-
-    summary = MoleculeGenerationSummary(
-        agent_run_id=agent_run.agent_run_id,
-        requested_count=generation_size,
-        seed_count=len(seeds),
-        strategy_summaries={
-            strategy: StrategyGenerationSummary(
-                requested_count=requested_by_strategy[strategy],
-                seed_count=len(seeds),
-            )
-            for strategy in selected_strategies
-        },
-        tool_status=tool_status,
-    )
-    existing_smiles = {
-        _standardize_or_normalize_smiles(row[0])
-        for row in db.query(Molecule.smiles).filter_by(project_id=project.project_id).all()
-    }
-    seen_in_batch: set[str] = set()
-
-    for strategy_name in selected_strategies:
-        strategy_summary = summary.strategy_summaries[strategy_name]
-        batch = STRATEGY_ADAPTERS[strategy_name].generate(
-            seeds=seeds,
-            requested_count=requested_by_strategy[strategy_name],
-            constraints=normalized_constraints,
-        )
-        strategy_summary.adapter_mode = batch.adapter_mode
-        strategy_summary.tool_status = batch.tool_status
-        strategy_summary.warnings = batch.warnings
-        strategy_summary.candidate_source_counts = batch.candidate_source_counts
-        strategy_summary.provenance = batch.provenance
-        strategy_summary.execution_mode = batch.execution_mode
-        strategy_summary.external_tools_requested = batch.external_tools_requested
-        strategy_summary.external_tool_used = batch.external_tool_used
-        strategy_summary.surrogate_used = batch.surrogate_used
-        strategy_summary.fallback_used = batch.fallback_used
-        strategy_summary.proposed_count = len(batch.candidates)
-        summary.generated_count += len(batch.candidates)
-        summary.warnings.extend(
-            warning for warning in batch.warnings if warning not in summary.warnings
-        )
-
-        for candidate in batch.candidates:
-            normalized_smiles = _standardize_or_normalize_smiles(candidate.smiles)
-            if not is_lightly_valid_smiles(normalized_smiles):
-                _count_failure(summary, strategy_summary, "invalid_smiles")
-                continue
-            if normalized_smiles in existing_smiles or normalized_smiles in seen_in_batch:
-                _count_failure(summary, strategy_summary, "duplicate")
-                continue
-
-            molecule = Molecule(
-                molecule_id=new_id("MOL"),
-                project_id=project.project_id,
-                smiles=normalized_smiles,
-                inchi_key=None,
-                scaffold=None,
-                source_agent=f"{GENERATOR_AGENT_NAME}:{strategy_name}",
-                status="generated",
-                labels=_merge_labels(
-                    [
-                        "generated",
-                        "candidate_generated",
-                        "requires_structure_validation",
-                        f"generator_strategy_{strategy_name}",
-                        f"generation_execution_{batch.execution_mode}",
-                    ],
-                    list(candidate.labels),
-                ),
-            )
-            db.add(molecule)
-            db.flush()
-
-            existing_smiles.add(normalized_smiles)
-            seen_in_batch.add(normalized_smiles)
-            summary.stored_count += 1
-            summary.molecule_ids.append(molecule.molecule_id)
-            strategy_summary.stored_count += 1
-            strategy_summary.molecule_ids.append(molecule.molecule_id)
-
-    agent_run.status = "success"
-    agent_run.output_json = {
-        **summary.as_dict(),
-        "toolchain_mode": TOOLCHAIN_MODE,
-        "execution_summary": _generation_execution_summary(summary),
-        "external_adapters_connected": {
-            "reinvent4": bool(tool_status["reinvent4"]["available"]),
-            "crem_database": bool(tool_status["crem"]["database_available"]),
-            "autogrow4": bool(tool_status["autogrow4"]["available"]),
-        },
-    }
-    project.status = "molecules_generated"
-    db.commit()
-    return summary.as_dict()
-
-
-def _generation_execution_summary(summary: MoleculeGenerationSummary) -> dict[str, Any]:
-    strategy_modes = {
-        strategy: {
-            "adapter_mode": item.adapter_mode,
-            "execution_mode": item.execution_mode,
-            "external_tool_used": item.external_tool_used,
-            "surrogate_used": item.surrogate_used,
-            "fallback_used": item.fallback_used,
-            "stored_count": item.stored_count,
-        }
-        for strategy, item in summary.strategy_summaries.items()
-    }
-    return {
-        "has_external_tool_results": any(
-            item.external_tool_used for item in summary.strategy_summaries.values()
-        ),
-        "has_surrogate_results": any(
-            item.surrogate_used for item in summary.strategy_summaries.values()
-        ),
-        "fallback_used": any(
-            item.fallback_used for item in summary.strategy_summaries.values()
-        ),
-        "strategy_modes": strategy_modes,
-    }
-
-
 def collect_generation_seed_smiles(
     db: Session,
     project: Project,
@@ -859,51 +602,6 @@ def _select_candidates(
             return candidates
 
     return candidates
-
-
-def _normalize_strategies(strategies: list[str] | None) -> list[str]:
-    if not strategies:
-        return list(GENERATION_STRATEGIES)
-
-    normalized = []
-    for strategy in strategies:
-        value = strategy.lower().strip()
-        if value not in STRATEGY_ADAPTERS:
-            raise ValueError(f"unsupported_generation_strategy:{strategy}")
-        if value not in normalized:
-            normalized.append(value)
-    if not normalized:
-        raise ValueError("generation_requires_at_least_one_strategy")
-    return normalized
-
-
-def _split_generation_size(generation_size: int, strategies: list[str]) -> dict[str, int]:
-    base_count, remainder = divmod(generation_size, len(strategies))
-    return {
-        strategy: base_count + (1 if index < remainder else 0)
-        for index, strategy in enumerate(strategies)
-    }
-
-
-def _resolve_strategy_counts(
-    generation_size: int,
-    strategies: list[str],
-    strategy_counts: dict[str, int] | None,
-) -> dict[str, int]:
-    if not strategies:
-        return {}
-    if not strategy_counts:
-        return _split_generation_size(generation_size, strategies)
-
-    resolved: dict[str, int] = {}
-    for strategy in strategies:
-        value = strategy_counts.get(strategy, 0)
-        try:
-            count = int(value)
-        except (TypeError, ValueError):
-            count = 0
-        resolved[strategy] = max(0, min(count, 500))
-    return resolved
 
 
 def _unique_valid_smiles(smiles_values: Iterable[str | None]) -> list[str]:
@@ -1134,20 +832,6 @@ def _rotate(items: list[str], offset: int) -> list[str]:
         return []
     shift = offset % len(items)
     return [*items[shift:], *items[:shift]]
-
-
-def _count_failure(
-    summary: MoleculeGenerationSummary,
-    strategy_summary: StrategyGenerationSummary,
-    reason: str,
-) -> None:
-    summary.failed_reason_summary[reason] = summary.failed_reason_summary.get(reason, 0) + 1
-    if reason == "invalid_smiles":
-        summary.invalid_count += 1
-        strategy_summary.invalid_count += 1
-    elif reason == "duplicate":
-        summary.duplicate_count += 1
-        strategy_summary.duplicate_count += 1
 
 
 def _candidate_tool_labels(

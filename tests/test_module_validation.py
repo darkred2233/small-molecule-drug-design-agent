@@ -6,14 +6,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
-def test_pipeline_tasks_direct():
-    """Test pipeline tasks module."""
-    with open("src/medagent/pipeline/tasks.py", encoding="utf-8") as f:
-        content = f.read()
-        assert "TASK_REGISTRY" in content
-        assert "TASK_CONFIGS" in content
-        assert "knowledge_ingestion_task" in content
-    print("✓ Pipeline tasks.py: all expected functions present")
+def test_round_orchestrator_direct():
+    """Test the current round orchestration entry point."""
+    from medagent.pipeline import RoundOrchestrator
+
+    for method in (
+        "create_round_draft",
+        "start_round",
+        "run_round_assessment",
+        "run_round_ranking",
+        "run_round",
+    ):
+        assert callable(getattr(RoundOrchestrator, method, None))
+    print("✓ RoundOrchestrator: all expected lifecycle methods present")
 
 
 def test_pipeline_recovery_direct():
@@ -79,7 +84,7 @@ def main():
     print("Running direct module tests...")
     print("=" * 60)
     try:
-        test_pipeline_tasks_direct()
+        test_round_orchestrator_direct()
         test_pipeline_recovery_direct()
         test_reporting_cards_direct()
         test_reporting_tables_direct()
@@ -91,7 +96,7 @@ def main():
         print("✓ All modules created successfully!")
         print()
         print("Summary:")
-        print("  - pipeline/tasks.py ✓")
+        print("  - pipeline/round_orchestrator.py ✓")
         print("  - pipeline/recovery.py ✓")
         print("  - reporting/cards.py ✓")
         print("  - reporting/tables.py ✓")

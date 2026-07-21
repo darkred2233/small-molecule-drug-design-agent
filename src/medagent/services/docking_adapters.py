@@ -104,8 +104,6 @@ def select_docking_tool(
         and _has_vina_prepared_pair(request)
     ):
         return "vina"
-    if tool_status.get("diffdock", {}).get("available"):
-        return "diffdock"
     return None
 
 

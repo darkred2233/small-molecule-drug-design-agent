@@ -1,14 +1,12 @@
 import { useState, useRef, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { chatApi, projectsApi, assessmentApi } from '@/api';
+import { chatApi, assessmentApi } from '@/api';
 import { useWorkspaceStore } from '@/state/workspaceStore';
 import { Bot, Sparkles } from 'lucide-react';
-import AgentControlPanel from './AgentControlPanel';
 import ChatComposer from './ChatComposer';
 import ConstraintChips from './ConstraintChips';
 import { cn } from '@/utils/helpers';
-import type { RunPlan, RunPlanChange } from '@/types/api';
 
 export default function ChatPanel() {
   const { projectId } = useParams();
@@ -17,34 +15,12 @@ export default function ChatPanel() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const [messages, setMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; intent?: string }>>([]);
-  const [draftRunPlan, setDraftRunPlan] = useState<RunPlan | null>(null);
-  const [latestPlanDiff, setLatestPlanDiff] = useState<RunPlanChange[]>([]);
   const [latestPlanWarnings, setLatestPlanWarnings] = useState<string[]>([]);
 
   const { data: constraints } = useQuery({
     queryKey: ['constraints', projectId],
     queryFn: () => assessmentApi.getConstraints(projectId!),
     enabled: !!projectId,
-  });
-
-  const { data: runPlan } = useQuery({
-    queryKey: ['run-plan', projectId],
-    queryFn: () => projectsApi.getRunPlan(projectId!),
-    enabled: !!projectId,
-  });
-
-  useEffect(() => {
-    if (runPlan) {
-      setDraftRunPlan(runPlan);
-    }
-  }, [runPlan, projectId]);
-
-  const saveRunPlan = useMutation({
-    mutationFn: (nextRunPlan: RunPlan) => projectsApi.saveRunPlan(projectId!, nextRunPlan),
-    onSuccess: (nextRunPlan) => {
-      queryClient.setQueryData(['run-plan', projectId], nextRunPlan);
-      setDraftRunPlan(nextRunPlan);
-    },
   });
 
   const sendMessage = useMutation({
@@ -58,30 +34,8 @@ export default function ChatPanel() {
       if (response.created_constraints && response.created_constraints.length > 0) {
         queryClient.invalidateQueries({ queryKey: ['constraints', projectId] });
       }
-      if (response.run_plan) {
-        queryClient.setQueryData(['run-plan', projectId], response.run_plan);
-        setDraftRunPlan(response.run_plan);
-      }
-      setLatestPlanDiff(response.plan_diff ?? []);
       setLatestPlanWarnings(response.warnings ?? []);
       scrollToBottom();
-    },
-  });
-
-  const runPipeline = useMutation({
-    mutationFn: async (nextRunPlan: RunPlan | null) => {
-      if (nextRunPlan) {
-        await projectsApi.saveRunPlan(projectId!, nextRunPlan);
-      }
-      return projectsApi.run(projectId!, 'iterative');
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['project-status', projectId] });
-      queryClient.invalidateQueries({ queryKey: ['run-plan', projectId] });
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: '已启动 iterative agent 流程，右侧会显示当前轮执行状态。' },
-      ]);
     },
   });
 
@@ -94,24 +48,8 @@ export default function ChatPanel() {
   }, [messages]);
 
   useEffect(() => {
-    setLatestPlanDiff([]);
     setLatestPlanWarnings([]);
   }, [projectId]);
-
-  const handleRunPlanChange = (nextRunPlan: RunPlan) => {
-    setDraftRunPlan(nextRunPlan);
-    queryClient.setQueryData(['run-plan', projectId], nextRunPlan);
-  };
-
-  const handleSaveRunPlan = () => {
-    if (draftRunPlan) {
-      saveRunPlan.mutate(draftRunPlan);
-    }
-  };
-
-  const handleRunIterative = () => {
-    runPipeline.mutate(draftRunPlan);
-  };
 
   const handleSend = (message: string) => {
     sendMessage.mutate(message);
@@ -149,20 +87,14 @@ export default function ChatPanel() {
           </span>
         </div>
 
-        <AgentControlPanel
-          runPlan={draftRunPlan}
-          planDiff={latestPlanDiff}
-          warnings={latestPlanWarnings}
-          isSaving={saveRunPlan.isPending}
-          isRunning={runPipeline.isPending}
-          onChange={handleRunPlanChange}
-          onSave={handleSaveRunPlan}
-          onRun={handleRunIterative}
-        />
-
         {constraints && constraints.length > 0 && (
           <div className="mt-3">
             <ConstraintChips constraints={constraints} />
+          </div>
+        )}
+        {latestPlanWarnings.length > 0 && (
+          <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            {latestPlanWarnings.join(' ')}
           </div>
         )}
       </div>

@@ -13,13 +13,6 @@ tools:
     command: chemprop
     docker_image: chemprop:latest
     timeout_seconds: 300
-  diffdock:
-    docker_image: diffdock:latest
-    timeout_seconds: 900
-    gpu_recommended: true
-    model_env:
-      - DIFFDOCK_MODEL_DIR
-      - DIFFDOCK_CONFIDENCE_MODEL_DIR
   reinvent4:
     command: reinvent
     docker_image: reinvent4:latest
