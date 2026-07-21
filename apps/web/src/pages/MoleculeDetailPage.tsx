@@ -1,376 +1,43 @@
-/**
- * Molecule Detail Page
- *
- * Detailed view of a single molecule with all assessment results
- */
-
-import { useParams, Link } from 'react-router-dom';
+import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { assessmentApi, moleculesApi } from '@/api';
-import { API_BASE_URL } from '@/api/client';
-import { ArrowLeft, BookOpen, Copy, Crosshair, Download, FlaskConical, Route } from 'lucide-react';
-import { formatNumber, getStatusColor, copyToClipboard } from '@/utils/helpers';
-import MoleculeStructure from '@/components/MoleculeStructure';
-import DecisionCard from '@/components/DecisionCard';
-import ReasoningTracePanel from '@/components/ReasoningTracePanel';
-import { cn } from '@/utils/helpers';
-import type { DockingResult, EvidenceLink, SynthesisRoute } from '@/types/api';
+import { Activity, BookOpenText, Box, FlaskConical, GitBranch, ShieldCheck } from 'lucide-react';
+import { Link, useParams } from 'react-router-dom';
+import { dataApi, moleculesApi } from '@/api';
+import { MoleculeThumbnail } from '@/components/MoleculeThumbnail';
+import { PoseViewer } from '@/components/PoseViewer';
+import { StatusBadge } from '@/components/StatusBadge';
+import { formatNumber, methodLabel } from '@/lib/format';
+import type { DockingResult, EvidenceLink, Molecule, MoleculeNarrative, MoleculeProperties } from '@/types/workbench';
 
-export default function MoleculeDetailPage() {
+type Tab = 'overview' | 'pose' | 'evidence' | 'provenance' | 'narrative';
+
+function JsonRows({ value }: { value: Record<string, unknown> | undefined }) {
+  const items = Object.entries(value || {});
+  return items.length ? <div className="table-scroll"><table className="data-table"><tbody>{items.map(([key, item]) => <tr key={key}><th style={{ width: '38%' }}>{key}</th><td className="mono" style={{ whiteSpace: 'pre-wrap' }}>{typeof item === 'string' ? item : JSON.stringify(item)}</td></tr>)}</tbody></table></div> : <div className="subtle">未保存额外来源信息。</div>;
+}
+
+export function MoleculeDetailPage() {
   const { projectId, moleculeId } = useParams();
+  const [tab, setTab] = useState<Tab>('overview');
+  const enabled = Boolean(projectId && moleculeId);
+  const { data: molecule, error } = useQuery<Molecule, Error>({ queryKey: ['molecule', projectId, moleculeId], queryFn: () => moleculesApi.get(projectId!, moleculeId!), enabled });
+  const { data: properties } = useQuery<MoleculeProperties, Error>({ queryKey: ['molecule-properties', projectId, moleculeId], queryFn: () => moleculesApi.properties(projectId!, moleculeId!), enabled, retry: false });
+  const { data: dockings = [] } = useQuery<DockingResult[], Error>({ queryKey: ['molecule-docking', projectId, molecule?.round_id], queryFn: () => moleculesApi.docking(projectId!, molecule?.round_id || undefined), enabled: Boolean(projectId && molecule) });
+  const { data: evidence = [] } = useQuery<EvidenceLink[], Error>({ queryKey: ['evidence', projectId], queryFn: () => dataApi.evidence(projectId!), enabled: Boolean(projectId) });
+  const { data: narrative } = useQuery<MoleculeNarrative, Error>({ queryKey: ['molecule-narrative', projectId, moleculeId], queryFn: () => moleculesApi.narrative(projectId!, moleculeId!), enabled, retry: false });
+  const docking = useMemo(() => dockings.find((item) => item.molecule_id === moleculeId), [dockings, moleculeId]);
+  const moleculeEvidence = evidence.filter((item) => item.molecule_id === moleculeId && Boolean(item.document_title || item.source || item.content));
+  const tabs: Array<[Tab, string]> = [['overview', '概览'], ['pose', '最佳对接构象'], ['evidence', '文献证据'], ['provenance', '来源谱系'], ['narrative', '中文评价']];
 
-  const { data: molecule } = useQuery({
-    queryKey: ['molecule', projectId, moleculeId],
-    queryFn: () => moleculesApi.get(projectId!, moleculeId!),
-  });
-
-  const { data: properties } = useQuery({
-    queryKey: ['molecule-properties', projectId, moleculeId],
-    queryFn: () => moleculesApi.getProperties(projectId!, moleculeId!),
-    enabled: !!molecule,
-  });
-
-  const { data: decisionCards } = useQuery({
-    queryKey: ['decision-cards', projectId, moleculeId],
-    queryFn: () => moleculesApi.getDecisionCards(projectId!, moleculeId!),
-    enabled: !!molecule,
-  });
-
-  const { data: synthesisRoutes } = useQuery({
-    queryKey: ['synthesis-routes', projectId],
-    queryFn: () => assessmentApi.getSynthesisRoutes(projectId!),
-    enabled: !!molecule,
-  });
-
-  const { data: dockingResults } = useQuery({
-    queryKey: ['docking-results', projectId],
-    queryFn: () => assessmentApi.getDockingResults(projectId!),
-    enabled: !!molecule,
-  });
-
-  const { data: evidenceLinks } = useQuery({
-    queryKey: ['evidence-links', projectId],
-    queryFn: () => assessmentApi.getEvidenceLinks(projectId!),
-    enabled: !!molecule,
-  });
-
-  if (!molecule) {
-    return (
-      <div className="app-shell flex h-screen items-center justify-center">
-        <div className="text-slate-500">加载中...</div>
-      </div>
-    );
-  }
-
-  const rotatableBonds =
-    properties?.tool_metadata?.rotatable_bond_count ??
-    properties?.tool_metadata?.rotatable_bonds ??
-    properties?.tool_metadata?.RotB;
-  const qed = properties?.tool_metadata?.qed ?? properties?.tool_metadata?.QED;
-  const synthesisRoute = synthesisRoutes?.find((route) => route.molecule_id === molecule.molecule_id);
-  const dockingResult = dockingResults?.find((result) => result.molecule_id === molecule.molecule_id);
-  const moleculeEvidence = evidenceLinks?.filter((link) => link.molecule_id === molecule.molecule_id) ?? [];
-
-  const handleCopySmiles = () => {
-    copyToClipboard(molecule.smiles);
-  };
-
-  return (
-    <div className="app-shell h-screen overflow-y-auto">
-      <div className="sticky top-0 z-10 border-b border-cyan-100 bg-white/95 backdrop-blur">
-        <div className="mx-auto max-w-7xl px-6 py-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex min-w-0 items-center gap-4">
-              <Link
-                to={`/workspace/${projectId}`}
-                className="inline-flex items-center gap-2 text-sm text-slate-600 hover:text-cyan-800"
-              >
-                <ArrowLeft className="h-4 w-4" />
-                返回
-              </Link>
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <FlaskConical className="h-5 w-5 text-cyan-600" />
-                  <h1 className="truncate text-xl font-semibold text-slate-950">{molecule.molecule_id}</h1>
-                </div>
-                <div className="mt-1 flex flex-wrap items-center gap-2">
-                  <span className={cn('rounded-full px-2.5 py-1 text-xs font-medium', getStatusColor(molecule.status))}>
-                    {molecule.status}
-                  </span>
-                  {molecule.source_agent && (
-                    <span className="text-sm text-slate-500">来源: {molecule.source_agent}</span>
-                  )}
-                </div>
-              </div>
-            </div>
-            <Link
-              to={`/workspace/${projectId}/report`}
-              className="inline-flex items-center gap-2 rounded-md bg-cyan-600 px-4 py-2 text-sm font-medium text-white shadow-sm shadow-cyan-900/20 hover:bg-cyan-700"
-            >
-              <Download className="h-4 w-4" />
-              查看报告
-            </Link>
-          </div>
-        </div>
-      </div>
-
-      <main className="mx-auto max-w-7xl px-6 py-6">
-        <div className="grid gap-6 xl:grid-cols-[20rem_minmax(0,1fr)_24rem]">
-          <div className="space-y-6">
-            <div className="science-card">
-              <h2 className="mb-3 text-sm font-semibold text-slate-950">分子结构</h2>
-              <MoleculeStructure smiles={molecule.smiles} width={300} height={300} />
-            </div>
-
-            <div className="science-card">
-              <div className="mb-2 flex items-center justify-between">
-                <h2 className="text-sm font-semibold text-slate-950">SMILES</h2>
-                <button
-                  onClick={handleCopySmiles}
-                  className="rounded-md p-1 text-slate-400 hover:bg-cyan-50 hover:text-cyan-700"
-                  title="复制"
-                >
-                  <Copy className="h-4 w-4" />
-                </button>
-              </div>
-              <code className="block break-all rounded-lg border border-cyan-100 bg-cyan-50/50 p-3 text-xs leading-5 text-slate-700">
-                {molecule.smiles}
-              </code>
-            </div>
-
-            {molecule.scaffold && (
-              <div className="science-card">
-                <h2 className="mb-2 text-sm font-semibold text-slate-950">骨架</h2>
-                <p className="break-all text-sm leading-6 text-slate-700">{molecule.scaffold}</p>
-              </div>
-            )}
-          </div>
-
-          <div className="space-y-6">
-            {properties && (
-              <div className="science-card">
-                <h2 className="mb-3 text-sm font-semibold text-slate-950">物化性质</h2>
-                <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-3">
-                  <Property label="MW" value={formatNumber(properties.mw)} />
-                  <Property label="LogP" value={formatNumber(properties.logp)} />
-                  <Property label="TPSA" value={formatNumber(properties.tpsa)} />
-                  <Property label="HBD" value={properties.hbd ?? '-'} />
-                  <Property label="HBA" value={properties.hba ?? '-'} />
-                  <Property label="RotB" value={rotatableBonds ?? '-'} />
-                  <Property label="QED" value={qed == null ? '-' : formatNumber(Number(qed), 3)} />
-                  <Property label="SA Score" value={formatNumber(properties.sa_score)} />
-                </div>
-              </div>
-            )}
-
-            {decisionCards && decisionCards.length > 0 && (
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-sm font-semibold text-slate-950">决策卡片</h2>
-                  <span className="chem-badge">{decisionCards.length} 张</span>
-                </div>
-                {decisionCards.map((card) => (
-                  <DecisionCard key={card.decision_id} card={card} />
-                ))}
-              </div>
-            )}
-
-            {dockingResult && (
-              <BestPosePanel projectId={projectId!} moleculeId={molecule.molecule_id} result={dockingResult} />
-            )}
-
-            {moleculeEvidence.length > 0 && <EvidencePanel evidenceLinks={moleculeEvidence} />}
-
-            {synthesisRoute && <SynthesisRoutePanel route={synthesisRoute} />}
-          </div>
-
-          <div>
-            <ReasoningTracePanel projectId={projectId!} moleculeId={moleculeId!} />
-          </div>
-        </div>
-      </main>
-    </div>
-  );
-}
-
-function BestPosePanel({
-  projectId,
-  moleculeId,
-  result,
-}: {
-  projectId: string;
-  moleculeId: string;
-  result: DockingResult;
-}) {
-  const rawOutput = result.raw_output ?? {};
-  const poseUrl = `${API_BASE_URL}/projects/${encodeURIComponent(projectId)}/molecules/${encodeURIComponent(
-    moleculeId
-  )}/docking/pose`;
-
-  return (
-    <div className="science-card">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <Crosshair className="h-4 w-4 text-cyan-700" />
-          <h2 className="text-sm font-semibold text-slate-950">最佳 Pose</h2>
-        </div>
-        {result.pose_file && (
-          <a
-            href={poseUrl}
-            className="inline-flex items-center gap-1 rounded-md border border-cyan-200 px-2.5 py-1 text-xs font-medium text-cyan-800 hover:bg-cyan-50"
-          >
-            <Download className="h-3.5 w-3.5" />
-            Pose
-          </a>
-        )}
-      </div>
-
-      <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-3">
-        <Property label="Vina" value={formatNumber(result.vina_score ?? result.docking_score ?? null)} />
-        <Property label="CNN" value={formatNumber(result.cnn_score ?? null, 3)} />
-        <Property label="DiffDock" value={formatNumber(result.diffdock_confidence ?? null, 3)} />
-        <Property label="H-bonds" value={result.key_hbond_count ?? '-'} />
-        <Property label="Clashes" value={result.clash_count ?? '-'} />
-        <Property label="Pose Rank" value={rawOutput.selected_pose_rank ?? '-'} />
-      </div>
-
-      <div className="mt-3 grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
-        {rawOutput.pose_count !== undefined && <div>Pose 数量：{String(rawOutput.pose_count)}</div>}
-        {rawOutput.pose_selection_method && <div>选择方式：{String(rawOutput.pose_selection_method)}</div>}
-        {rawOutput.best_pose_confirmed !== undefined && (
-          <div>确认状态：{rawOutput.best_pose_confirmed ? '已确认' : '未确认'}</div>
-        )}
-        {result.labels && result.labels.length > 0 && <div>标签：{result.labels.join(', ')}</div>}
-      </div>
-    </div>
-  );
-}
-
-function EvidencePanel({ evidenceLinks }: { evidenceLinks: EvidenceLink[] }) {
-  return (
-    <div className="science-card">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <BookOpen className="h-4 w-4 text-cyan-700" />
-          <h2 className="text-sm font-semibold text-slate-950">文献证据</h2>
-        </div>
-        <span className="chem-badge">{evidenceLinks.length} 条</span>
-      </div>
-
-      <div className="space-y-3">
-        {evidenceLinks.slice(0, 6).map((evidence) => (
-          <div key={evidence.evidence_id} className="rounded-lg border border-cyan-100 bg-cyan-50/40 p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="text-xs font-semibold text-cyan-900">
-                {evidence.document_title || evidence.claim_type}
-              </div>
-              {evidence.confidence != null && (
-                <span className="rounded-full bg-white px-2 py-0.5 text-[11px] text-slate-600">
-                  conf {formatNumber(evidence.confidence, 2)}
-                </span>
-              )}
-            </div>
-            {(evidence.source || evidence.section || evidence.page_number != null) && (
-              <div className="mt-1 text-[11px] text-slate-500">
-                {[evidence.source, evidence.section, evidence.page_number != null ? `p.${evidence.page_number}` : '']
-                  .filter(Boolean)
-                  .join(' · ')}
-              </div>
-            )}
-            {evidence.rationale && (
-              <p className="mt-2 text-xs leading-5 text-slate-700">{evidence.rationale}</p>
-            )}
-            {evidence.content && (
-              <p className="mt-2 max-h-28 overflow-y-auto rounded border border-white bg-white/80 p-2 text-xs leading-5 text-slate-600">
-                {evidence.content}
-              </p>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function SynthesisRoutePanel({ route }: { route: SynthesisRoute }) {
-  const routeJson = route.route_json ?? {};
-  const plan = routeJson.route_plan ?? [];
-  const risks = routeJson.route_risks ?? [];
-  const startingMaterials = routeJson.starting_materials ?? [];
-
-  return (
-    <div className="science-card">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <Route className="h-4 w-4 text-cyan-700" />
-          <h2 className="text-sm font-semibold text-slate-950">合成路线</h2>
-        </div>
-        <span
-          className={cn(
-            'rounded-full border px-2.5 py-1 text-xs font-medium',
-            route.route_found
-              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-              : 'border-rose-200 bg-rose-50 text-rose-700'
-          )}
-        >
-          {route.route_found ? '可合成' : '需重设'}
-        </span>
-      </div>
-
-      <div className="grid grid-cols-3 gap-3 text-sm">
-        <Property label="Steps" value={route.route_steps ?? '-'} />
-        <Property label="Confidence" value={formatNumber(route.route_confidence, 3)} />
-        <Property label="Blocks" value={route.buyable_building_blocks ?? '-'} />
-      </div>
-
-      {routeJson.route_summary && (
-        <p className="mt-3 rounded-lg border border-cyan-100 bg-cyan-50/50 p-3 text-sm leading-6 text-slate-700">
-          {routeJson.route_summary}
-        </p>
-      )}
-
-      {startingMaterials.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-1">
-          {startingMaterials.map((material: string) => (
-            <span key={material} className="rounded-md bg-cyan-50 px-2 py-0.5 text-[11px] text-cyan-800">
-              {material}
-            </span>
-          ))}
-        </div>
-      )}
-
-      {plan.length > 0 && (
-        <div className="mt-4 space-y-2">
-          {plan.map((step) => (
-            <div key={step.step} className="rounded-lg border border-cyan-100 bg-white p-3">
-              <div className="text-xs font-semibold text-cyan-900">
-                Step {step.step}: {step.stage}
-              </div>
-              <div className="mt-1 text-xs leading-5 text-slate-600">{step.operation}</div>
-              <div className="mt-1 text-[11px] text-slate-500">输出: {step.output}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {risks.length > 0 && (
-        <div className="mt-4 space-y-1 rounded-lg border border-amber-100 bg-amber-50/60 p-3 text-xs leading-5 text-amber-800">
-          {risks.map((risk: string) => (
-            <div key={risk}>风险: {risk}</div>
-          ))}
-        </div>
-      )}
-
-      {routeJson.route_note && <p className="mt-3 text-xs leading-5 text-slate-500">{routeJson.route_note}</p>}
-    </div>
-  );
-}
-
-function Property({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="rounded-lg border border-cyan-100 bg-cyan-50/40 p-3">
-      <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</div>
-      <div className="mt-1 font-semibold text-slate-950">{value}</div>
-    </div>
-  );
+  if (error) return <div className="page"><div className="notice notice-danger">{error instanceof Error ? error.message : '无法读取分子详情。'}</div></div>;
+  if (!molecule) return <div className="page"><div className="empty-state">正在载入分子详情…</div></div>;
+  return <div className="page"><div className="page-heading"><div className="row"><MoleculeThumbnail smiles={molecule.smiles} className="structure-large" /><div><p className="eyebrow">候选分子</p><h1 className="mono">{molecule.molecule_id}</h1><p className="subtle">{methodLabel(molecule.generation_method || molecule.source_agent)} · {molecule.round_id ? `第 ${molecule.round_id} 轮来源` : 'Seed 来源'}</p></div></div><div className="row"><StatusBadge status={molecule.status} /><Link className="button" to={`/projects/${projectId}/rounds/${molecule.round_id}/ranking`}>返回排名</Link></div></div>
+    <div className="metric-grid"><div className="metric"><div className="metric-label">分子量</div><div className="metric-value">{formatNumber(properties?.mw, 1)}</div><div className="metric-note">MW</div></div><div className="metric"><div className="metric-label">LogP</div><div className="metric-value">{formatNumber(properties?.logp, 2)}</div><div className="metric-note">理化性质</div></div><div className="metric"><div className="metric-label">Docking</div><div className="metric-value">{formatNumber(docking?.vina_score ?? docking?.docking_score, 2)}</div><div className="metric-note">GNINA / Vina</div></div><div className="metric"><div className="metric-label">最佳 Pose</div><div className="metric-value">{docking?.pose_artifact_available || docking?.pose_file ? '可用' : '未保存'}</div><div className="metric-note">真实构象文件状态</div></div></div>
+    <div className="tab-list" style={{ marginTop: 20 }}>{tabs.map(([id, label]) => <button key={id} className={`tab ${tab === id ? 'tab-active' : ''}`} onClick={() => setTab(id)}>{label}</button>)}</div>
+    <div style={{ paddingTop: 18 }}>{tab === 'overview' && <div className="two-column"><section className="panel"><div className="panel-header"><div className="row"><FlaskConical size={17} color="#176451" /><h2>结构与理化性质</h2></div></div><div className="panel-body"><div className="field"><label>SMILES</label><textarea value={molecule.smiles} readOnly /></div><div className="table-scroll" style={{ marginTop: 14 }}><table className="data-table"><tbody>{[['TPSA', properties?.tpsa], ['HBD', properties?.hbd], ['HBA', properties?.hba], ['合成复杂度', properties?.sa_score]].map(([label, value]) => <tr key={String(label)}><th>{label}</th><td>{formatNumber(value as number | null | undefined, 2)}</td></tr>)}</tbody></table></div></div></section><section className="panel"><div className="panel-header"><div className="row"><Activity size={17} color="#176451" /><h2>对接与相互作用</h2></div></div><div className="panel-body stack"><div className="row" style={{ justifyContent: 'space-between' }}><span>Vina / docking score</span><strong>{formatNumber(docking?.vina_score ?? docking?.docking_score, 2)}</strong></div><div className="row" style={{ justifyContent: 'space-between' }}><span>CNN 分数</span><strong>{formatNumber(docking?.cnn_score, 3)}</strong></div><div className="row" style={{ justifyContent: 'space-between' }}><span>关键氢键</span><strong>{formatNumber(docking?.key_hbond_count, 0)}</strong></div><div className="row" style={{ justifyContent: 'space-between' }}><span>碰撞数</span><strong>{formatNumber(docking?.clash_count, 0)}</strong></div>{docking?.key_interactions?.length ? <div className="notice">{docking.key_interactions.join('；')}</div> : <div className="subtle">没有保存结构相互作用注释。</div>}</div></section></div>}
+      {tab === 'pose' && <div className="split-grid"><section className="panel"><div className="panel-header"><div className="row"><Box size={17} color="#176451" /><h2>最佳 Pose</h2></div><StatusBadge status={docking?.pose_artifact_available || docking?.pose_file ? 'completed' : 'pending'} /></div><div className="panel-body"><PoseViewer projectId={projectId!} moleculeId={moleculeId!} docking={docking} /></div></section><section className="panel"><div className="panel-header"><h2>构象选择依据</h2></div><div className="panel-body stack"><div className="row" style={{ justifyContent: 'space-between' }}><span>所选 Pose</span><strong>{docking?.selected_pose_rank ?? '未报告'}</strong></div><div className="row" style={{ justifyContent: 'space-between' }}><span>候选 Pose 数</span><strong>{docking?.pose_count ?? '未报告'}</strong></div><div className="row" style={{ justifyContent: 'space-between' }}><span>选择方法</span><strong>{docking?.pose_selection_method || '未记录'}</strong></div><div className="notice notice-warning">仅在后端保存真实构象文件时显示三维结果；没有 Pose 文件时页面不会以评分或推断替代三维构象。</div></div></section></div>}
+      {tab === 'evidence' && <section className="panel"><div className="panel-header"><div className="row"><BookOpenText size={17} color="#176451" /><h2>论文引用与证据</h2></div><span className="subtle" style={{ margin: 0 }}>仅展示可追溯至项目资料或文献索引的条目。</span></div><div className="panel-body">{moleculeEvidence.length ? moleculeEvidence.map((item) => <article key={item.evidence_id} className="citation"><div className="row-wrap"><span className="badge badge-neutral">{item.claim_type}</span><div className="citation-title">{item.document_title || '项目资料'}</div></div><div className="citation-meta">{item.source || '本地上传资料'}{item.page_number ? ` · 第 ${item.page_number} 页` : ''}{item.section ? ` · ${item.section}` : ''}</div>{item.rationale && <div className="citation-quote">{item.rationale}</div>}{item.content && <div className="citation-quote">{item.content}</div>}</article>) : <div className="empty-state"><BookOpenText size={30} /><div><strong>没有直接文献证据</strong><div>这不代表分子无效，只表示当前项目资料中没有与该分子建立可追溯的论文引用。上传并解析文献后可重新生成证据。</div></div></div>}</div></section>}
+      {tab === 'provenance' && <div className="two-column"><section className="panel"><div className="panel-header"><div className="row"><GitBranch size={17} color="#176451" /><h2>生成来源</h2></div></div><div className="panel-body stack"><div className="row" style={{ justifyContent: 'space-between' }}><span>生成方式</span><strong>{methodLabel(molecule.generation_method || molecule.source_agent)}</strong></div><div className="row" style={{ justifyContent: 'space-between' }}><span>Campaign</span><span className="mono">{molecule.campaign_run_id || '未记录'}</span></div><div className="row" style={{ justifyContent: 'space-between' }}><span>所在轮次</span><span className="mono">{molecule.round_id || '初始 Seed'}</span></div><div><div className="subtle">父分子</div><div className="row-wrap" style={{ marginTop: 5 }}>{molecule.parent_molecule_ids?.length ? molecule.parent_molecule_ids.map((id) => <span className="badge badge-neutral mono" key={id}>{id}</span>) : <span className="badge badge-neutral">初始 Seed</span>}</div></div></div></section><section className="panel"><div className="panel-header"><h2>Provenance 元数据</h2></div><div className="panel-body"><JsonRows value={molecule.provenance_json} /></div></section></div>}
+      {tab === 'narrative' && <section className="panel"><div className="panel-header"><div className="row"><ShieldCheck size={17} color="#176451" /><h2>Agent 中文评价</h2></div></div><div className="panel-body">{narrative ? <div className="section-stack"><p style={{ margin: 0, fontSize: 14, lineHeight: 1.75 }}>{narrative.summary}</p>{narrative.why_it_matters && <div className="notice">{narrative.why_it_matters}</div>}<div className="three-column"><div><h3>优势</h3><div className="stack" style={{ marginTop: 8 }}>{narrative.strengths.map((item, index) => <div className="subtle" key={index}>{item}</div>)}</div></div><div><h3>风险</h3><div className="stack" style={{ marginTop: 8 }}>{narrative.risks.map((item, index) => <div className="subtle" key={index}>{item}</div>)}</div></div><div><h3>下一轮建议</h3><div className="stack" style={{ marginTop: 8 }}>{narrative.next_round_suggestions.map((item, index) => <div className="subtle" key={index}>{item}</div>)}</div></div></div></div> : <div className="subtle">尚未生成该分子的中文评价。评价生成后会明确标注计算依据、文献证据和不确定性。</div>}</div></section>}</div>
+  </div>;
 }
