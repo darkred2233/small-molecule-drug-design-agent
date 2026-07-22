@@ -367,9 +367,7 @@ def _evidence_refs(candidate: dict[str, Any]) -> list[dict[str, Any]]:
                 "molecule_id": molecule_id,
                 "summary": _docking_ref_summary(docking),
                 "artifact_path": docking.get("pose_file"),
-                "score": docking.get("vina_score")
-                if docking.get("vina_score") is not None
-                else docking.get("diffdock_confidence"),
+                "score": docking.get("vina_score"),
                 "metadata": {
                     "selected_pose_rank": docking.get("selected_pose_rank"),
                     "pose_count": docking.get("pose_count"),
@@ -569,8 +567,6 @@ def _top_candidate_sentence(narratives: list[dict[str, Any]]) -> str:
 def _docking_ref_summary(docking: dict[str, Any]) -> str:
     if docking.get("vina_score") is not None:
         return f"Vina score {_format_number(docking.get('vina_score'), digits=2)}"
-    if docking.get("diffdock_confidence") is not None:
-        return f"DiffDock confidence {_format_number(docking.get('diffdock_confidence'), digits=2)}"
     return "存在 docking 结果。"
 
 

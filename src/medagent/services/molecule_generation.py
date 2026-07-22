@@ -53,129 +53,6 @@ class GenerationBatch:
     fallback_used: bool = False
 
 
-class RdkitScoredReinvent4Strategy:
-    name = "reinvent4"
-
-    def generate(
-        self,
-        seeds: list[str],
-        requested_count: int,
-        constraints: dict[str, Any],
-    ) -> GenerationBatch:
-        from medagent.services.reinvent4_adapter import (
-            Reinvent4Request,
-            run_reinvent4_generation,
-        )
-
-        tool_status = generation_tool_status()
-        reinvent4_status = tool_status["reinvent4"]
-        fallback_warnings: list[str] = []
-
-        # Try real REINVENT4 if available
-        if reinvent4_status.get("available"):
-            try:
-                import tempfile
-                with tempfile.TemporaryDirectory(prefix="reinvent4_gen_") as tmp_dir:
-                    request = Reinvent4Request(
-                        seed_smiles=seeds[:5],
-                        output_dir=tmp_dir,
-                        num_molecules=requested_count,
-                        timeout_seconds=int(
-                            reinvent4_status.get("configured_timeout_seconds") or 600
-                        ),
-                    )
-                    result = run_reinvent4_generation(request, reinvent4_status)
-                    fallback_warnings.extend(result.warnings)
-
-                    if result.success and result.generated_smiles:
-                        candidates = _external_generation_candidates(
-                            strategy=self.name,
-                            source="reinvent4_external_prior_sampling",
-                            generated_smiles=result.generated_smiles,
-                            scores=result.scores,
-                            seeds=seeds,
-                            constraints=constraints,
-                            rationale="REINVENT4 prior-model sampling",
-                            labels=result.labels,
-                            adapter_mode=result.adapter_mode,
-                            provenance=result.provenance,
-                        )
-                        if candidates:
-                            return GenerationBatch(
-                                candidates=candidates[:requested_count],
-                                adapter_mode=result.adapter_mode,
-                                tool_status=_strategy_tool_status(
-                                    tool_status, ["rdkit", "datamol", "reinvent4"]
-                                ),
-                                warnings=list(dict.fromkeys(result.warnings)),
-                                candidate_source_counts=_candidate_source_counts(candidates),
-                                provenance=result.provenance,
-                                execution_mode="external_tool",
-                                external_tools_requested=True,
-                                external_tool_used=True,
-                                surrogate_used=False,
-                                fallback_used=False,
-                            )
-                        fallback_warnings.append(
-                            "reinvent4_external_candidates_rejected_by_generation_constraints"
-                        )
-                    else:
-                        fallback_warnings.append(
-                            f"reinvent4_external_adapter_failed:{result.adapter_mode}"
-                        )
-            except Exception as exc:
-                fallback_warnings.append(
-                    f"reinvent4_external_adapter_exception:{type(exc).__name__}"
-                )
-        else:
-            fallback_warnings.append(
-                str(reinvent4_status.get("warning") or "reinvent4_external_adapter_not_installed")
-            )
-
-        # RDKit surrogate fallback
-        labels = _candidate_tool_labels(
-            tool_status,
-            external_pending_label="external_reinvent4_pending",
-        )
-        candidates = _generate_from_libraries(
-            strategy=self.name,
-            seeds=seeds,
-            requested_count=requested_count,
-            constraints=constraints,
-            aliphatic_library=_reinvent4_aliphatic_library(),
-            aromatic_library=_reinvent4_aromatic_library(),
-            rationale="REINVENT4-style optimization scored with RDKit/Datamol",
-            source_label="rdkit_scored_reinvent4_surrogate",
-            labels=labels,
-        )
-        return GenerationBatch(
-            candidates=candidates,
-            adapter_mode="rdkit_datamol_scored_reinvent4_surrogate",
-            tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "reinvent4"]),
-            warnings=list(
-                dict.fromkeys(
-                    fallback_warnings
-                    + (
-                        ["reinvent4_detected_but_rdkit_surrogate_adapter_used"]
-                        if tool_status["reinvent4"]["available"]
-                        else []
-                    )
-                )
-            ),
-            candidate_source_counts=_candidate_source_counts(candidates),
-            provenance={
-                "execution_mode": "surrogate_fallback",
-                "external_tool_status": reinvent4_status,
-                "fallback_toolchain": ["rdkit", "datamol"],
-            },
-            execution_mode="surrogate_fallback",
-            external_tools_requested=True,
-            external_tool_used=False,
-            surrogate_used=True,
-            fallback_used=True,
-        )
-
-
 class CremFragmentStrategy:
     name = "crem"
 
@@ -188,7 +65,7 @@ class CremFragmentStrategy:
         tool_status = generation_tool_status()
         candidates: list[GenerationCandidate] = []
         warnings: list[str] = []
-        adapter_mode = "rdkit_datamol_crem_fragment_surrogate"
+        adapter_mode = "crem_fragment_database"
 
         if tool_status["crem"]["database_available"]:
             try:
@@ -202,35 +79,10 @@ class CremFragmentStrategy:
             except Exception as exc:  # pragma: no cover - depends on external CReM DB.
                 warnings.append(f"crem_database_generation_failed:{type(exc).__name__}")
 
-        crem_candidate_count = len(candidates)
-        if len(candidates) < requested_count:
-            if not tool_status["crem"]["database_available"]:
-                warnings.append("crem_fragment_database_not_configured")
-            elif crem_candidate_count == 0:
-                warnings.append("crem_database_returned_no_candidates")
-            labels = _candidate_tool_labels(
-                tool_status,
-                external_pending_label="crem_fragment_database_pending",
-            )
-            candidates.extend(
-                _generate_from_libraries(
-                    strategy=self.name,
-                    seeds=seeds,
-                    requested_count=requested_count - len(candidates),
-                    constraints=constraints,
-                    aliphatic_library=_crem_aliphatic_library(),
-                    aromatic_library=_crem_aromatic_library(),
-                    rationale="CReM-style fragment replacement scored with RDKit/Datamol",
-                    source_label="rdkit_fragment_replacement_surrogate",
-                    labels=labels,
-                    excluded_smiles={candidate.smiles for candidate in candidates},
-                )
-            )
-            adapter_mode = (
-                "crem_fragment_database_with_rdkit_surrogate_fill"
-                if crem_candidate_count
-                else "rdkit_datamol_crem_fragment_surrogate"
-            )
+        if not tool_status["crem"]["database_available"]:
+            warnings.append("crem_fragment_database_not_configured")
+        elif not candidates:
+            warnings.append("crem_database_returned_no_candidates")
 
         return GenerationBatch(
             candidates=candidates[:requested_count],
@@ -238,36 +90,12 @@ class CremFragmentStrategy:
             tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "crem"]),
             warnings=warnings,
             candidate_source_counts=_candidate_source_counts(candidates),
-            provenance={
-                "execution_mode": (
-                    "native_tool"
-                    if adapter_mode == "crem_fragment_database"
-                    else (
-                        "mixed_native_surrogate"
-                        if adapter_mode == "crem_fragment_database_with_rdkit_surrogate_fill"
-                        else "surrogate_fallback"
-                    )
-                ),
-                "fallback_toolchain": ["rdkit", "datamol"]
-                if "surrogate" in adapter_mode
-                else [],
-            },
-            execution_mode=(
-                "native_tool"
-                if adapter_mode == "crem_fragment_database"
-                else (
-                    "mixed_native_surrogate"
-                    if adapter_mode == "crem_fragment_database_with_rdkit_surrogate_fill"
-                    else "surrogate_fallback"
-                )
-            ),
+            provenance={"execution_mode": "native_tool"},
+            execution_mode="native_tool",
             external_tools_requested=True,
-            external_tool_used=adapter_mode in {
-                "crem_fragment_database",
-                "crem_fragment_database_with_rdkit_surrogate_fill",
-            },
-            surrogate_used="surrogate" in adapter_mode,
-            fallback_used="surrogate" in adapter_mode,
+            external_tool_used=bool(candidates),
+            surrogate_used=False,
+            fallback_used=False,
         )
 
 
@@ -370,52 +198,25 @@ class RdkitGrowLinkAutoGrow4Strategy:
                 str(autogrow4_status.get("warning") or "autogrow4_external_adapter_not_installed")
             )
 
-        # RDKit surrogate fallback
-        labels = _candidate_tool_labels(
-            tool_status,
-            external_pending_label="external_autogrow4_pending",
-        )
-        candidates = _generate_from_libraries(
-            strategy=self.name,
-            seeds=seeds,
-            requested_count=requested_count,
-            constraints=constraints,
-            aliphatic_library=_autogrow4_aliphatic_library(),
-            aromatic_library=_autogrow4_aromatic_library(),
-            rationale="AutoGrow4-style grow/link enumeration scored with RDKit/Datamol",
-            source_label="rdkit_grow_link_autogrow4_surrogate",
-            labels=labels,
-        )
         return GenerationBatch(
-            candidates=candidates,
-            adapter_mode="rdkit_datamol_grow_link_autogrow4_surrogate",
+            candidates=[],
+            adapter_mode="autogrow4_no_verified_generation",
             tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "autogrow4"]),
-            warnings=list(
-                dict.fromkeys(
-                    fallback_warnings
-                    + (
-                        ["autogrow4_detected_but_rdkit_surrogate_adapter_used"]
-                        if tool_status["autogrow4"]["available"]
-                        else []
-                    )
-                )
-            ),
-            candidate_source_counts=_candidate_source_counts(candidates),
+            warnings=list(dict.fromkeys(fallback_warnings)),
+            candidate_source_counts={},
             provenance={
-                "execution_mode": "surrogate_fallback",
+                "execution_mode": "not_run",
                 "external_tool_status": autogrow4_status,
-                "fallback_toolchain": ["rdkit", "datamol"],
             },
-            execution_mode="surrogate_fallback",
+            execution_mode="not_run",
             external_tools_requested=True,
             external_tool_used=False,
-            surrogate_used=True,
-            fallback_used=True,
+            surrogate_used=False,
+            fallback_used=False,
         )
 
 
 STRATEGY_ADAPTERS = {
-    RdkitScoredReinvent4Strategy.name: RdkitScoredReinvent4Strategy(),
     CremFragmentStrategy.name: CremFragmentStrategy(),
     RdkitGrowLinkAutoGrow4Strategy.name: RdkitGrowLinkAutoGrow4Strategy(),
 }
@@ -467,7 +268,7 @@ def collect_generation_seed_smiles(
 
 def generation_tool_status() -> dict[str, Any]:
     from medagent.services.autogrow4_adapter import autogrow4_tool_status
-    from medagent.services.reinvent4_adapter import reinvent4_tool_status
+    from medagent.services.targetdiff_adapter import targetdiff_tool_status
 
     crem_database_path = _resolve_crem_database_path()
     return {
@@ -479,7 +280,7 @@ def generation_tool_status() -> dict[str, Any]:
             "database_path": str(crem_database_path) if crem_database_path else None,
             "database_env_vars": ["MEDAGENT_CREM_DB", "CREM_DB"],
         },
-        "reinvent4": reinvent4_tool_status(),
+        "targetdiff": targetdiff_tool_status(),
         "autogrow4": autogrow4_tool_status(),
     }
 
@@ -980,42 +781,6 @@ def _resolve_crem_database_path() -> Path | None:
         if default_path.exists():
             return default_path
     return None
-
-
-def _reinvent4_aliphatic_library() -> list[str]:
-    return _unique_library(
-        [
-            "CCN",
-            "CCCO",
-            "CCOC",
-            "CC(C)O",
-            "CC(=O)O",
-            "CCS",
-            "CC(C)N",
-            "CCC(=O)O",
-            "COCCO",
-            "CCNCC",
-            *_linear_analogs(max_chain_length=36, hetero_atoms=("O", "N", "F", "Cl")),
-        ]
-    )
-
-
-def _reinvent4_aromatic_library() -> list[str]:
-    return _unique_library(
-        [
-            "Cc1ccccc1",
-            "COc1ccccc1",
-            "Nc1ccccc1",
-            "O=C(O)c1ccccc1",
-            "CC(=O)Nc1ccccc1",
-            "O=C(N)c1ccccc1",
-            "COc1ccc(C)cc1",
-            "Nc1ccc(C)cc1",
-            "CC(C)c1ccccc1",
-            "COc1ccc(OC)cc1",
-            *_substituted_aromatic_analogs(),
-        ]
-    )
 
 
 def _crem_aliphatic_library() -> list[str]:

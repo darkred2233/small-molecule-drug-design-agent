@@ -4,13 +4,13 @@
 提供端到端的对接流程：
 1. 受体准备（蛋白结构清理、加氢、电荷分配）
 2. 配体准备（3D构象生成、能量优化）
-3. 对接执行（GNINA/Vina/DiffDock）
+3. 对接执行（GNINA/Vina）
 4. 结果分析和排序
 
 依赖：
 - RDKit（必需）
 - OpenBabel（可选，用于格式转换）
-- GNINA/Vina/DiffDock（至少一个）
+- GNINA/Vina（至少一个）
 """
 
 import tempfile
@@ -485,7 +485,7 @@ def run_docking_workflow(
         receptor_prep = prepare_receptor_from_pdb(
             pdb_file=Path(receptor_pdb_file),
             output_dir=tmpdir_path,
-            target_format="pdb",  # GNINA和DiffDock支持PDB
+            target_format="pdb",  # GNINA supports PDB directly.
             add_hydrogens=True,
             remove_waters=True,
         )
@@ -528,9 +528,7 @@ def run_docking_workflow(
                 docking_result_id=None,
                 vina_score=docking_result.vina_score if docking_result else None,
                 cnn_score=docking_result.cnn_score if docking_result else None,
-                diffdock_confidence=(
-                    docking_result.diffdock_confidence if docking_result else None
-                ),
+                diffdock_confidence=None,
                 pose_file=None,
                 ligand_prep=ligand_prep,
                 receptor_prep=receptor_prep,
@@ -551,7 +549,8 @@ def run_docking_workflow(
         docking_db_result.tool_run_id = docking_result.adapter_mode
         docking_db_result.vina_score = docking_result.vina_score
         docking_db_result.cnn_score = docking_result.cnn_score
-        docking_db_result.diffdock_confidence = docking_result.diffdock_confidence
+        # Kept as a nullable historical database column; local docking never writes it.
+        docking_db_result.diffdock_confidence = None
         docking_db_result.pose_file = docking_result.pose_file
         docking_db_result.labels = docking_result.labels
         docking_db_result.raw_output = {
@@ -560,7 +559,6 @@ def run_docking_workflow(
             "adapter_mode": docking_result.adapter_mode,
             "tool_name": docking_result.tool_name,
             "cnn_affinity": docking_result.cnn_affinity,
-            "diffdock_confidence": docking_result.diffdock_confidence,
             "selected_pose_rank": docking_result.selected_pose_rank,
             "pose_count": docking_result.pose_count,
             "pose_selection_method": docking_result.pose_selection_method,
@@ -590,7 +588,7 @@ def run_docking_workflow(
             docking_result_id=docking_db_result.id,
             vina_score=docking_result.vina_score,
             cnn_score=docking_result.cnn_score,
-            diffdock_confidence=docking_result.diffdock_confidence,
+            diffdock_confidence=None,
             pose_file=docking_result.pose_file,
             ligand_prep=ligand_prep,
             receptor_prep=receptor_prep,

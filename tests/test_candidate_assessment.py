@@ -42,7 +42,6 @@ def _disable_external_retrosynthesis(status: dict) -> dict:
         "mode": None,
         "version": None,
         "path": None,
-        "docker_image": None,
         "model_configured": False,
     }
     status["askcos"] = {"available": False, "version": None}
@@ -54,23 +53,20 @@ def _minimal_tool_status_with_external() -> dict:
         "rdkit": {"available": True, "version": "test"},
         "gnina": {
             "available": True,
-            "mode": "docker",
+            "mode": "local_binary",
             "version": None,
-            "path": None,
-            "docker_image": "gnina/gnina:latest",
+            "path": "gnina",
         },
-        "vina": {"available": False, "mode": None, "path": None, "docker_image": None},
-        "diffdock": {"available": False, "mode": None, "version": None, "docker_image": None},
+        "vina": {"available": False, "mode": None, "path": None},
         "oddt": {"available": False, "version": None},
         "admetlab": {"available": False, "version": None},
         "chemprop": {"available": False, "mode": None, "version": None},
         "deepchem": {"available": False, "version": None},
         "aizynthfinder": {
             "available": True,
-            "mode": "docker",
+            "mode": "local_python",
             "version": None,
-            "path": None,
-            "docker_image": "aizynthfinder:latest",
+            "path": "aizynthcli",
             "model_configured": True,
         },
         "askcos": {"available": False, "version": None},
@@ -79,7 +75,7 @@ def _minimal_tool_status_with_external() -> dict:
 
 def _minimal_tool_status_without_external() -> dict:
     status = _minimal_tool_status_with_external()
-    for tool_name in ("gnina", "vina", "diffdock", "chemprop", "aizynthfinder"):
+    for tool_name in ("gnina", "vina", "chemprop", "aizynthfinder"):
         status[tool_name]["available"] = False
         status[tool_name]["runtime_available"] = False
     status["aizynthfinder"]["model_configured"] = False
@@ -93,22 +89,18 @@ def _minimal_tool_status_with_vina_only() -> dict:
         "mode": None,
         "version": None,
         "path": None,
-        "docker_image": None,
     }
     status["vina"] = {
         "available": True,
-        "mode": "docker",
+        "mode": "local_binary",
         "version": None,
-        "path": None,
-        "docker_image": "vina:latest",
+        "path": "vina",
     }
-    status["diffdock"] = {"available": False, "mode": None, "version": None, "docker_image": None}
     status["aizynthfinder"] = {
         "available": False,
         "mode": None,
         "version": None,
         "path": None,
-        "docker_image": None,
         "model_configured": False,
     }
     return status
@@ -116,7 +108,7 @@ def _minimal_tool_status_with_vina_only() -> dict:
 
 def _successful_docking_result(tmp_path, request) -> DockingToolResult:
     return DockingToolResult(
-        adapter_mode="gnina_docker_docking",
+        adapter_mode="gnina_local_docking",
         tool_name="gnina",
         success=True,
         vina_score=-8.4,
@@ -138,21 +130,21 @@ def test_gnina_failure_retries_with_prepared_cpu_vina_inputs(tmp_path, monkeypat
 
     tool_status = _minimal_tool_status_with_external()
     tool_status["gnina"]["gpu_available"] = True
-    tool_status["vina"] = {"available": True, "mode": "docker", "docker_image": "vina:latest"}
+    tool_status["vina"] = {"available": True, "mode": "local_binary", "path": "vina"}
     requests = []
 
     def fake_run_external_docking(request, status):
         requests.append((request, status))
         if len(requests) == 1:
             return DockingToolResult(
-                adapter_mode="gnina_docker_docking",
+                adapter_mode="gnina_local_docking",
                 tool_name="gnina",
                 success=False,
                 warnings=["external_docking_tool_failed"],
                 exit_code=1,
             )
         return DockingToolResult(
-            adapter_mode="vina_docker_docking",
+            adapter_mode="vina_local_docking",
             tool_name="vina",
             success=True,
             vina_score=-7.4,
@@ -233,24 +225,9 @@ def test_assessment_backfills_missing_molecule_properties(tmp_path):
         assert properties.tpsa is not None
 
 
-def _successful_diffdock_result(tmp_path, request) -> DockingToolResult:
-    return DockingToolResult(
-        adapter_mode="diffdock_docker_docking",
-        tool_name="diffdock",
-        success=True,
-        diffdock_confidence=1.25,
-        pose_file=str(tmp_path / f"{request.molecule_id}.sdf"),
-        selected_pose_rank=1,
-        pose_count=10,
-        pose_selection_method="diffdock_rank_1_by_confidence",
-        labels=["external_docking_adapter_used", "diffdock_adapter"],
-        stdout="rank1_confidence1.25.sdf\n",
-    )
-
-
 def _successful_retrosynthesis_result() -> AiZynthFinderResult:
     return AiZynthFinderResult(
-        adapter_mode="aizynthfinder_docker",
+        adapter_mode="aizynthfinder_local",
         tool_name="aizynthfinder",
         success=True,
         route_found=True,
@@ -394,7 +371,6 @@ def test_candidate_assessment_writes_docking_admet_and_synthesis_results(tmp_pat
             item["raw_output"]["adapter_mode"] in {
                 "admet_ai_chemprop_admet",
                 "chemprop_local_admet",
-                "chemprop_docker_admet",
                 "rdkit_surrogate_admet",
             }
             for item in admet
@@ -746,8 +722,8 @@ def test_external_route_failure_marks_candidate_as_failed_assessment(tmp_path, m
     status = _minimal_tool_status_without_external()
     status["aizynthfinder"] = {
         "available": True,
-        "mode": "docker",
-        "docker_image": "aizynthfinder:latest",
+        "mode": "local_python",
+        "path": "aizynthcli",
         "model_configured": True,
     }
     monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", lambda: status)
@@ -755,7 +731,7 @@ def test_external_route_failure_marks_candidate_as_failed_assessment(tmp_path, m
         candidate_assessment,
         "run_aizynthfinder_retrosynthesis",
         lambda request, status=None: AiZynthFinderResult(
-            adapter_mode="aizynthfinder_docker",
+            adapter_mode="aizynthfinder_local",
             tool_name="aizynthfinder",
             success=True,
             route_found=False,
@@ -878,7 +854,7 @@ def test_candidate_assessment_prepares_pdbqt_inputs_for_vina_when_gnina_unavaila
     def fake_external_docking(request, tool_status):
         docking_requests.append((request, tool_status))
         return DockingToolResult(
-            adapter_mode="vina_docker_docking",
+            adapter_mode="vina_local_docking",
             tool_name="vina",
             success=True,
             vina_score=-6.9,
@@ -916,7 +892,7 @@ def test_candidate_assessment_prepares_pdbqt_inputs_for_vina_when_gnina_unavaila
 
         assert response.status_code == 200
         body = response.json()
-        assert body["docking"]["adapter_mode"] == "vina_docker_docking"
+        assert body["docking"]["adapter_mode"] == "vina_local_docking"
         assert "vina_requires_prepared_pdbqt_inputs" not in body["docking"]["warnings"]
         assert len(docking_requests) == 2
         assert all(request.receptor_file.endswith(".pdbqt") for request, _ in docking_requests)
@@ -924,23 +900,16 @@ def test_candidate_assessment_prepares_pdbqt_inputs_for_vina_when_gnina_unavaila
         assert all(tool_status["vina"]["available"] for _, tool_status in docking_requests)
 
 
-def test_external_assessment_does_not_use_diffdock_from_default_path(tmp_path, monkeypatch):
+def test_external_assessment_falls_back_when_no_local_docking_tool_is_available(tmp_path, monkeypatch):
     status = _minimal_tool_status_with_external()
     status["gnina"]["available"] = False
-    status["diffdock"] = {
-        "available": True,
-        "mode": "docker",
-        "version": "test",
-        "docker_image": "diffdock:test",
-        "model_configured": True,
-    }
     status["aizynthfinder"]["available"] = False
     status["aizynthfinder"]["model_configured"] = False
     monkeypatch.setattr(candidate_assessment, "candidate_assessment_tool_status", lambda: status)
-    def unexpected_diffdock(*_args, **_kwargs):
-        raise AssertionError("DiffDock must not run from the default assessment path")
+    def unexpected_docking(*_args, **_kwargs):
+        raise AssertionError("No docking adapter should run without a local tool")
 
-    monkeypatch.setattr(candidate_assessment, "run_external_docking", unexpected_diffdock)
+    monkeypatch.setattr(candidate_assessment, "run_external_docking", unexpected_docking)
 
     receptor_file = tmp_path / "egfr_receptor.pdb"
     receptor_file.write_text("HEADER    TEST RECEPTOR\n", encoding="utf-8")
@@ -965,7 +934,6 @@ def test_external_assessment_does_not_use_diffdock_from_default_path(tmp_path, m
         assert body["docking"]["adapter_mode"] == "rdkit_surrogate_docking"
         assert "external_docking_tools_not_installed" in body["docking"]["warnings"]
         results = client.get(f"/projects/{project_id}/docking-results").json()
-        assert all("diffdock_adapter" not in item["labels"] for item in results)
         assert all(item["diffdock_confidence"] is None for item in results)
 
 
@@ -1120,14 +1088,14 @@ def test_external_assessment_mode_refines_only_top_n(tmp_path, monkeypatch):
         assert body["assessment_mode"] == "external"
         assert body["external_top_n"] == 1
         assert body["runtime_policy"]["external_refinement"] == "top_n_after_coarse_screen"
-        assert body["docking"]["adapter_mode"] == "gnina_docker_docking_top_n_refinement"
+        assert body["docking"]["adapter_mode"] == "gnina_local_docking_top_n_refinement"
         assert body["docking"]["execution_mode"] == "mixed_external_surrogate"
         assert body["docking"]["external_tools_requested"] is True
         assert body["docking"]["external_attempted_count"] == 1
         assert body["docking"]["external_success_count"] == 1
         assert body["docking"]["surrogate_count"] == 1
         assert body["docking"]["fallback_used"] is False
-        assert body["synthesis"]["adapter_mode"] == "aizynthfinder_docker_top_n_refinement"
+        assert body["synthesis"]["adapter_mode"] == "aizynthfinder_local_top_n_refinement"
         assert body["synthesis"]["execution_mode"] == "mixed_external_surrogate"
         assert body["synthesis"]["external_success_count"] == 1
         assert body["synthesis"]["surrogate_count"] == 1
@@ -1268,8 +1236,8 @@ def test_full_assessment_mode_refines_all_candidates(tmp_path, monkeypatch):
         assert response.status_code == 200
         body = response.json()
         assert body["assessment_mode"] == "full"
-        assert body["docking"]["adapter_mode"] == "gnina_docker_docking"
-        assert body["synthesis"]["adapter_mode"] == "aizynthfinder_docker"
+        assert body["docking"]["adapter_mode"] == "gnina_local_docking"
+        assert body["synthesis"]["adapter_mode"] == "aizynthfinder_local"
         assert len(docking_requests) == 2
         assert len(retrosynthesis_requests) == 2
 
@@ -1282,10 +1250,9 @@ def test_candidate_assessment_uses_aizynthfinder_when_available(tmp_path, monkey
         status = original_tool_status()
         status["aizynthfinder"] = {
             "available": True,
-            "mode": "docker",
+            "mode": "local_python",
             "version": None,
-            "path": None,
-            "docker_image": "aizynthfinder:latest",
+            "path": "aizynthcli",
             "model_configured": True,
         }
         status["askcos"] = {"available": False, "version": None}
@@ -1318,7 +1285,7 @@ def test_candidate_assessment_uses_aizynthfinder_when_available(tmp_path, monkey
 
         assert response.status_code == 200
         body = response.json()
-        assert body["synthesis"]["adapter_mode"] == "aizynthfinder_docker"
+        assert body["synthesis"]["adapter_mode"] == "aizynthfinder_local"
         assert body["synthesis"]["evaluated_count"] == 2
         assert len(retrosynthesis_requests) == 2
 
@@ -1327,7 +1294,7 @@ def test_candidate_assessment_uses_aizynthfinder_when_available(tmp_path, monkey
         assert all(item["route_found"] is True for item in synthesis)
         assert all(item["route_steps"] == 2 for item in synthesis)
         assert all(item["buyable_building_blocks"] == 2 for item in synthesis)
-        assert all(item["route_json"]["adapter_mode"] == "aizynthfinder_docker" for item in synthesis)
+        assert all(item["route_json"]["adapter_mode"] == "aizynthfinder_local" for item in synthesis)
         assert all(item["route_json"]["route_score"] == 0.84 for item in synthesis)
         assert all(item["route_json"]["result_kind"] == "external_retrosynthesis_route" for item in synthesis)
         assert all(

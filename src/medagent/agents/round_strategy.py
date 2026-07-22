@@ -86,7 +86,7 @@ class RoundStrategyAgent:
         previous_ids = list(context.get("previous_ranked_molecule_ids") or [])
         previous_count = int(context.get("previous_molecule_count", 0) or 0)
         has_seed_source = bool(seed_count or previous_ids or previous_count)
-        later_round = bool(previous_ids or context.get("has_previous_round"))
+        later_round = round_number > 1
 
         # Keep counts proportional to the available input pool and bounded for offline runs.
         base_count = max(10, min(100, max(seed_count, len(previous_ids), 1) * 10))
@@ -97,12 +97,15 @@ class RoundStrategyAgent:
                 "num_molecules": min(50, base_count),
                 "edit_depth": 2,
             },
-            "reinvent4": {
-                "enabled": self._availability_value(tool_availability.get("reinvent4")),
-                "sample_count": base_count,
-                "mode": "light_tl_then_rl" if later_round else "rl_only",
-                "rl_steps": 30,
-                "batch_size": 128,
+            "targetdiff": {
+                "enabled": self._availability_value(tool_availability.get("targetdiff"))
+                and bool(
+                    (data_summary.get("resource_types") or {}).get("binding_pocket")
+                    or data_summary.get("prepared_binding_site_count")
+                    or data_summary.get("binding_site_count")
+                ),
+                "num_molecules": min(50, base_count),
+                "sampling_mode": "balanced",
             },
             "autogrow4": {
                 "enabled": self._availability_value(tool_availability.get("autogrow4"))
@@ -344,17 +347,17 @@ class RoundStrategyAgent:
                                 "edit_depth": {"type": "integer", "minimum": 1, "maximum": 5},
                             },
                         },
-                        "reinvent4": {
+                        "targetdiff": {
                             "type": "object",
                             "properties": {
                                 "enabled": {"type": "boolean"},
-                                "sample_count": {"type": "integer", "minimum": 0, "maximum": 1000},
-                                "mode": {
+                                "num_molecules": {"type": "integer", "minimum": 0, "maximum": 300},
+                                "sampling_mode": {
                                     "type": "string",
-                                    "enum": ["rl_only", "light_tl_then_rl", "tl_then_rl"],
+                                    "enum": ["fast", "balanced", "thorough"],
                                 },
-                                "rl_steps": {"type": "integer", "minimum": 5, "maximum": 200},
-                                "batch_size": {"type": "integer", "minimum": 16, "maximum": 1024},
+                                "pocket_resource_id": {"type": "string"},
+                                "binding_site_id": {"type": "string"},
                             },
                         },
                         "autogrow4": {
@@ -412,17 +415,8 @@ class RoundStrategyAgent:
             name: dict(value) if isinstance(value, dict) else {}
             for name, value in (strategy.get("campaign_config") or {}).items()
         }
-        reinvent4 = campaign_config.setdefault("reinvent4", {})
-        if "sample_count" not in reinvent4 and "num_molecules" in reinvent4:
-            reinvent4["sample_count"] = reinvent4.pop("num_molecules")
-        mode_aliases = {
-            "sampling": "rl_only",
-            "light_transfer": "light_tl_then_rl",
-            "full_transfer": "tl_then_rl",
-        }
-        if reinvent4.get("mode") in mode_aliases:
-            reinvent4["mode"] = mode_aliases[reinvent4["mode"]]
-        for method in ("crem", "reinvent4", "autogrow4"):
+        campaign_config.setdefault("targetdiff", {})
+        for method in ("crem", "targetdiff", "autogrow4"):
             if not self._availability_value(tool_availability.get(method, False)):
                 campaign_config.setdefault(method, {})["enabled"] = False
         strategy["campaign_config"] = campaign_config

@@ -496,7 +496,7 @@ class CampaignRun(TimestampMixin, Base):
     campaign_run_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     round_id: Mapped[str] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
-    method: Mapped[str] = mapped_column(String(40))  # crem / reinvent4 / autogrow4
+    method: Mapped[str] = mapped_column(String(40))  # crem / targetdiff / autogrow4; historical values remain readable
     status: Mapped[str] = mapped_column(String(40), default="pending")
     config_json: Mapped[dict | None] = mapped_column(JSON, default=None)
     resource_bundle_json: Mapped[dict | None] = mapped_column(JSON, default=None)

@@ -104,7 +104,6 @@ def test_candidate_assessment_uses_binding_site_receptor_and_grid(tmp_path, monk
             "mode": None,
             "version": None,
             "path": None,
-            "docker_image": None,
             "model_configured": False,
         }
         status["askcos"] = {"available": False, "version": None}
@@ -170,14 +169,12 @@ def test_candidate_assessment_auto_uses_project_binding_site_when_omitted(tmp_pa
         status = original_tool_status()
         status["gnina"] = {"available": True, "path": "gnina"}
         status["vina"] = {"available": False, "path": None}
-        status["diffdock"] = {"available": False, "mode": None, "version": None}
         status["chemprop"] = {"available": False, "mode": None, "version": None}
         status["aizynthfinder"] = {
             "available": False,
             "mode": None,
             "version": None,
             "path": None,
-            "docker_image": None,
             "model_configured": False,
         }
         status["askcos"] = {"available": False, "version": None}
@@ -246,14 +243,12 @@ def test_candidate_assessment_auto_uses_builtin_target_binding_site_when_omitted
         status = original_tool_status()
         status["gnina"] = {"available": True, "path": "gnina"}
         status["vina"] = {"available": False, "path": None}
-        status["diffdock"] = {"available": False, "mode": None, "version": None}
         status["chemprop"] = {"available": False, "mode": None, "version": None}
         status["aizynthfinder"] = {
             "available": False,
             "mode": None,
             "version": None,
             "path": None,
-            "docker_image": None,
             "model_configured": False,
         }
         status["askcos"] = {"available": False, "version": None}

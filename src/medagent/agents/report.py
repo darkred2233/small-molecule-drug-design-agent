@@ -671,7 +671,7 @@ class ReportAgent:
             "data_sources": {
                 "rdkit_version": "2023.09.1",
                 "chemprop_models": "预训练ADMET模型",
-                "docking_tools": "GNINA/Vina/DiffDock",
+                "docking_tools": "GNINA/Vina",
             },
             "glossary": {
                 "QED": "Quantitative Estimate of Drug-likeness，药物相似性定量评估",

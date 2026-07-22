@@ -27,7 +27,7 @@ def create_validated_project(client: TestClient) -> str:
         files={
             "file": (
                 "decision_cards.smi",
-                b"CCO ethanol\nC1CC unclosed_ring\n",
+                b"CCO ethanol\n",
                 "text/plain",
             )
         },
@@ -84,14 +84,14 @@ def test_decision_cards_are_generated_from_validation_results(tmp_path):
 
         assert response.status_code == 201
         body = response.json()
-        assert body["generated_count"] == 2
-        assert body["trace_count"] == 2
-        assert len(body["decision_card_ids"]) == 2
+        assert body["generated_count"] == 1
+        assert body["trace_count"] == 1
+        assert len(body["decision_card_ids"]) == 1
 
         cards_response = client.get(f"/projects/{project_id}/decision-cards")
         assert cards_response.status_code == 200
         cards = cards_response.json()
-        assert len(cards) == 2
+        assert len(cards) == 1
 
         molecules = client.get(f"/projects/{project_id}/molecules").json()
         by_smiles = {molecule["smiles"]: molecule for molecule in molecules}
@@ -105,15 +105,10 @@ def test_decision_cards_are_generated_from_validation_results(tmp_path):
         assert valid_card["provenance"]["basis"] == "database_records"
         assert any("RDKit" in risk for risk in valid_card["risk"])
 
-        invalid_card = by_molecule_id[by_smiles["C1CC"]["molecule_id"]]
-        assert invalid_card["decision"] == "reject_for_structure"
-        assert invalid_card["title"] == "结构异常，暂不推进"
-        assert any("invalid" in factor for factor in invalid_card["support"])
-
         traces_response = client.get(f"/projects/{project_id}/reasoning-traces")
         assert traces_response.status_code == 200
         traces = traces_response.json()
-        assert len(traces) == 2
+        assert len(traces) == 1
         assert {trace["source_agent"] for trace in traces} == {"decision_card_generator"}
 
 

@@ -58,13 +58,13 @@ def test_round_strategy_uses_deterministic_fallback_when_llm_is_unavailable(monk
         parent_round_id="ROUND-1",
         tool_availability={
             "crem": {"available": True},
-            "reinvent4": False,
+            "targetdiff": False,
             "autogrow4": False,
         },
     )
 
     assert strategy["campaign_config"]["crem"]["enabled"] is True
-    assert strategy["campaign_config"]["reinvent4"]["enabled"] is False
+    assert strategy["campaign_config"]["targetdiff"]["enabled"] is False
     assert strategy["seed_policy"]["molecule_ids"] == ["MOL-2", "MOL-1", "MOL-3"]
     assert strategy["requires_user_confirmation"] is True
     assert any("deterministic fallback" in warning for warning in strategy["warnings"])
@@ -76,7 +76,7 @@ def test_strategy_validator_clamps_values_and_keeps_ranked_explicit_seed_order()
             "objective": "test",
             "campaign_config": {
                 "crem": {"enabled": True, "num_molecules": 9999, "edit_depth": 99},
-                "reinvent4": {"enabled": False},
+                "targetdiff": {"enabled": False},
                 "autogrow4": {"enabled": False},
             },
             "seed_policy": {
@@ -398,7 +398,7 @@ def test_next_round_auto_strategy_stays_ready_for_user_confirmation(monkeypatch)
         monkeypatch.setattr(
             orchestrator,
             "_detect_tool_availability",
-            lambda: {"crem": True, "reinvent4": False, "autogrow4": False},
+            lambda: {"crem": True, "targetdiff": False, "autogrow4": False},
         )
         next_round = orchestrator.create_round_draft(
             db,

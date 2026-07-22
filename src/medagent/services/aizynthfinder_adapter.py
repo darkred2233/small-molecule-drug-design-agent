@@ -2,16 +2,14 @@
 
 import json
 import os
-import shutil
 import subprocess
-import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
-from importlib import metadata, util
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
-from medagent.services.docker_runtime import DockerMountBuilder, docker_temporary_directory
+from medagent.services.tool_config import configured_paths_exist, get_tool_runtime_config, resolve_configured_path
 
 
 @dataclass(frozen=True)
@@ -20,7 +18,6 @@ class AiZynthFinderRequest:
     output_dir: str
     config_file: str | None = None
     max_steps: int = 6
-    docker_image: str = "aizynthfinder:latest"
     timeout_seconds: int = 900
 
 
@@ -47,27 +44,48 @@ class AiZynthFinderResult:
 
 
 def check_aizynthfinder_available() -> dict[str, Any]:
+    config = get_tool_runtime_config("aizynthfinder", default_timeout_seconds=900)
+    required_ready, missing_paths = configured_paths_exist(config)
+    python = resolve_configured_path(config.python_executable)
+    cli = resolve_configured_path(config.command)
     result: dict[str, Any] = {
         "available": False,
-        "mode": None,
+        "mode": "local_python",
         "version": None,
-        "path": None,
-        "docker_image": None,
+        "path": str(cli) if cli and cli.is_file() else None,
+        "python_executable": str(python) if python and python.is_file() else None,
         "model_configured": False,
+        "runtime_available": False,
+        "missing_paths": missing_paths,
+        "warning": None,
+        **config.as_status(),
     }
-
-    package_status = _python_package_status()
-    if package_status is not None:
-        return {**result, **package_status}
-
-    cli_status = _cli_status()
-    if cli_status is not None:
-        return {**result, **cli_status}
-
-    docker_status = _docker_status()
-    if docker_status is not None:
-        return {**result, **docker_status}
-
+    config_file = _default_config_path()
+    result["model_configured"] = bool(config_file and _config_file_ready(config_file))
+    if not required_ready:
+        result["warning"] = "aizynthfinder_required_files_missing"
+        return result
+    if python is None or not python.is_file():
+        result["warning"] = "aizynthfinder_local_python_not_found"
+        return result
+    if cli is None or not cli.is_file():
+        result["warning"] = "aizynthfinder_local_cli_not_found"
+        return result
+    if not result["model_configured"]:
+        result["warning"] = "aizynthfinder_config_not_configured"
+        return result
+    try:
+        probe = subprocess.run(
+            [str(cli), "--help"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result["warning"] = "aizynthfinder_local_runtime_probe_failed"
+        return result
+    result["runtime_available"] = probe.returncode == 0
+    result["available"] = probe.returncode == 0
+    if probe.returncode != 0:
+        result["warning"] = "aizynthfinder_local_runtime_probe_failed"
     return result
 
 
@@ -78,10 +96,8 @@ def aizynthfinder_tool_status() -> dict[str, Any]:
         "mode": status.get("mode"),
         "version": status.get("version"),
         "path": status.get("path"),
-        "docker_image": status.get("docker_image"),
         "model_configured": status.get("model_configured", False),
         "runtime_available": status.get("runtime_available", status["available"]),
-        "gpu_available": status.get("gpu_available", False),
         "warning": status.get("warning"),
     }
 
@@ -127,95 +143,7 @@ def run_aizynthfinder_retrosynthesis(
             warnings=["aizynthfinder_config_empty"],
             runtime_seconds=time.monotonic() - start_time,
         )
-
-    mode = status.get("mode")
-    if mode == "docker":
-        return _run_aizynthfinder_docker(request, status, config_file, start_time)
-    if mode in {"local_cli", "python_package"}:
-        return _run_aizynthfinder_local(request, status, config_file, start_time)
-
-    return AiZynthFinderResult(
-        adapter_mode="aizynthfinder_mode_unsupported",
-        tool_name="aizynthfinder",
-        success=False,
-        warnings=[f"aizynthfinder_mode_unsupported:{mode}"],
-        runtime_seconds=time.monotonic() - start_time,
-    )
-
-
-def _python_package_status() -> dict[str, Any] | None:
-    if util.find_spec("aizynthfinder") is None:
-        return None
-
-    try:
-        version = metadata.version("aizynthfinder")
-    except metadata.PackageNotFoundError:
-        version = "unknown"
-
-    return {
-        "available": True,
-        "mode": "python_package",
-        "version": version,
-        "path": None,
-        "model_configured": _default_config_available(),
-    }
-
-
-def _cli_status() -> dict[str, Any] | None:
-    for command in ["aizynthcli", "aizynthapp"]:
-        path = shutil.which(command)
-        if path is not None:
-            return {
-                "available": True,
-                "mode": "local_cli",
-                "version": "unknown",
-                "path": path,
-                "model_configured": _default_config_available(),
-            }
-    return None
-
-
-def _docker_status() -> dict[str, Any] | None:
-    for image in ["aizynthfinder:latest", "molecularai/aizynthfinder:latest"]:
-        try:
-            proc = subprocess.run(
-                ["docker", "image", "inspect", image],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
-        if proc.returncode == 0:
-            runtime_probe = subprocess.run(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "--entrypoint",
-                    "aizynthcli",
-                    image,
-                    "--help",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            runtime_available = runtime_probe.returncode == 0
-            return {
-                "available": runtime_available,
-                "runtime_available": runtime_available,
-                "mode": "docker",
-                "docker_image": image,
-                "model_configured": _default_config_available(),
-                "gpu_available": _check_gpu_available(image),
-                "warning": None
-                if runtime_available
-                else "aizynthfinder_runtime_probe_failed",
-            }
-    return None
-
+    return _run_aizynthfinder_local(request, status, config_file, start_time)
 
 def _default_config_path() -> Path | None:
     env_path = os.environ.get("AIZYNTHFINDER_CONFIG") or os.environ.get(
@@ -259,7 +187,7 @@ def _run_aizynthfinder_local(
     output_file = output_dir / "aizynthfinder_routes.json"
     _remove_stale_output(output_file)
 
-    with docker_temporary_directory(prefix="aizynthfinder_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="aizynthfinder_") as tmp_dir:
         smiles_file = Path(tmp_dir) / "targets.smi"
         _write_smiles_input(smiles_file, request.smiles)
         command = _build_aizynthfinder_local_command(
@@ -268,14 +196,9 @@ def _run_aizynthfinder_local(
             smiles_file=smiles_file,
             output_file=output_file,
         )
-        adapter_mode = (
-            "aizynthfinder_python_package"
-            if status.get("mode") == "python_package"
-            else "aizynthfinder_local"
-        )
         return _run_command(
             command=command,
-            adapter_mode=adapter_mode,
+            adapter_mode="aizynthfinder_local",
             start_time=start_time,
             timeout_seconds=request.timeout_seconds,
             output_file=output_file,
@@ -283,36 +206,6 @@ def _run_aizynthfinder_local(
             cwd=config_file.parent,
         )
 
-
-def _run_aizynthfinder_docker(
-    request: AiZynthFinderRequest,
-    status: dict[str, Any],
-    config_file: Path,
-    start_time: float,
-) -> AiZynthFinderResult:
-    output_dir = Path(request.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / "aizynthfinder_routes.json"
-    _remove_stale_output(output_file)
-
-    with docker_temporary_directory(prefix="aizynthfinder_") as tmp_dir:
-        smiles_file = Path(tmp_dir) / "targets.smi"
-        _write_smiles_input(smiles_file, request.smiles)
-        command = _build_aizynthfinder_docker_command(
-            request=request,
-            status=status,
-            config_file=config_file,
-            smiles_file=smiles_file,
-            output_dir=output_dir,
-        )
-        return _run_command(
-            command=command,
-            adapter_mode="aizynthfinder_docker",
-            start_time=start_time,
-            timeout_seconds=request.timeout_seconds,
-            output_file=output_file,
-            max_steps=request.max_steps,
-        )
 
 
 def _write_smiles_input(path: Path, smiles: str) -> None:
@@ -332,12 +225,10 @@ def _build_aizynthfinder_local_command(
     smiles_file: Path,
     output_file: Path,
 ) -> list[str]:
-    if status.get("mode") == "python_package":
-        executable = [sys.executable, "-m", "aizynthfinder.interfaces.aizynthcli"]
-    else:
-        executable = [status.get("path") or "aizynthcli"]
-
-    return executable + [
+    cli = status.get("path")
+    if not cli:
+        raise FileNotFoundError("aizynthfinder local CLI is not configured")
+    return [cli,
         "--config",
         str(config_file),
         "--smiles",
@@ -345,73 +236,6 @@ def _build_aizynthfinder_local_command(
         "--output",
         str(output_file),
     ]
-
-
-def _build_aizynthfinder_docker_command(
-    request: AiZynthFinderRequest,
-    status: dict[str, Any],
-    config_file: Path,
-    smiles_file: Path,
-    output_dir: Path,
-) -> list[str]:
-    import time
-    image = status.get("docker_image") or request.docker_image
-    container_name = f"aizynthfinder_{int(time.time() * 1000)}"
-
-    has_gpu = bool(status.get("gpu_available"))
-    mounts = DockerMountBuilder()
-    input_path = mounts.bind(smiles_file.parent.resolve(), "/data/input", read_only=True)
-    output_path = mounts.bind(output_dir.resolve(), "/data/output")
-    config_path = mounts.bind(config_file.parent.resolve(), "/data/config", read_only=True)
-
-    command = [
-        "docker",
-        "run",
-        "--rm",
-        "--name",
-        container_name,
-    ]
-
-    # Add GPU support if available (AiZynthFinder can benefit from GPU)
-    if has_gpu:
-        command.extend(["--gpus", "all"])
-
-    data_dir = _resolve_data_dir(config_file)
-    if data_dir is not None:
-        mounts.bind(data_dir, "/data/aizynthfinder", read_only=True)
-
-    command += [
-        *mounts.arguments,
-        "-w",
-        config_path,
-        "--entrypoint",
-        "aizynthcli",
-        image,
-        "--config",
-        str(PurePosixPath(config_path, config_file.name)),
-        "--smiles",
-        str(PurePosixPath(input_path, smiles_file.name)),
-        "--output",
-        str(PurePosixPath(output_path, "aizynthfinder_routes.json")),
-    ]
-    return command
-
-
-def _resolve_data_dir(config_file: Path) -> Path | None:
-    env_path = os.environ.get("AIZYNTHFINDER_DATA_DIR") or os.environ.get(
-        "MEDAGENT_AIZYNTHFINDER_DATA_DIR"
-    )
-    candidates = []
-    if env_path:
-        candidates.append(Path(env_path).expanduser().resolve())
-    candidates.append(config_file.parent.resolve())
-    repo_data_dir = Path.cwd().resolve() / "data" / "aizynthfinder"
-    candidates.append(repo_data_dir)
-
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    return None
 
 
 def _run_command(
@@ -423,7 +247,6 @@ def _run_command(
     max_steps: int,
     cwd: Path | None = None,
 ) -> AiZynthFinderResult:
-    container_name = _extract_container_name(command)
     try:
         proc = subprocess.run(
             command,
@@ -433,9 +256,6 @@ def _run_command(
             cwd=str(cwd) if cwd else None,
         )
     except subprocess.TimeoutExpired:
-        # Clean up Docker container on timeout
-        if container_name:
-            _cleanup_docker_container(container_name)
         return AiZynthFinderResult(
             adapter_mode=f"{adapter_mode}_timeout",
             tool_name="aizynthfinder",
@@ -850,61 +670,3 @@ def _first_scalar(value: Any) -> Any:
     if isinstance(value, list):
         return value[0] if value else None
     return value
-
-
-def _extract_container_name(command: list[str]) -> str | None:
-    """Extract container name from Docker command if present."""
-    try:
-        if "docker" in command and "run" in command:
-            # Look for --name flag
-            if "--name" in command:
-                name_index = command.index("--name")
-                if name_index + 1 < len(command):
-                    return command[name_index + 1]
-    except (ValueError, IndexError):
-        pass
-    return None
-
-
-def _cleanup_docker_container(container_name: str) -> None:
-    """Force remove a Docker container."""
-    try:
-        subprocess.run(
-            ["docker", "rm", "-f", container_name],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        # Best effort cleanup, don't fail if it doesn't work
-        pass
-
-
-def _check_gpu_available(docker_image: str = "aizynthfinder:latest") -> bool:
-    """Check whether this image can actually use ONNX Runtime's CUDA provider."""
-    try:
-        result = subprocess.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--gpus",
-                "all",
-                "--entrypoint",
-                "python",
-                docker_image,
-                "-c",
-                (
-                    "import onnxruntime as ort; "
-                    "raise SystemExit(0 if 'CUDAExecutionProvider' "
-                    "in ort.get_available_providers() else 2)"
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False

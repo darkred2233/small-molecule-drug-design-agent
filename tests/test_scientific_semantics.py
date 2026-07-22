@@ -75,13 +75,13 @@ def test_sar_prompt_handles_docking_results_without_vina_score():
 
     agent._llm_client = FakeLLMClient()
     molecules = [
-        SimpleNamespace(molecule_id="MOL-DIFFDOCK", smiles="CCO"),
+        SimpleNamespace(molecule_id="MOL-POSE", smiles="CCO"),
     ]
     docking_data = {
-        "MOL-DIFFDOCK": SimpleNamespace(vina_score=None),
+        "MOL-POSE": SimpleNamespace(vina_score=None),
     }
 
     patterns = agent._identify_sar_patterns(molecules, docking_data, use_llm=True)
 
     assert patterns == []
-    assert "MOL-DIFFDOCK | CCO | N/A" in captured["prompt"]
+    assert "MOL-POSE | CCO | N/A" in captured["prompt"]

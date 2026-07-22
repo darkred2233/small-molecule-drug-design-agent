@@ -1,35 +1,28 @@
-"""AutoGrow4 adapter for molecular generation.
+"""Local AutoGrow4 adapter.
 
-AutoGrow4 is a genetic algorithm-based molecular generation tool that
-optimizes molecules using docking-guided evolution.
-
-Supports:
-- Local source/module installation
-- Docker container execution
-
-Reference: https://github.com/durrantlab/autogrow4
+AutoGrow4 is run from a checkout and an isolated Python interpreter.  No
+synthetic candidate fallback is produced when the local tool is unavailable.
 """
+
+from __future__ import annotations
 
 import csv
 import json
 import math
-import re
 import shutil
 import subprocess
-import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from pathlib import PurePosixPath
 from typing import Any
 
-from medagent.services.docker_runtime import DockerMountBuilder, docker_temporary_directory
-from medagent.services.tool_config import get_tool_runtime_config
+from medagent.services.tool_config import (
+    configured_paths_exist,
+    get_tool_runtime_config,
+    resolve_configured_path,
+)
 
-
-# ---------------------------------------------------------------------------
-# Data contracts
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class AutoGrow4Request:
@@ -40,8 +33,6 @@ class AutoGrow4Request:
     population_size: int = 50
     optimization_mode: str = "genetic"
     constraints: dict[str, Any] = field(default_factory=dict)
-    docker_image: str | None = None
-    use_docker: bool = False
     timeout_seconds: int = 1200
 
 
@@ -61,837 +52,239 @@ class AutoGrow4Result:
     provenance: dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# AutoGrow4 availability check
-# ---------------------------------------------------------------------------
-
 def check_autogrow4_available() -> dict[str, Any]:
-    """Check if AutoGrow4 is available."""
-    runtime_config = get_tool_runtime_config(
-        "autogrow4",
-        default_images=("autogrow4:latest", "autogrow:latest"),
-        default_timeout_seconds=1200,
-    )
+    config = get_tool_runtime_config("autogrow4", default_timeout_seconds=1200)
+    required_ready, missing_paths = configured_paths_exist(config)
+    python = _local_python(config.python_executable)
+    script = _script_path(config.command, config.working_directory)
+    dependencies = _missing_local_dependencies()
     result: dict[str, Any] = {
-        "available": False,
-        "mode": None,
-        "version": None,
-        "docker_image": None,
-        "runtime_available": False,
-        "warning": None,
-        **runtime_config.as_status(),
+        "available": False, "runtime_available": False, "mode": "local_python",
+        "python_executable": python, "script": str(script) if script else None,
+        "working_directory": config.working_directory, "version": None,
+        "missing_paths": missing_paths, "missing_dependencies": dependencies,
+        "warning": None, **config.as_status(),
     }
-
-    # Check local Python package
+    if not required_ready:
+        result["warning"] = "autogrow4_required_files_missing"
+        return result
+    if python is None:
+        result["warning"] = "autogrow4_local_python_not_found"
+        return result
+    if script is None:
+        result["warning"] = "autogrow4_entrypoint_not_found"
+        return result
+    if dependencies:
+        result["warning"] = "autogrow4_local_dependencies_unavailable:" + ",".join(dependencies)
+        return result
     try:
-        import autogrow4
-        proc = subprocess.run(
-            [sys.executable, "-m", "autogrow4", "--help"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
+        probe = subprocess.run(
+            [python, str(script), "--help"], capture_output=True, text=True, timeout=30, check=False,
+            cwd=str(script.parent),
         )
-        if proc.returncode == 0:
-            result["mode"] = "python_package"
-            result["version"] = getattr(autogrow4, "__version__", "unknown")
-            missing_dependencies = _missing_local_dependencies()
-            if not missing_dependencies:
-                result["available"] = True
-                result["runtime_available"] = True
-                return result
-            result["warning"] = (
-                "autogrow4_local_dependencies_unavailable:"
-                + ",".join(missing_dependencies)
-            )
-    except (ImportError, OSError, subprocess.TimeoutExpired):
-        pass
-
-    # Check Docker
-    for image in runtime_config.docker_images:
-        try:
-            proc = subprocess.run(
-                ["docker", "image", "inspect", image],
-                capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                result["mode"] = "docker"
-                result["docker_image"] = image
-                runtime_probe = subprocess.run(
-                    [
-                        "docker",
-                        "run",
-                        "--rm",
-                        "--entrypoint",
-                        "sh",
-                        image,
-                        "-c",
-                        (
-                            "(test -f /app/autogrow4/RunAutogrow.py "
-                            "|| test -f /app/autogrow4/run_autogrow.py) "
-                            "&& python -m autogrow4 --help >/dev/null "
-                            "&& command -v vina >/dev/null "
-                            "&& command -v obabel >/dev/null"
-                        ),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                )
-                result["runtime_available"] = runtime_probe.returncode == 0
-                result["available"] = result["runtime_available"]
-                if not result["runtime_available"]:
-                    result["warning"] = "autogrow4_runtime_or_vina_dependency_unavailable"
-                return result
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-
+    except (OSError, subprocess.TimeoutExpired):
+        result["warning"] = "autogrow4_local_runtime_probe_failed"
+        return result
+    result["runtime_available"] = probe.returncode == 0
+    result["available"] = probe.returncode == 0
+    output = (probe.stdout or probe.stderr or "").strip().splitlines()
+    result["version"] = output[0] if output else None
+    if not result["available"]:
+        result["warning"] = "autogrow4_local_runtime_probe_failed"
     return result
 
 
-def _missing_local_dependencies() -> list[str]:
-    return [name for name in ("vina", "obabel") if shutil.which(name) is None]
+def autogrow4_tool_status() -> dict[str, Any]:
+    return check_autogrow4_available()
 
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 
 def run_autogrow4_generation(
-    request: AutoGrow4Request,
-    autogrow4_status: dict[str, Any] | None = None,
+    request: AutoGrow4Request, autogrow4_status: dict[str, Any] | None = None
 ) -> AutoGrow4Result:
-    """Run AutoGrow4 molecular generation."""
-    if autogrow4_status is None:
-        autogrow4_status = check_autogrow4_available()
-
-    if not autogrow4_status.get("available"):
-        return AutoGrow4Result(
-            adapter_mode="autogrow4_unavailable",
-            tool_name="autogrow4",
-            success=False,
-            warnings=["autogrow4_not_installed"],
-        )
-
-    receptor_path = Path(request.receptor_file).expanduser()
-    if not receptor_path.is_file():
-        return AutoGrow4Result(
-            adapter_mode="autogrow4_receptor_not_found",
-            tool_name="autogrow4",
-            success=False,
-            warnings=["autogrow4_receptor_file_not_found"],
-        )
-    if receptor_path.suffix.lower() != ".pdb":
-        return AutoGrow4Result(
-            adapter_mode="autogrow4_receptor_format_unsupported",
-            tool_name="autogrow4",
-            success=False,
-            warnings=["autogrow4_receptor_pdb_required"],
-        )
-
+    status = autogrow4_status or check_autogrow4_available()
+    if not status.get("available"):
+        return AutoGrow4Result("autogrow4_unavailable", "autogrow4", False, warnings=[str(status.get("warning") or "autogrow4_not_installed")])
+    receptor = Path(request.receptor_file).expanduser()
+    if not receptor.is_file():
+        return AutoGrow4Result("autogrow4_receptor_not_found", "autogrow4", False, warnings=["autogrow4_receptor_file_not_found"])
+    if receptor.suffix.lower() != ".pdb":
+        return AutoGrow4Result("autogrow4_receptor_format_unsupported", "autogrow4", False, warnings=["autogrow4_receptor_pdb_required"])
     if not request.seed_smiles:
-        return AutoGrow4Result(
-            adapter_mode="autogrow4_seed_smiles_missing",
-            tool_name="autogrow4",
-            success=False,
-            warnings=["autogrow4_seed_smiles_required"],
-        )
+        return AutoGrow4Result("autogrow4_seed_smiles_missing", "autogrow4", False, warnings=["autogrow4_seed_smiles_required"])
+    if request.optimization_mode != "genetic" or _grid_values(request) is None:
+        warning = "autogrow4_grid_center_and_size_required" if _grid_values(request) is None else "autogrow4_optimization_mode_unsupported"
+        return AutoGrow4Result("autogrow4_request_invalid", "autogrow4", False, warnings=[warning])
 
-    if request.optimization_mode.strip().lower() != "genetic":
-        return AutoGrow4Result(
-            adapter_mode="autogrow4_optimization_mode_unsupported",
-            tool_name="autogrow4",
-            success=False,
-            warnings=[
-                f"autogrow4_optimization_mode_unsupported:{request.optimization_mode}"
-            ],
-        )
+    python = str(status.get("python_executable") or "")
+    script = Path(str(status.get("script") or ""))
+    if not python or not script.is_file():
+        return AutoGrow4Result("autogrow4_unavailable", "autogrow4", False, warnings=["autogrow4_runtime_not_configured"])
 
-    if _grid_values(request) is None:
-        return AutoGrow4Result(
-            adapter_mode="autogrow4_grid_not_configured",
-            tool_name="autogrow4",
-            success=False,
-            warnings=["autogrow4_grid_center_and_size_required"],
-        )
-
-    mode = autogrow4_status.get("mode")
-
-    if mode == "docker":
-        docker_image = (
-            request.docker_image
-            or autogrow4_status.get("docker_image")
-            or "autogrow4:latest"
-        )
-        return _run_autogrow4_docker(request, str(docker_image))
-    else:
-        return _run_autogrow4_local(request)
-
-
-# ---------------------------------------------------------------------------
-# Local execution
-# ---------------------------------------------------------------------------
-
-def _run_autogrow4_local(request: AutoGrow4Request) -> AutoGrow4Result:
-    """Run AutoGrow4 via local CLI."""
-    start_time = time.monotonic()
-
-    with docker_temporary_directory(prefix="autogrow4_") as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        seeds_file = tmp_path / "seeds.smi"
-        config_file = tmp_path / "config.json"
-        output_dir = tmp_path / "output"
-
-        # Write seed SMILES
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="autogrow4_") as temporary:
+        root = Path(temporary)
+        seeds_file, config_file, generated_dir = root / "seeds.smi", root / "config.json", root / "output"
         _write_seed_smiles(seeds_file, request.seed_smiles)
-        output_dir.mkdir()
-
+        generated_dir.mkdir()
         config = _write_autogrow4_config(
-            config_file,
-            request,
-            receptor_file=str(Path(request.receptor_file).expanduser().resolve()),
-            seeds_file=str(seeds_file),
-            output_dir=str(output_dir),
-            docker=False,
+            config_file, request, receptor_file=str(receptor.resolve()), seeds_file=str(seeds_file), output_dir=str(generated_dir)
         )
-        cmd = _build_autogrow4_command(
-            config_file=str(config_file),
-            executable=[sys.executable, "-m", "autogrow4"],
-        )
-
-        # Run AutoGrow4
+        command = _build_autogrow4_command(config_file=str(config_file), executable=[python, str(script)])
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=request.timeout_seconds,
-                cwd=str(tmp_path),
-            )
-            exit_code = proc.returncode
-            stdout = proc.stdout
-            stderr = proc.stderr
+            process = subprocess.run(command, capture_output=True, text=True, timeout=request.timeout_seconds, cwd=str(script.parent), check=False)
         except subprocess.TimeoutExpired:
-            return AutoGrow4Result(
-                adapter_mode="autogrow4_timeout",
-                tool_name="autogrow4",
-                success=False,
-                warnings=["autogrow4_execution_timeout"],
-                exit_code=-1,
-                runtime_seconds=time.monotonic() - start_time,
-                provenance=_autogrow4_provenance(
-                    request,
-                    execution_mode="python_package",
-                    command=cmd,
-                    config=config,
-                ),
-            )
-        except FileNotFoundError:
-            return AutoGrow4Result(
-                adapter_mode="autogrow4_not_found",
-                tool_name="autogrow4",
-                success=False,
-                warnings=["autogrow4_binary_not_found"],
-                exit_code=-1,
-                runtime_seconds=time.monotonic() - start_time,
-                provenance=_autogrow4_provenance(
-                    request,
-                    execution_mode="python_package",
-                    command=cmd,
-                    config=config,
-                ),
-            )
+            return AutoGrow4Result("autogrow4_timeout", "autogrow4", False, warnings=["autogrow4_execution_timeout"], exit_code=None, runtime_seconds=time.monotonic() - started, provenance=_provenance(request, command, config))
         except OSError as exc:
-            return AutoGrow4Result(
-                adapter_mode="autogrow4_execution_os_error",
-                tool_name="autogrow4",
-                success=False,
-                warnings=[f"autogrow4_execution_os_error:{type(exc).__name__}"],
-                exit_code=-1,
-                runtime_seconds=time.monotonic() - start_time,
-                provenance=_autogrow4_provenance(
-                    request,
-                    execution_mode="python_package",
-                    command=cmd,
-                    config=config,
-                ),
-            )
+            return AutoGrow4Result("autogrow4_execution_os_error", "autogrow4", False, warnings=[f"autogrow4_execution_os_error:{type(exc).__name__}"], exit_code=None, runtime_seconds=time.monotonic() - started, provenance=_provenance(request, command, config))
 
-        # Parse complete ranked evidence separately from genetic products. A
-        # completed AutoGrow generation can retain source/elite states, which
-        # must never be persisted as newly generated candidates.
-        ranked_smiles, ranked_scores = _parse_autogrow4_output(output_dir)
-        generated_smiles, scores = _parse_autogrow4_output(
-            output_dir, generated_only=True
-        )
-
-        # Copy output to request output_dir
-        final_output_dir = Path(request.output_dir)
-        final_output_dir.mkdir(parents=True, exist_ok=True)
-        if output_dir.exists():
-            shutil.copytree(
-                output_dir,
-                final_output_dir / "autogrow4_output",
-                dirs_exist_ok=True,
-            )
-
-        has_scored_output = bool(ranked_smiles) and any(
-            score is not None for score in ranked_scores
-        )
-        has_generated_output = bool(generated_smiles) and _has_completed_generation_output(
-            output_dir, request
-        )
-        success = exit_code == 0 and has_generated_output
-        partial_output = exit_code != 0 and has_scored_output
-        source_only_output = exit_code == 0 and has_scored_output and not has_generated_output
-        adapter_mode = (
-            "autogrow4_local_partial"
-            if partial_output
-            else "autogrow4_local_source_evaluated_only"
-            if source_only_output
-            else "autogrow4_local"
-        )
+        smiles, scores = _parse_autogrow4_output(generated_dir, generated_only=True)
+        destination = Path(request.output_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        if generated_dir.exists():
+            shutil.copytree(generated_dir, destination, dirs_exist_ok=True)
+        completed = process.returncode == 0 and _has_completed_generation_output(generated_dir, request) and bool(smiles)
+        warnings = _autogrow4_warnings(process.returncode, smiles, scores, source_only_output=bool(smiles) and not completed)
         return AutoGrow4Result(
-            adapter_mode=adapter_mode,
-            tool_name="autogrow4",
-            success=success,
-            generated_smiles=generated_smiles,
-            scores=scores,
-            labels=_autogrow4_labels(success, adapter_mode),
-            warnings=_autogrow4_warnings(
-                exit_code,
-                generated_smiles,
-                scores,
-                partial_output=partial_output,
-                source_only_output=source_only_output,
-            ),
-            stdout=stdout[:2000],
-            stderr=stderr[:2000],
-            exit_code=exit_code,
-            runtime_seconds=time.monotonic() - start_time,
-            provenance=_autogrow4_provenance(
-                request,
-                execution_mode="python_package",
-                command=cmd,
-                config=config,
-            ),
+            "autogrow4_local_generation", "autogrow4", completed, generated_smiles=smiles,
+            scores=scores, labels=["autogrow4_local_executed"] if completed else [], warnings=warnings,
+            stdout=process.stdout[:4000], stderr=process.stderr[:4000], exit_code=process.returncode,
+            runtime_seconds=time.monotonic() - started, provenance=_provenance(request, command, config),
         )
 
 
-# ---------------------------------------------------------------------------
-# Docker execution
-# ---------------------------------------------------------------------------
-
-def _run_autogrow4_docker(request: AutoGrow4Request, docker_image: str) -> AutoGrow4Result:
-    """Run AutoGrow4 via Docker container."""
-    start_time = time.monotonic()
-
-    with docker_temporary_directory(prefix="autogrow4_") as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        seeds_file = tmp_path / "seeds.smi"
-        receptor_file = tmp_path / "protein.pdb"
-        config_file = tmp_path / "config.json"
-        output_dir = tmp_path / "output"
-
-        # Write seed SMILES and copy receptor
-        _write_seed_smiles(seeds_file, request.seed_smiles)
-        shutil.copy2(request.receptor_file, receptor_file)
-        output_dir.mkdir()
-
-        # Generate unique container name
-        container_name = f"autogrow4_{int(time.monotonic() * 1000)}"
-        mounts = DockerMountBuilder()
-        data_path = mounts.bind(tmp_path, "/data")
-
-        config = _write_autogrow4_config(
-            config_file,
-            request,
-            receptor_file=str(PurePosixPath(data_path, "protein.pdb")),
-            seeds_file=str(PurePosixPath(data_path, "seeds.smi")),
-            output_dir=str(PurePosixPath(data_path, "output")),
-            docker=True,
-        )
-        autogrow_command = _build_autogrow4_command(
-            config_file=str(PurePosixPath(data_path, "config.json")),
-            executable=["-m", "autogrow4"],
-        )
-        cmd = [
-            "docker", "run", "--rm",
-            "--name", container_name,
-            *mounts.arguments,
-            docker_image,
-            *autogrow_command,
-        ]
-
-        # Run Docker
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=request.timeout_seconds,
-            )
-            exit_code = proc.returncode
-            stdout = proc.stdout
-            stderr = proc.stderr
-        except subprocess.TimeoutExpired:
-            # Clean up container on timeout
-            _cleanup_docker_container(container_name)
-            return AutoGrow4Result(
-                adapter_mode="autogrow4_docker_timeout",
-                tool_name="autogrow4",
-                success=False,
-                warnings=["autogrow4_docker_timeout"],
-                exit_code=-1,
-                runtime_seconds=time.monotonic() - start_time,
-                provenance=_autogrow4_provenance(
-                    request,
-                    execution_mode="docker",
-                    command=cmd,
-                    config=config,
-                    docker_image=docker_image,
-                ),
-            )
-        except FileNotFoundError:
-            return AutoGrow4Result(
-                adapter_mode="docker_not_found",
-                tool_name="autogrow4",
-                success=False,
-                warnings=["docker_not_installed"],
-                exit_code=-1,
-                runtime_seconds=time.monotonic() - start_time,
-                provenance=_autogrow4_provenance(
-                    request,
-                    execution_mode="docker",
-                    command=cmd,
-                    config=config,
-                    docker_image=docker_image,
-                ),
-            )
-        except OSError as exc:
-            return AutoGrow4Result(
-                adapter_mode="autogrow4_docker_os_error",
-                tool_name="autogrow4",
-                success=False,
-                warnings=[f"autogrow4_docker_os_error:{type(exc).__name__}"],
-                exit_code=-1,
-                runtime_seconds=time.monotonic() - start_time,
-                provenance=_autogrow4_provenance(
-                    request,
-                    execution_mode="docker",
-                    command=cmd,
-                    config=config,
-                    docker_image=docker_image,
-                ),
-            )
-
-        # See the matching local execution path for why ranked source/elite
-        # states are kept separate from actual genetic products.
-        ranked_smiles, ranked_scores = _parse_autogrow4_output(output_dir)
-        generated_smiles, scores = _parse_autogrow4_output(
-            output_dir, generated_only=True
-        )
-
-        # Copy output to request output_dir
-        final_output_dir = Path(request.output_dir)
-        final_output_dir.mkdir(parents=True, exist_ok=True)
-        if output_dir.exists():
-            shutil.copytree(
-                output_dir,
-                final_output_dir / "autogrow4_output",
-                dirs_exist_ok=True,
-            )
-
-        has_scored_output = bool(ranked_smiles) and any(
-            score is not None for score in ranked_scores
-        )
-        has_generated_output = bool(generated_smiles) and _has_completed_generation_output(
-            output_dir, request
-        )
-        success = exit_code == 0 and has_generated_output
-        partial_output = exit_code != 0 and has_scored_output
-        source_only_output = exit_code == 0 and has_scored_output and not has_generated_output
-        adapter_mode = (
-            "autogrow4_docker_partial"
-            if partial_output
-            else "autogrow4_docker_source_evaluated_only"
-            if source_only_output
-            else "autogrow4_docker"
-        )
-        return AutoGrow4Result(
-            adapter_mode=adapter_mode,
-            tool_name="autogrow4",
-            success=success,
-            generated_smiles=generated_smiles,
-            scores=scores,
-            labels=_autogrow4_labels(success, adapter_mode),
-            warnings=_autogrow4_warnings(
-                exit_code,
-                generated_smiles,
-                scores,
-                docker=True,
-                partial_output=partial_output,
-                source_only_output=source_only_output,
-            ),
-            stdout=stdout[:2000],
-            stderr=stderr[:2000],
-            exit_code=exit_code,
-            runtime_seconds=time.monotonic() - start_time,
-            provenance=_autogrow4_provenance(
-                request,
-                execution_mode="docker",
-                command=cmd,
-                config=config,
-                docker_image=docker_image,
-            ),
-        )
+def _write_seed_smiles(path: Path, seeds: list[str]) -> None:
+    path.write_text("\n".join(f"{value}\tseed_{index}" for index, value in enumerate(seeds)) + "\n", encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
-# I/O helpers
-# ---------------------------------------------------------------------------
-
-def _write_seed_smiles(path: Path, smiles_list: list[str]) -> None:
-    """Write seed SMILES to file."""
-    with open(path, "w", encoding="utf-8") as f:
-        for i, smi in enumerate(smiles_list):
-            f.write(f"{smi}\tseed_{i}\n")
-
-
-def _build_autogrow4_command(
-    *,
-    config_file: str,
-    executable: list[str],
-) -> list[str]:
+def _build_autogrow4_command(config_file: str, executable: list[str]) -> list[str]:
     return [*executable, "-j", config_file]
 
 
 def _write_autogrow4_config(
-    path: Path,
-    request: AutoGrow4Request,
-    *,
-    receptor_file: str,
-    seeds_file: str,
-    output_dir: str,
-    docker: bool,
+    config_file: Path, request: AutoGrow4Request, *, receptor_file: str, seeds_file: str, output_dir: str
 ) -> dict[str, Any]:
-    config = _autogrow4_config(
-        request,
-        receptor_file=receptor_file,
-        seeds_file=seeds_file,
-        output_dir=output_dir,
-        docker=docker,
-    )
-    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    config = _autogrow4_config(request, receptor_file=receptor_file, seeds_file=seeds_file, output_dir=output_dir)
+    config_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
     return config
 
 
-def _autogrow4_config(
-    request: AutoGrow4Request,
-    *,
-    receptor_file: str,
-    seeds_file: str,
-    output_dir: str,
-    docker: bool,
-) -> dict[str, Any]:
-    grid = _grid_values(request)
-    if grid is None:
-        raise ValueError("autogrow4_grid_center_and_size_required")
-    center, size = grid
-    population_size = max(4, request.population_size)
-    elite = max(1, population_size // 5)
-    generated = population_size - elite
-    constraints = request.constraints
-    crossover_fraction = _bounded_fraction(
-        constraints.get("crossover_fraction"), default=0.5
-    )
-    crossovers = round(generated * crossover_fraction)
-    mutants = generated - crossovers
-    vina_path = "/usr/bin/vina" if docker else str(shutil.which("vina") or "vina")
-    obabel_path = "/usr/bin/obabel" if docker else str(shutil.which("obabel") or "obabel")
+def _autogrow4_config(request: AutoGrow4Request, *, receptor_file: str, seeds_file: str, output_dir: str) -> dict[str, Any]:
+    center, size = _grid_values(request) or ([0.0, 0.0, 0.0], [20.0, 20.0, 20.0])
+    crossover = _bounded_float(request.constraints.get("crossover_fraction", 0.5), 0.0, 1.0, 0.5)
     return {
-        "filename_of_receptor": receptor_file,
-        "source_compound_file": seeds_file,
-        "root_output_folder": output_dir,
-        "center_x": center[0],
-        "center_y": center[1],
-        "center_z": center[2],
-        "size_x": size[0],
-        "size_y": size[1],
-        "size_z": size[2],
-        # With use_docked_source_compounds, AutoGrow evaluates the source pool
-        # as generation_0 and then evolves through the configured final
-        # generation number. A user request for one generation therefore maps
-        # directly to generation_1.
-        "num_generations": max(1, request.num_generations),
-        "number_of_crossovers_first_generation": crossovers,
-        "number_of_mutants_first_generation": mutants,
-        "number_of_crossovers": crossovers,
-        "number_of_mutants": mutants,
-        "crossover_fraction": crossover_fraction,
-        "number_elitism_advance_from_previous_gen": elite,
-        "top_mols_to_seed_next_generation": elite,
-        "diversity_mols_to_seed_first_generation": elite,
-        "conversion_choice": "ObabelConversion",
-        "obabel_path": obabel_path,
-        "dock_choice": "VinaDocking",
-        "docking_executable": vina_path,
-        "multithread_mode": "multithreading",
-        "number_of_processors": _positive_int(constraints.get("number_of_processors"), -1),
-        "start_a_new_run": True,
-        "debug_mode": bool(constraints.get("debug_mode", False)),
-        "max_variants_per_compound": _positive_int(
-            constraints.get("max_variants_per_compound"), 3
-        ),
-        "gypsum_thoroughness": _positive_int(constraints.get("gypsum_thoroughness"), 3),
-        "gypsum_timeout_limit": _positive_int(constraints.get("gypsum_timeout_limit"), 10),
+        "filename_of_receptor": receptor_file, "source_compound_file": seeds_file,
+        "root_output_folder": output_dir, "center_x": center[0], "center_y": center[1], "center_z": center[2],
+        "size_x": size[0], "size_y": size[1], "size_z": size[2], "number_of_mutants": request.population_size,
+        "number_of_crossovers": int(round(request.population_size * crossover)),
+        "num_generations": request.num_generations, "start_a_new_run": True,
+        "use_docked_source_compounds": True, "dock_choice": "VinaDocking",
     }
 
 
-def _positive_int(value: Any, default: int) -> int:
+def _parse_autogrow4_output(output_dir: Path, *, generated_only: bool = False) -> tuple[list[str], list[float | None]]:
+    ranked_files = sorted(output_dir.rglob("*_ranked.smi"), key=_ranked_file_sort_key, reverse=True)
+    for ranked in ranked_files:
+        generation = _generation_number(ranked)
+        if generated_only and (generation is None or generation < 1):
+            continue
+        smiles, scores = _parse_ranked_smi(ranked, generated_only=generated_only)
+        if smiles:
+            return smiles, scores
+    return [], []
+
+
+def _parse_ranked_smi(path: Path, *, generated_only: bool) -> tuple[list[str], list[float | None]]:
+    smiles: list[str] = []
+    scores: list[float | None] = []
+    for row in csv.reader(path.read_text(encoding="utf-8", errors="replace").splitlines(), delimiter="\t"):
+        if not row or not row[0].strip() or row[0].lower().strip() in {"smiles", "id"}:
+            continue
+        identifier = row[1].lower() if len(row) > 1 else ""
+        if generated_only and any(token in identifier for token in ("seed", "source", "elite")):
+            continue
+        smiles.append(row[0].strip())
+        scores.append(_first_float(row[2:]))
+    return smiles, scores
+
+
+def _has_completed_generation_output(output_dir: Path, request: AutoGrow4Request) -> bool:
+    highest_generation = max((_generation_number(path) or 0 for path in output_dir.rglob("*_ranked.smi")), default=0)
+    return highest_generation >= max(request.num_generations, 1)
+
+
+def _autogrow4_warnings(exit_code: int | None, smiles: list[str], scores: list[float | None], *, source_only_output: bool = False) -> list[str]:
+    if source_only_output:
+        return ["autogrow4_generated_generation_missing"]
+    if exit_code not in {0, None} and smiles:
+        return ["autogrow4_partial_generation_output"]
+    if exit_code not in {0, None}:
+        return ["autogrow4_execution_failed"]
+    if not smiles:
+        return ["autogrow4_generated_generation_missing"]
+    if not any(score is not None for score in scores):
+        return ["autogrow4_ranked_scores_missing"]
+    return []
+
+
+def _provenance(request: AutoGrow4Request, command: list[str], config: dict[str, Any]) -> dict[str, Any]:
+    return {"execution_mode": "local_python", "command": command, "config": config, "score_semantics": "autogrow4_ranked_output_fitness", "requested_count": len(request.seed_smiles)}
+
+
+def _grid_values(request: AutoGrow4Request) -> tuple[list[float], list[float]] | None:
+    center, size = request.constraints.get("grid_center"), request.constraints.get("grid_size")
+    if not isinstance(center, list) or not isinstance(size, list) or len(center) != 3 or len(size) != 3:
+        return None
     try:
-        parsed = int(value)
+        return [float(value) for value in center], [float(value) for value in size]
     except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
+        return None
 
 
-def _bounded_fraction(value: Any, *, default: float) -> float:
+def _missing_local_dependencies() -> list[str]:
+    return [name for name in ("vina", "obabel") if shutil.which(name) is None and not _configured_dependency_exists(name)]
+
+
+def _configured_dependency_exists(name: str) -> bool:
+    config = get_tool_runtime_config(name, default_command=name, default_timeout_seconds=120)
+    path = resolve_configured_path(config.command)
+    return bool(path and path.is_file())
+
+
+def _local_python(configured: str | None) -> str | None:
+    path = resolve_configured_path(configured)
+    return str(path) if path and path.is_file() else None
+
+
+def _script_path(command: str | None, workdir: str | None) -> Path | None:
+    if not command:
+        return None
+    root = resolve_configured_path(workdir)
+    candidate = (root / command).resolve() if root and root.is_dir() else resolve_configured_path(command)
+    return candidate if candidate and candidate.is_file() else None
+
+
+def _generation_number(path: Path) -> int | None:
+    import re
+    match = re.search(r"generation_(\d+)", str(path).replace("\\", "/"), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _ranked_file_sort_key(path: Path) -> tuple[int, str]:
+    return _generation_number(path) or 0, str(path)
+
+
+def _first_float(values: list[str]) -> float | None:
+    for value in values:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _bounded_float(value: Any, minimum: float, maximum: float, default: float) -> float:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return default
-    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
-        return default
-    return parsed
-
-
-def _grid_values(
-    request: AutoGrow4Request,
-) -> tuple[list[float], list[float]] | None:
-    center = request.constraints.get("grid_center") or request.constraints.get("center")
-    size = request.constraints.get("grid_size") or request.constraints.get("size")
-    if not isinstance(center, list) or not isinstance(size, list):
-        return None
-    if len(center) != 3 or len(size) != 3:
-        return None
-    try:
-        center_values = [float(value) for value in center]
-        size_values = [float(value) for value in size]
-    except (TypeError, ValueError):
-        return None
-    if not all(math.isfinite(value) for value in [*center_values, *size_values]):
-        return None
-    if not all(value > 0 for value in size_values):
-        return None
-    return center_values, size_values
-
-
-def _parse_autogrow4_output(
-    output_dir: Path,
-    *,
-    generated_only: bool = False,
-) -> tuple[list[str], list[float | None]]:
-    """Parse ranked AutoGrow4 output, optionally retaining only genetic products."""
-    smiles_list: list[str] = []
-    scores: list[float | None] = []
-
-    ranked_files = _ranked_output_files(output_dir)
-    if ranked_files:
-        for line in ranked_files[-1].read_text(encoding="utf-8", errors="ignore").splitlines():
-            columns = line.split()
-            if not columns or columns[0].lower() == "smiles":
-                continue
-            if generated_only and not _is_genetic_product_row(columns):
-                continue
-            score: float | None = None
-            numeric_values: list[float] = []
-            for value in columns[1:]:
-                try:
-                    parsed_score = float(value)
-                    if math.isfinite(parsed_score):
-                        numeric_values.append(parsed_score)
-                except ValueError:
-                    continue
-            # AutoGrow ranked SMI rows end with Vina score followed by ligand
-            # efficiency. Preserve the affinity-like Vina score when both are
-            # present; legacy three-column output has only one numeric score.
-            if numeric_values:
-                score = numeric_values[-2] if len(numeric_values) >= 2 else numeric_values[-1]
-            if columns[0] not in smiles_list:
-                smiles_list.append(columns[0])
-                scores.append(score)
-
-    # CSV/SDF fallbacks do not encode AutoGrow's mutant/crossover label, so
-    # they are evidence only and never a source of persisted genetic products.
-    if not generated_only:
-        for csv_file in output_dir.rglob("*.csv"):
-            try:
-                with open(csv_file, newline="") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        smi = row.get("SMILES") or row.get("smiles") or row.get("Smiles")
-                        score = row.get("score") or row.get("Score") or row.get("fitness")
-                        if smi and smi not in smiles_list:
-                            smiles_list.append(smi)
-                            if score:
-                                try:
-                                    parsed_score = float(score)
-                                    scores.append(
-                                        parsed_score if math.isfinite(parsed_score) else None
-                                    )
-                                except ValueError:
-                                    scores.append(None)
-                            else:
-                                scores.append(None)
-            except Exception:
-                continue
-
-    # Look for SDF files if no CSV found
-    if not generated_only and not smiles_list:
-        try:
-            from rdkit import Chem
-            for sdf_file in output_dir.rglob("*.sdf"):
-                supplier = Chem.SDMolSupplier(str(sdf_file))
-                for mol in supplier:
-                    if mol is not None:
-                        smi = Chem.MolToSmiles(mol)
-                        if smi:
-                            smiles_list.append(smi)
-                            scores.append(None)
-        except ImportError:
-            pass
-
-    return smiles_list, scores
-
-
-def _is_genetic_product_row(columns: list[str]) -> bool:
-    """Return whether an AutoGrow ranked row names a mutant or crossover product."""
-    metadata = " ".join(columns[1:])
-    return re.search(r"(?:^|\W)Gen[_-]?\d+_", metadata, re.IGNORECASE) is not None
-
-
-def _has_completed_generation_output(output_dir: Path, request: AutoGrow4Request) -> bool:
-    latest_generation = _latest_ranked_generation(output_dir)
-    return latest_generation is not None and latest_generation >= max(1, request.num_generations)
-
-
-def _latest_ranked_generation(output_dir: Path) -> int | None:
-    ranked_files = _ranked_output_files(output_dir)
-    if not ranked_files:
-        return None
-    generation_match = re.search(
-        r"generation[_-]?(\d+)", str(ranked_files[-1]), re.IGNORECASE
-    )
-    return int(generation_match.group(1)) if generation_match else None
-
-
-def _ranked_output_files(output_dir: Path) -> list[Path]:
-    return sorted(output_dir.rglob("*ranked*.smi"), key=_ranked_output_sort_key)
-
-
-def _ranked_output_sort_key(path: Path) -> tuple[int, int, str]:
-    generation_match = re.search(r"generation[_-]?(\d+)", str(path), re.IGNORECASE)
-    generation = int(generation_match.group(1)) if generation_match else -1
-    try:
-        modified_ns = path.stat().st_mtime_ns
-    except OSError:
-        modified_ns = -1
-    return generation, modified_ns, str(path)
-
-
-def _autogrow4_warnings(
-    exit_code: int,
-    generated_smiles: list[str],
-    scores: list[float | None],
-    *,
-    docker: bool = False,
-    partial_output: bool = False,
-    source_only_output: bool = False,
-) -> list[str]:
-    if partial_output:
-        return ["autogrow4_partial_generation_output"]
-    if source_only_output:
-        return ["autogrow4_generated_generation_missing"]
-    if exit_code != 0:
-        return ["autogrow4_docker_failed" if docker else "autogrow4_execution_failed"]
-    if not generated_smiles:
-        return ["autogrow4_output_missing_or_empty"]
-    if not any(score is not None for score in scores):
-        return ["autogrow4_ranked_fitness_missing"]
-    return []
-
-
-def _autogrow4_labels(success: bool, mode_label: str) -> list[str]:
-    outcome = "autogrow4_generated" if success else "autogrow4_generation_failed"
-    return [outcome, mode_label]
-
-
-def _autogrow4_provenance(
-    request: AutoGrow4Request,
-    *,
-    execution_mode: str,
-    command: list[str],
-    config: dict[str, Any],
-    docker_image: str | None = None,
-) -> dict[str, Any]:
-    grid = _grid_values(request)
-    return {
-        "execution_mode": execution_mode,
-        "docker_image": docker_image,
-        "command": command,
-        "config": config,
-        "receptor_file": str(Path(request.receptor_file).resolve()),
-        "grid_center": grid[0] if grid else None,
-        "grid_size": grid[1] if grid else None,
-        "num_generations": request.num_generations,
-        "tool_num_generations": config["num_generations"],
-        "source_pool_evaluation_generation": 0,
-        "population_size": request.population_size,
-        "effective_population_size": (
-            config["number_of_crossovers"]
-            + config["number_of_mutants"]
-            + config["number_elitism_advance_from_previous_gen"]
-        ),
-        "crossover_fraction": config["crossover_fraction"],
-        "optimization_mode": request.optimization_mode,
-        "score_semantics": "autogrow4_vina_affinity_kcal_mol",
-        "timeout_seconds": request.timeout_seconds,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Adapter status for tool detection
-# ---------------------------------------------------------------------------
-
-def autogrow4_tool_status() -> dict[str, Any]:
-    """Get AutoGrow4 tool status."""
-    status = check_autogrow4_available()
-    return {
-        "available": status["available"],
-        "mode": status.get("mode"),
-        "version": status.get("version"),
-        "docker_image": status.get("docker_image"),
-        "runtime_available": status.get("runtime_available", False),
-        "warning": status.get("warning"),
-        "docker_image_candidates": status.get("docker_image_candidates", []),
-        "configured_timeout_seconds": status.get("configured_timeout_seconds", 1200),
-        "config_source": status.get("config_source"),
-        "config_loaded": status.get("config_loaded", False),
-        "config_environment_overrides": status.get("config_environment_overrides", []),
-    }
-
-
-def _cleanup_docker_container(container_name: str) -> None:
-    """Force remove a Docker container."""
-    try:
-        subprocess.run(
-            ["docker", "rm", "-f", container_name],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        # Best effort cleanup, don't fail if it doesn't work
-        pass
+    return max(minimum, min(parsed, maximum)) if math.isfinite(parsed) else default

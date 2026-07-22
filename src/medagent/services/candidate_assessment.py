@@ -44,6 +44,7 @@ from medagent.services.docking_adapters import (
     run_external_docking,
     select_docking_tool,
 )
+from medagent.services.tool_config import get_tool_runtime_config, resolve_configured_path
 from medagent.services.docking_workflow import (
     prepare_ligand_from_smiles,
 )
@@ -99,13 +100,8 @@ DOCKING_RESULT_LABELS = {
     "rdkit_surrogate_docking",
     "gnina_adapter",
     "vina_adapter",
-    "diffdock_adapter",
     "gnina_external_docking",
-    "gnina_docker_docking",
     "vina_external_docking",
-    "vina_docker_docking",
-    "diffdock_external_docking",
-    "diffdock_docker_docking",
     "docking_strong",
     "docking_weak",
     "pose_confident",
@@ -1235,11 +1231,6 @@ def candidate_assessment_tool_status() -> dict[str, Any]:
         "rdkit": _package_status("rdkit"),
         "gnina": check_gnina_available(),
         "vina": check_vina_available(),
-        "diffdock": {
-            "available": False,
-            "disabled_by_policy": True,
-            "warning": "diffdock_removed_from_default_assessment_path",
-        },
         "oddt": _package_status("oddt"),
         "admetlab": _package_status("admetlab"),
         "chemprop": chemprop_tool_status(),
@@ -1907,7 +1898,6 @@ def _upsert_external_docking_result(
     if vina_score is None:
         vina_score = external_result.cnn_affinity
     cnn_score = external_result.cnn_score
-    diffdock_confidence = external_result.diffdock_confidence
     labels = list(external_result.labels or [])
     if not labels:
         labels = ["external_docking_adapter_used", f"{external_result.tool_name}_adapter"]
@@ -1920,8 +1910,6 @@ def _upsert_external_docking_result(
             labels.append("good_ligand_efficiency")
     if cnn_score is not None:
         labels.append("pose_confident" if cnn_score >= 0.6 else "pose_uncertain")
-    if diffdock_confidence is not None:
-        labels.append("diffdock_confidence_recorded")
     interaction_summary = analyze_pose_interactions(
         pose_file=external_result.pose_file,
         receptor_file=receptor_file,
@@ -1942,7 +1930,7 @@ def _upsert_external_docking_result(
     result.tool_run_id = external_result.adapter_mode
     result.vina_score = _rounded(vina_score)
     result.cnn_score = _rounded(cnn_score)
-    result.diffdock_confidence = _rounded(diffdock_confidence)
+    result.diffdock_confidence = None
     result.key_hbond_count = interaction_summary["key_hbond_count"]
     result.clash_count = interaction_summary["clash_count"]
     result.pose_file = external_result.pose_file
@@ -1960,12 +1948,6 @@ def _upsert_external_docking_result(
         "fallback_used": False,
         "result_kind": "external_docking",
         "cnn_affinity": external_result.cnn_affinity,
-        "diffdock_confidence": external_result.diffdock_confidence,
-        "diffdock_confidence_semantics": (
-            "model_specific_uncalibrated_score_higher_is_better"
-            if external_result.diffdock_confidence is not None
-            else None
-        ),
         "selected_pose_rank": external_result.selected_pose_rank,
         "pose_count": external_result.pose_count,
         "pose_selection_method": external_result.pose_selection_method,
@@ -2100,7 +2082,6 @@ def _attempt_external_retrosynthesis(
             smiles=molecule.smiles,
             output_dir=str(output_dir),
             max_steps=max_synthesis_steps,
-            docker_image=aizynthfinder_status.get("docker_image") or "aizynthfinder:latest",
             timeout_seconds=_retrosynthesis_timeout_seconds(),
         ),
         aizynthfinder_status,
@@ -2933,7 +2914,15 @@ def _existing_vina_receptor_file(receptor_path: Path, output_dir: Path) -> Path 
 
 
 def _prepare_vina_receptor_file(receptor_path: Path, output_dir: Path) -> tuple[str | None, list[str]]:
-    obabel = shutil.which("obabel")
+    openbabel_config = get_tool_runtime_config(
+        "openbabel", default_command="obabel", default_timeout_seconds=120
+    )
+    configured_obabel = resolve_configured_path(openbabel_config.command)
+    obabel = (
+        str(configured_obabel)
+        if configured_obabel is not None and configured_obabel.is_file()
+        else shutil.which("obabel")
+    )
     if obabel is None:
         return None, _vina_preparation_warnings(
             "vina_receptor_pdbqt_preparation_failed",
@@ -3122,16 +3111,6 @@ def _write_ligand_sdf(project: Project, molecule: Molecule) -> str | None:
         return None
 
 
-def _diffdock_ligand_file(
-    project: Project,
-    molecule: Molecule,
-    ligand_file: str | None,
-) -> str | None:
-    if ligand_file and Path(ligand_file).suffix.lower() == ".sdf":
-        return ligand_file
-    return _write_ligand_sdf(project, molecule)
-
-
 def _is_vector3(values: list[float] | None) -> bool:
     return values is not None and len(values) == 3
 
@@ -3154,13 +3133,7 @@ def _external_docking_available(tool_status: dict[str, Any]) -> bool:
 
 def _gnina_gpu_docking_available(tool_status: dict[str, Any]) -> bool:
     gnina_status = tool_status.get("gnina", {})
-    return bool(
-        gnina_status.get("available")
-        and not (
-            gnina_status.get("mode") == "docker"
-            and gnina_status.get("gpu_available") is False
-        )
-    )
+    return bool(gnina_status.get("available"))
 
 
 def _external_admet_available(tool_status: dict[str, Any]) -> bool:

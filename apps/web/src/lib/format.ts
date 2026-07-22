@@ -9,7 +9,7 @@ export function formatDate(value: string | null | undefined): string {
 }
 
 export function methodLabel(method: string | null | undefined): string {
-  const labels: Record<string, string> = { crem: 'CReM 片段编辑', reinvent4: 'REINVENT4 生成', autogrow4: 'AutoGrow4 生长' };
+  const labels: Record<string, string> = { crem: 'CReM 片段编辑', targetdiff: 'TargetDiff 口袋生成', autogrow4: 'AutoGrow4 生长' };
   return method ? labels[method.toLowerCase()] || method : '未记录';
 }
 

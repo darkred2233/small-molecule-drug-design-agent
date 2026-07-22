@@ -62,12 +62,13 @@ def test_docking_workflow_persists_result_with_current_database_schema(tmp_path,
     monkeypatch.setattr(
         "medagent.services.docking_workflow.run_external_docking",
         lambda request, tool_status: DockingToolResult(
-            adapter_mode="diffdock_docker_docking",
-            tool_name="diffdock",
+            adapter_mode="gnina_local_docking",
+            tool_name="gnina",
             success=True,
-            diffdock_confidence=1.1,
+            vina_score=-7.5,
+            cnn_score=0.81,
             pose_file=str(tmp_path / "pose.sdf"),
-            labels=["external_docking_adapter_used", "diffdock_adapter"],
+            labels=["gnina_local_executed", "external_docking_pose_confirmed"],
         ),
     )
 
@@ -88,14 +89,13 @@ def test_docking_workflow_persists_result_with_current_database_schema(tmp_path,
             receptor_pdb_file=str(tmp_path / "receptor.pdb"),
             binding_site_center=[1.0, 2.0, 3.0],
             binding_site_size=[18.0, 18.0, 18.0],
-            tool_status={"diffdock": {"available": True}},
+            tool_status={"gnina": {"available": True, "path": "gnina.exe"}, "vina": {"available": False}},
         )
 
         persisted = db.query(DockingResult).filter_by(molecule_id=molecule.molecule_id).one()
         assert result.success is True
         assert result.docking_result_id == persisted.id
-        assert result.cnn_score is None
-        assert result.diffdock_confidence == 1.1
-        assert persisted.cnn_score is None
-        assert persisted.diffdock_confidence == 1.1
-        assert persisted.raw_output["tool_name"] == "diffdock"
+        assert result.cnn_score == 0.81
+        assert result.vina_score == -7.5
+        assert persisted.cnn_score == 0.81
+        assert persisted.raw_output["tool_name"] == "gnina"

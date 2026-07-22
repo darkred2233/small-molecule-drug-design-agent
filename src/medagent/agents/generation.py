@@ -3,12 +3,12 @@
 from medagent.agents.autogrow4_agent import AutoGrow4Agent
 from medagent.agents.crem_agent import CremAgent
 from medagent.agents.generation_base import GenerationAgent
-from medagent.agents.reinvent4_agent import Reinvent4Agent
+from medagent.agents.targetdiff_agent import TargetDiffAgent
 from medagent.domain.schemas import AgentName, AgentResult, AgentTask
 
 
 GENERATION_AGENTS: dict[AgentName, GenerationAgent] = {
-    "reinvent4": Reinvent4Agent(),
+    "targetdiff": TargetDiffAgent(),
     "crem": CremAgent(),
     "autogrow4": AutoGrow4Agent(),
 }
@@ -23,6 +23,6 @@ __all__ = [
     "CremAgent",
     "GENERATION_AGENTS",
     "GenerationAgent",
-    "Reinvent4Agent",
+    "TargetDiffAgent",
     "run_generation_agent",
 ]

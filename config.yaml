@@ -91,21 +91,17 @@ tools:
 
   chemprop:
     enabled: true
-    mode: "docker"
+    mode: "local"
     batch_size: 100
 
   gnina:
     enabled: true
-    mode: "docker"
+    mode: "local"
     exhaustiveness: 8
 
   vina:
     enabled: true
     exhaustiveness: 8
-
-  diffdock:
-    enabled: false
-    mode: "docker"
 
 workflows:
   admet:

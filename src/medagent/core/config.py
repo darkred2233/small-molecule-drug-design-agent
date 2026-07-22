@@ -1,6 +1,5 @@
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,10 +7,6 @@ class Settings(BaseSettings):
     app_name: str = "小分子药物设计 Agent"
     database_url: str = "sqlite:///./.local/medagent.db"
 
-    storage_endpoint: str = "localhost:9000"
-    storage_access_key: str = "medagent"
-    storage_secret_key: str = "medagent-secret"
-    storage_bucket: str = "medagent-files"
     storage_local_root: str = "./.local/uploads"
 
     qwen_reasoning_model: str = "qwen3.7-max"
@@ -33,28 +28,6 @@ class Settings(BaseSettings):
     self_refutation_use_llm: bool = False
     self_refutation_provider: str = "deepseek"
     self_refutation_model: str = "deepseek-chat"
-    reinvent4_prior_file: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            "REINVENT4_PRIOR_FILE",
-            "MEDAGENT_REINVENT4_PRIOR_FILE",
-        ),
-    )
-    diffdock_model_dir: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            "DIFFDOCK_MODEL_DIR",
-            "MEDAGENT_DIFFDOCK_MODEL_DIR",
-        ),
-    )
-    diffdock_confidence_model_dir: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            "DIFFDOCK_CONFIDENCE_MODEL_DIR",
-            "MEDAGENT_DIFFDOCK_CONFIDENCE_MODEL_DIR",
-        ),
-    )
-
     model_config = SettingsConfigDict(
         env_prefix="MEDAGENT_",
         env_file=".env",

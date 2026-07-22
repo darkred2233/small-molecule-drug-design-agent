@@ -28,7 +28,7 @@ from medagent.services.docking_adapters import (
     run_external_docking,
 )
 from medagent.services.rdkit_enhanced import validate_and_calculate_enhanced
-from medagent.services.reinvent4_adapter import reinvent4_tool_status
+from medagent.services.targetdiff_adapter import targetdiff_tool_status
 
 
 router = APIRouter(prefix="/tools", tags=["计算工具"])
@@ -44,7 +44,7 @@ class ToolStatusResponse(BaseModel):
     chemprop: dict[str, Any] = Field(description="Chemprop状态")
     gnina: dict[str, Any] = Field(description="GNINA状态")
     vina: dict[str, Any] = Field(description="Vina状态")
-    reinvent4: dict[str, Any] = Field(description="REINVENT4状态")
+    targetdiff: dict[str, Any] = Field(description="TargetDiff状态")
     autogrow4: dict[str, Any] = Field(description="AutoGrow4状态")
     aizynthfinder: dict[str, Any] = Field(description="AiZynthFinder状态")
     summary: dict[str, Any] = Field(description="汇总信息")
@@ -80,7 +80,6 @@ class ADMETPredictRequest(BaseModel):
         ],
         description="预测性质列表"
     )
-    use_docker: bool = Field(default=False, description="是否使用Docker")
     timeout_seconds: int = Field(default=300, description="超时时间（秒）")
 
 
@@ -132,7 +131,7 @@ async def get_tools_status():
 
     返回每个工具的：
     - 是否可用
-    - 安装模式（python包/CLI/Docker）
+    - 安装模式（Python 包或本地 CLI）
     - 版本信息
     - 路径或镜像名
     """
@@ -146,7 +145,7 @@ async def get_tools_status():
     vina_status = check_vina_available()
 
     # 检查生成工具
-    reinvent4_status = reinvent4_tool_status()
+    targetdiff_status = targetdiff_tool_status()
     autogrow4_status = autogrow4_tool_status()
     aizynthfinder_status = aizynthfinder_tool_status()
 
@@ -156,7 +155,7 @@ async def get_tools_status():
         chemprop_status.get("available", False),
         gnina_status.get("available", False),
         vina_status.get("available", False),
-        reinvent4_status.get("available", False),
+        targetdiff_status.get("available", False),
         autogrow4_status.get("available", False),
         aizynthfinder_status.get("available", False),
     ])
@@ -166,7 +165,7 @@ async def get_tools_status():
         chemprop=chemprop_status,
         gnina=gnina_status,
         vina=vina_status,
-        reinvent4=reinvent4_status,
+        targetdiff=targetdiff_status,
         autogrow4=autogrow4_status,
         aizynthfinder=aizynthfinder_status,
         summary={
@@ -251,7 +250,6 @@ async def predict_admet(request: ADMETPredictRequest):
         smiles_list=request.smiles_list,
         molecule_ids=request.molecule_ids,
         properties=request.properties,
-        use_docker=request.use_docker,
         timeout_seconds=request.timeout_seconds,
     )
 
@@ -357,33 +355,6 @@ def _check_tool_cli(command: str, version_arg: str) -> dict[str, Any]:
             result["available"] = True
             result["version"] = proc.stdout.strip()
             result["path"] = command
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    return result
-
-
-def _check_tool_docker(image_name: str) -> dict[str, Any]:
-    """检查Docker镜像"""
-    import subprocess
-
-    result = {
-        "available": False,
-        "mode": None,
-        "docker_image": None,
-    }
-
-    try:
-        proc = subprocess.run(
-            ["docker", "image", "inspect", image_name],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            result["available"] = True
-            result["mode"] = "docker"
-            result["docker_image"] = image_name
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 

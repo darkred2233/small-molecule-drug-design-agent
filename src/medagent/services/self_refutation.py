@@ -399,7 +399,7 @@ def _build_molecule_summary(
         lines.append(
             "对接: "
             f"Vina={docking.vina_score}, GNINA_CNN={docking.cnn_score}, "
-            f"DiffDock_confidence={docking.diffdock_confidence}, 冲突数={docking.clash_count}"
+            f"CNN_score={docking.cnn_score}, 冲突数={docking.clash_count}"
         )
 
     if risk_factors:

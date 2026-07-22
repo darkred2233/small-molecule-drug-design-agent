@@ -66,13 +66,12 @@ def test_infra_utils_direct():
     print("✓ Infrastructure utils.py: all expected functions present")
 
 
-def test_infra_scripts():
-    """Test infrastructure scripts exist."""
+def test_local_runtime_scripts():
+    """Test local chemistry-runtime scripts exist."""
     scripts = [
-        "infra/backup.sh",
-        "infra/health_check.sh",
-        "infra/docker/docker-compose.yml",
-        "infra/docker/.env.example",
+        "scripts/install_local_tools.ps1",
+        "scripts/check_local_tools.py",
+        "scripts/start_local.ps1",
     ]
     for script in scripts:
         assert Path(script).exists(), f"Missing: {script}"
@@ -90,7 +89,7 @@ def main():
         test_reporting_tables_direct()
         test_reporting_pdf_direct()
         test_infra_utils_direct()
-        test_infra_scripts()
+        test_local_runtime_scripts()
         print()
         print("=" * 60)
         print("✓ All modules created successfully!")

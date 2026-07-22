@@ -1,7 +1,6 @@
 from sqlalchemy import create_engine, inspect, text
 
 from medagent.db.models import Base
-from migrations.add_docking_diffdock_confidence import apply_migration as apply_diffdock_migration
 from migrations.add_docking_raw_output import apply_migration
 from migrations.add_seed_ligand_activity_type import (
     apply_migration as apply_seed_activity_type_migration,
@@ -40,38 +39,6 @@ def test_add_docking_raw_output_upgrades_existing_sqlite_table(tmp_path):
             text("SELECT raw_output FROM docking_results WHERE id = 1")
         ).scalar_one()
     assert raw_output == "{}"
-
-
-def test_add_diffdock_confidence_upgrades_existing_sqlite_table(tmp_path):
-    database_url = f"sqlite:///{tmp_path / 'legacy-diffdock.db'}"
-    engine = create_engine(database_url)
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "CREATE TABLE docking_results ("
-                "id INTEGER PRIMARY KEY, molecule_id VARCHAR(64), cnn_score FLOAT)"
-            )
-        )
-        connection.execute(
-            text(
-                "INSERT INTO docking_results (id, molecule_id, cnn_score) "
-                "VALUES (1, 'MOL-LEGACY', 0.81)"
-            )
-        )
-
-    assert apply_diffdock_migration(database_url) is True
-    assert apply_diffdock_migration(database_url) is False
-
-    columns = {column["name"] for column in inspect(engine).get_columns("docking_results")}
-    assert "diffdock_confidence" in columns
-    with engine.connect() as connection:
-        values = connection.execute(
-            text(
-                "SELECT cnn_score, diffdock_confidence FROM docking_results "
-                "WHERE id = 1"
-            )
-        ).one()
-    assert values == (0.81, None)
 
 
 def test_add_seed_ligand_activity_type_upgrades_existing_sqlite_table(tmp_path):
@@ -119,7 +86,6 @@ def test_apply_all_is_idempotent_on_current_schema(tmp_path):
 
     expected = {
         "docking_raw_output": False,
-        "docking_diffdock_confidence": False,
         "seed_ligand_activity_type": False,
         "llm_critique_fields": [],
         "round_provenance": {"added_columns": [], "round_reports_created": False},

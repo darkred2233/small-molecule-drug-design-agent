@@ -92,12 +92,11 @@ def test_infra_utils_direct():
     print("✓ Infrastructure utils.py: all expected functions present")
 
 
-def test_infra_scripts():
-    """Test infrastructure scripts exist."""
-    assert Path("infra/backup.sh").exists(), "backup.sh should exist"
-    assert Path("infra/health_check.sh").exists(), "health_check.sh should exist"
-    assert Path("infra/docker/docker-compose.yml").exists(), "docker-compose.yml should exist"
-    assert Path("infra/docker/.env.example").exists(), ".env.example should exist"
+def test_local_runtime_scripts():
+    """Test local chemistry-runtime scripts exist."""
+    assert Path("scripts/install_local_tools.ps1").exists(), "local installer should exist"
+    assert Path("scripts/check_local_tools.py").exists(), "local tool checker should exist"
+    assert Path("scripts/start_local.ps1").exists(), "local start script should exist"
 
     print("✓ Infrastructure scripts: all deployment files present")
 
@@ -125,7 +124,7 @@ def main():
         test_reporting_tables_direct()
         test_reporting_pdf_direct()
         test_infra_utils_direct()
-        test_infra_scripts()
+        test_local_runtime_scripts()
         test_reporting_init()
 
         print()
@@ -139,10 +138,9 @@ def main():
         print("  - reporting/tables.py: Table generation utilities")
         print("  - reporting/pdf.py: PDF report generation")
         print("  - infra/utils.py: Health check utilities")
-        print("  - infra/backup.sh: Backup script")
-        print("  - infra/health_check.sh: Health check script")
-        print("  - infra/docker/docker-compose.yml: Infrastructure setup")
-        print("  - infra/docker/.env.example: Environment template")
+        print("  - scripts/install_local_tools.ps1: Local chemistry-tool installer")
+        print("  - scripts/check_local_tools.py: Local tool readiness checker")
+        print("  - scripts/start_local.ps1: Local application launcher")
         return 0
 
     except AssertionError as e:

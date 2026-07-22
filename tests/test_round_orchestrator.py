@@ -1,6 +1,59 @@
 from types import SimpleNamespace
 
+from medagent.core.config import Settings
+from medagent.db.models import Base, Project, ProjectResource
+from medagent.db.session import build_engine, build_session_factory
+from medagent.domain.schemas import TargetDiffCampaignConfig
+
 from medagent.pipeline.round_orchestrator import RoundOrchestrator
+
+
+def test_targetdiff_resource_resolution_prefers_explicit_project_pocket(tmp_path):
+    from medagent.services.targetdiff_resources import resolve_targetdiff_resources
+
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}")
+    engine = build_engine(settings)
+    Base.metadata.create_all(bind=engine)
+    session_factory = build_session_factory(settings)
+    explicit_pocket = tmp_path / "explicit-pocket.pdb"
+    fallback_pocket = tmp_path / "fallback-pocket.pdb"
+    explicit_pocket.write_text("HEADER EXPLICIT POCKET\n", encoding="utf-8")
+    fallback_pocket.write_text("HEADER FALLBACK POCKET\n", encoding="utf-8")
+
+    with session_factory() as db:
+        project = Project(project_id="PROJ-TARGETDIFF", name="TargetDiff resources")
+        db.add_all(
+            [
+                project,
+                ProjectResource(
+                    resource_id="POCKET-FALLBACK",
+                    project_id=project.project_id,
+                    resource_type="binding_pocket",
+                    scope="project",
+                    name="Fallback pocket",
+                    file_path=f"local://{fallback_pocket}",
+                ),
+                ProjectResource(
+                    resource_id="POCKET-EXPLICIT",
+                    project_id=project.project_id,
+                    resource_type="binding_pocket",
+                    scope="project",
+                    name="Explicit pocket",
+                    file_path=f"local://{explicit_pocket}",
+                ),
+            ]
+        )
+        db.flush()
+
+        bundle = resolve_targetdiff_resources(
+            db,
+            project,
+            TargetDiffCampaignConfig(pocket_resource_id="POCKET-EXPLICIT"),
+        )
+
+    assert bundle.pocket_file == str(explicit_pocket)
+    assert bundle.pocket_resource_id == "POCKET-EXPLICIT"
+    assert bundle.provenance["source"] == "project_resource"
 
 
 def test_round_assessment_maps_external_top_n_and_passes_round_id(monkeypatch):

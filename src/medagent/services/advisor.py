@@ -675,7 +675,7 @@ def _normalize_generation_size(value: Any) -> int:
 
 
 def _normalize_generation_strategies(value: Any) -> list[str]:
-    allowed = {"reinvent4", "crem", "autogrow4"}
+    allowed = {"targetdiff", "crem", "autogrow4"}
     if not isinstance(value, list):
         return ["crem"]
     strategies = [

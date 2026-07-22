@@ -396,7 +396,7 @@ class LLMClient:
                 "objective": "生成策略（JSON 解析失败）",
                 "campaign_config": {
                     "crem": {"enabled": False},
-                    "reinvent4": {"enabled": True, "num_molecules": 100, "mode": "sampling"},
+                    "targetdiff": {"enabled": False, "num_molecules": 100, "sampling_mode": "balanced"},
                     "autogrow4": {"enabled": False},
                 },
                 "rationale": f"LLM 输出解析失败: {str(e)}。已使用默认配置。",

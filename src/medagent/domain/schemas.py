@@ -48,7 +48,7 @@ class ConstraintRead(BaseModel):
     priority: int = Field(title="优先级")
 
 
-AgentName = Literal["reinvent4", "crem", "autogrow4"]
+AgentName = Literal["targetdiff", "crem", "autogrow4"]
 AgentBudget = Literal["low", "medium", "high"]
 EvidenceType = Literal[
     "admet_prediction",
@@ -561,7 +561,7 @@ class DockingResultRead(BaseModel):
     molecule_id: str = Field(title="Molecule id")
     vina_score: float | None = Field(title="Vina score")
     cnn_score: float | None = Field(title="GNINA CNN score")
-    diffdock_confidence: float | None = Field(title="DiffDock pose confidence")
+    diffdock_confidence: float | None = Field(title="Legacy pose confidence")
     key_hbond_count: int | None = Field(title="Key hydrogen bond count")
     clash_count: int | None = Field(title="Clash count")
     pose_file: str | None = Field(title="Pose file")
@@ -731,7 +731,7 @@ RoundStatus = Literal["draft", "ready", "running", "completed", "failed", "cance
 CampaignStatus = Literal["pending", "running", "completed", "failed", "skipped"]
 SearchIntensity = Literal["quick", "normal", "heavy"]
 SourcePoolPolicy = Literal["auto", "target_ligands", "previous_top", "user_uploaded"]
-Reinvent4Mode = Literal["rl_only", "light_tl_then_rl", "tl_then_rl"]
+TargetDiffSamplingMode = Literal["fast", "balanced", "thorough"]
 
 
 class TargetLigandRead(BaseModel):
@@ -800,21 +800,19 @@ class CremCampaignConfig(BaseModel):
     edit_depth: int = Field(default=2, ge=1, le=5, title="编辑深度")
 
 
-class Reinvent4CampaignConfig(BaseModel):
+class TargetDiffCampaignConfig(BaseModel):
     enabled: bool = Field(default=True, title="是否启用")
-    mode: Reinvent4Mode = Field(default="rl_only", title="运行模式")
-    rl_steps: int = Field(default=30, ge=5, le=200, title="RL 训练步数")
-    batch_size: int = Field(default=128, ge=16, le=1024, title="RL batch size")
-    sample_count: int = Field(default=100, ge=0, le=1000, title="生成候选数")
-    tl_epochs: int | None = Field(default=None, ge=1, le=100, title="TL epochs")
-    reward_profile: str = Field(default="default", title="reward 配置名")
-    seed_similarity_min: float = Field(default=0.35, ge=0, le=1, title="seed 相似度下限")
-    seed_similarity_max: float = Field(default=0.75, ge=0, le=1, title="seed 相似度上限")
-    seed_similarity_penalty_low: float = Field(default=0.25, ge=0, le=1, title="低相似度惩罚阈值")
-    seed_similarity_penalty_high: float = Field(default=0.85, ge=0, le=1, title="高相似度惩罚阈值")
-    property_targets: dict[str, Any] = Field(default_factory=dict, title="理化性质目标范围")
-    enable_docking_rerank: bool = Field(default=False, title="是否启用 docking 后处理 rerank")
-    docking_rerank_top_n: int = Field(default=50, ge=10, le=200, title="docking rerank 取 top N")
+    num_molecules: int = Field(default=100, ge=0, le=300, title="生成候选数")
+    sampling_mode: TargetDiffSamplingMode = Field(default="balanced", title="采样强度")
+    pocket_resource_id: str | None = Field(default=None, title="pocket PDB 资源编号")
+    binding_site_id: str | None = Field(default=None, title="binding site 编号")
+
+
+class TargetDiffResourceBundle(BaseModel):
+    pocket_file: str = Field(title="TargetDiff pocket .pdb file path")
+    pocket_resource_id: str | None = Field(default=None, title="project pocket resource ID")
+    binding_site_id: str | None = Field(default=None, title="binding site ID")
+    provenance: dict[str, Any] = Field(default_factory=dict, title="resource provenance")
 
 
 class AutoGrow4CampaignConfig(BaseModel):
@@ -872,7 +870,7 @@ class SelfRefutationRecommendation(BaseModel):
 class CampaignConfig(BaseModel):
     """所有 campaign 配置的容器。"""
     crem: CremCampaignConfig = Field(default_factory=CremCampaignConfig, title="CReM 配置")
-    reinvent4: Reinvent4CampaignConfig = Field(default_factory=Reinvent4CampaignConfig, title="REINVENT4 配置")
+    targetdiff: TargetDiffCampaignConfig = Field(default_factory=TargetDiffCampaignConfig, title="TargetDiff 配置")
     autogrow4: AutoGrow4CampaignConfig = Field(default_factory=AutoGrow4CampaignConfig, title="AutoGrow4 配置")
 
 

@@ -12,7 +12,7 @@
 2. 上传文献、结构文件、SMILES/SDF/CSV 等资料，构建 RAG 证据库。
 3. 通过自然语言聊天提取结构化约束，例如降低 hERG 风险、保留某个骨架、限制理化性质范围。
 4. 创建一轮 `ProjectRound` 草稿。
-5. 为本轮配置 `CampaignConfig`，分别控制 CReM、REINVENT4、AutoGrow4。
+5. 为本轮配置 `CampaignConfig`，分别控制 CReM、TargetDiff、AutoGrow4。
 6. 启动本轮后，系统执行生成、候选评估、综合排序、自我反驳，并创建下一轮草稿。
 7. 用户或后续中枢 LLM 根据本轮结果，继续调整下一轮策略。
 8. 报告模块基于数据库中已存在的证据输出项目报告。
@@ -36,10 +36,10 @@ GET  /projects/{project_id}/report
 ## 三种生成方式
 
 - CReM：适合围绕已有种子做局部片段替换，适合小步 SAR 优化和保守探索。
-- REINVENT4：适合更强的生成式优化，可用轻量迁移学习加强化学习，也可按项目目标配置奖励函数。
+- TargetDiff：根据本地 pocket PDB 进行口袋条件小分子生成；生成坐标仅为假设，必须由 GNINA 或 Vina 独立对接验证。
 - AutoGrow4：适合结合受体结构、结合口袋和对接搜索区域做对接引导的遗传式搜索。
 
-底层适配器仍保留真实工具优先、不可用时明确 fallback 的机制。新流程通过 `CremAgent`、`Reinvent4Agent`、`AutoGrow4Agent` 在每个 Campaign 内调用这些适配器。
+底层适配器只接受真实工具输出；工具不可用或失败时 Campaign 会明确标记失败，不会生成模拟候选。新流程通过 `CremAgent`、`TargetDiffAgent`、`AutoGrow4Agent` 在每个 Campaign 内调用这些适配器。
 
 ## 关键目录
 
@@ -80,3 +80,17 @@ pnpm dev
 ## 当前设计文档
 
 - `docs/ROUND_STRATEGY_REDESIGN_GUIDE.md`：无限轮次、中央 LLM 策略、三种生成方式和后续评估排名的改造说明。
+
+## Local Chemistry Tools
+
+Run `./scripts/install_local_tools.ps1` from PowerShell to create project-local
+Python environments and install the supported local tools. Run
+`./.venv/Scripts/python.exe scripts/check_local_tools.py --json` to inspect the
+actual readiness state after installation.
+
+Vina, Open Babel, AiZynthFinder, RDKit, CReM, and ADMET-AI run directly on the
+Windows host. GNINA and TargetDiff require an Ubuntu WSL distribution with GPU
+support; after installing Ubuntu WSL, run `scripts/install_wsl_gpu_tools.sh`
+inside that distribution. TargetDiff remains unavailable until its official
+checkpoint is installed and verified. AutoGrow4 remains unavailable until its
+source checkout and isolated environment complete successfully.

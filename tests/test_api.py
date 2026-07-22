@@ -203,7 +203,7 @@ def test_round_summary_exposes_the_active_assessment_progress(tmp_path):
                         project_id=project_id,
                         round_id=round_id,
                         agent_name="synthesis_agent",
-                        model_name="aizynthfinder_docker",
+                        model_name="aizynthfinder_local",
                         status="running",
                         output_json={
                             "progress": {
@@ -249,7 +249,7 @@ def test_strategy_confirmation_queues_background_round_execution(tmp_path, monke
         "objective": "Queue the round without blocking the HTTP response.",
         "campaign_config": {
             "crem": {"enabled": True, "num_molecules": 5, "edit_depth": 1},
-            "reinvent4": {"enabled": False, "sample_count": 0},
+            "targetdiff": {"enabled": False, "num_molecules": 0},
             "autogrow4": {"enabled": False, "num_molecules": 0},
         },
         "seed_policy": {"source": "all_seeds"},
@@ -458,7 +458,7 @@ $$$$
             db.add(
                 DockingResult(
                     molecule_id=molecule_id,
-                    tool_run_id="gnina_docker_docking",
+                    tool_run_id="gnina_local_docking",
                     vina_score=-3.33,
                     cnn_score=0.795,
                     pose_file=str(pose_file),
@@ -740,7 +740,7 @@ def test_strategy_revision_persists_history_and_agent_audit(tmp_path, monkeypatc
                 "objective": "Revised objective" if revised else "Initial objective",
                 "campaign_config": {
                     "crem": {"enabled": True, "num_molecules": 100, "edit_depth": 2},
-                    "reinvent4": {"enabled": False, "sample_count": 0},
+                    "targetdiff": {"enabled": False, "num_molecules": 0},
                     "autogrow4": {"enabled": False, "num_molecules": 0},
                 },
                 "seed_policy": {"source": "all_seeds"},
@@ -984,15 +984,16 @@ $$$$
             db.add(
                 DockingResult(
                     molecule_id="MOL-REPORT-PROVENANCE",
-                    tool_run_id="diffdock_docker_docking",
-                    diffdock_confidence=1.25,
+                    tool_run_id="gnina_local_docking",
+                    vina_score=-7.2,
+                    cnn_score=0.81,
                     pose_file=str(pose_file),
-                    labels=["external_docking_adapter_used", "diffdock_adapter"],
+                    labels=["external_docking_adapter_used", "gnina_adapter"],
                     raw_output={
-                        "tool_name": "diffdock",
+                        "tool_name": "gnina",
                         "selected_pose_rank": 1,
                         "pose_count": 10,
-                        "pose_selection_method": "diffdock_rank_1_by_confidence",
+                        "pose_selection_method": "gnina_output_mode_1",
                         "pose_interactions_computed": True,
                         "pose_interactions": {
                             "computed": True,
@@ -1054,7 +1055,7 @@ $$$$
         assert candidate["evidence_confidence_semantics"] == "heuristic_completeness_not_probability"
         assert candidate["docking"]["selected_pose_rank"] == 1
         assert candidate["docking"]["pose_count"] == 10
-        assert candidate["docking"]["pose_selection_method"] == "diffdock_rank_1_by_confidence"
+        assert candidate["docking"]["pose_selection_method"] == "gnina_output_mode_1"
         assert candidate["docking"]["best_pose_confirmed"] is True
         assert candidate["docking"]["pose_artifact_available"] is True
         assert candidate["docking"]["pose_file"] == str(pose_file)

@@ -1,43 +1,37 @@
+# All chemistry tools execute from local files or isolated local Python environments.
+# Environment variables named MEDAGENT_<TOOL>_COMMAND / _PYTHON / _WORKDIR override
+# these values for a workstation without modifying this file.
 tools:
   gnina:
-    command: gnina
-    docker_images:
-      - gnina/gnina:latest
-      - gnina/gnina:1.0.3
+    command: .local/tools/gnina/gnina.exe
     timeout_seconds: 300
   vina:
-    command: vina
-    docker_image: vina:latest
+    command: .local/tools/vina/vina.exe
     timeout_seconds: 300
+  openbabel:
+    command: .local/envs/chemtools/Scripts/obabel.exe
+    timeout_seconds: 120
   chemprop:
     command: chemprop
-    docker_image: chemprop:latest
     timeout_seconds: 300
-  reinvent4:
-    command: reinvent
-    docker_image: reinvent4:latest
-    timeout_seconds: 600
-    run_type: sampling
-    prior_env:
-      - REINVENT4_PRIOR_FILE
-      - MEDAGENT_REINVENT4_PRIOR_FILE
   autogrow4:
-    docker_image: autogrow4:latest
+    python_executable: .local/envs/autogrow4/python.exe
+    working_directory: .local/tools/AutoGrow4
+    command: RunAutogrow.py
     timeout_seconds: 1200
-    source_ref: 1b47b3fe2d9faa76a904533bea2312326a3f44c5
-    requires:
-      - receptor_file
-      - grid_center
-      - grid_size
+    required_paths:
+      - .local/tools/AutoGrow4/RunAutogrow.py
   aizynthfinder:
-    command: aizynthcli
-    docker_image: aizynthfinder:latest
-    config_env:
-      - AIZYNTHFINDER_CONFIG
-      - MEDAGENT_AIZYNTHFINDER_CONFIG
-    data_env:
-      - AIZYNTHFINDER_DATA_DIR
-      - MEDAGENT_AIZYNTHFINDER_DATA_DIR
-    data_dir: data/aizynthfinder
-    output_dir: data/retrosynthesis
+    python_executable: .local/envs/aizynthfinder/Scripts/python.exe
+    command: .local/envs/aizynthfinder/Scripts/aizynthcli.exe
     timeout_seconds: 900
+    required_paths:
+      - data/aizynthfinder/config.yml
+  targetdiff:
+    python_executable: .local/envs/targetdiff/python.exe
+    working_directory: .local/tools/TargetDiff
+    command: scripts/sample_for_pdb.py
+    timeout_seconds: 1800
+    required_paths:
+      - .local/tools/TargetDiff/scripts/sample_for_pdb.py
+      - .local/models/targetdiff/pretrained.pt

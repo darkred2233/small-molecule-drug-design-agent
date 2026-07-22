@@ -12,7 +12,7 @@ class StrategyValidationError(Exception):
 
 class StrategyValidator:
     MAX_CREM_MOLECULES = 500
-    MAX_REINVENT4_MOLECULES = 1000
+    MAX_TARGETDIFF_MOLECULES = 300
     MAX_AUTOGROW4_MOLECULES = 300
     MAX_AUTOGROW4_GENERATIONS = 50
     MW_MIN = 100
@@ -90,7 +90,7 @@ class StrategyValidator:
         warnings: list[str],
     ) -> dict[str, Any]:
         normalized: dict[str, Any] = {}
-        for method in ("crem", "reinvent4", "autogrow4"):
+        for method in ("crem", "targetdiff", "autogrow4"):
             value = campaign_config.get(method) or {}
             normalized[method] = dict(value) if isinstance(value, dict) else {}
 
@@ -109,25 +109,28 @@ class StrategyValidator:
             crem["enabled"] = False
             warnings.append("CReM 需要至少一个 seed ligand，当前轮次已禁用")
 
-        reinvent4 = normalized["reinvent4"]
-        if "sample_count" not in reinvent4 and "num_molecules" in reinvent4:
-            reinvent4["sample_count"] = reinvent4.pop("num_molecules")
-        reinvent4["sample_count"] = self._bounded_count(
-            reinvent4.get("sample_count", 100), self.MAX_REINVENT4_MOLECULES, 10, warnings, "REINVENT4"
+        targetdiff = normalized["targetdiff"]
+        targetdiff["num_molecules"] = self._bounded_count(
+            targetdiff.get("num_molecules", 100),
+            self.MAX_TARGETDIFF_MOLECULES,
+            10,
+            warnings,
+            "TargetDiff",
         )
-        mode_aliases = {
-            "sampling": "rl_only",
-            "light_transfer": "light_tl_then_rl",
-            "full_transfer": "tl_then_rl",
-        }
-        mode = mode_aliases.get(reinvent4.get("mode"), reinvent4.get("mode", "rl_only"))
-        if mode not in {"rl_only", "light_tl_then_rl", "tl_then_rl"}:
-            mode = "rl_only"
-            warnings.append("REINVENT4 模式无效，已调整为 rl_only")
-        reinvent4["mode"] = mode
-        reinvent4["rl_steps"] = self._bounded_int(reinvent4.get("rl_steps", 30), 5, 200, 30)
-        reinvent4["batch_size"] = self._bounded_int(reinvent4.get("batch_size", 128), 16, 1024, 128)
-        self._disable_if_unavailable(reinvent4, "reinvent4", tool_availability, warnings)
+        targetdiff.setdefault("sampling_mode", "balanced")
+        if targetdiff["sampling_mode"] not in {"fast", "balanced", "thorough"}:
+            targetdiff["sampling_mode"] = "balanced"
+            warnings.append("TargetDiff sampling mode is invalid; reset to balanced")
+        self._disable_if_unavailable(targetdiff, "targetdiff", tool_availability, warnings)
+        summary = data_context.get("data_summary") or {}
+        has_targetdiff_pocket = bool(
+            (summary.get("resource_types") or {}).get("binding_pocket")
+            or summary.get("prepared_binding_site_count")
+            or summary.get("binding_site_count")
+        )
+        if targetdiff.get("enabled") and not has_targetdiff_pocket:
+            targetdiff["enabled"] = False
+            warnings.append("TargetDiff requires a local pocket PDB or binding site; disabled for this round")
 
         autogrow4 = normalized["autogrow4"]
         autogrow4["num_molecules"] = self._bounded_count(

@@ -1037,7 +1037,7 @@ def _detect_tool_availability() -> dict[str, bool]:
     """检测生成工具的可用性。"""
     availability = {
         "crem": False,
-        "reinvent4": False,
+        "targetdiff": False,
         "autogrow4": False,
     }
 
@@ -1048,10 +1048,10 @@ def _detect_tool_availability() -> dict[str, bool]:
     except Exception:
         pass
 
-    # 检测 REINVENT4
+    # 检测 TargetDiff
     try:
-        from medagent.services.reinvent4_adapter import check_reinvent4_available
-        availability["reinvent4"] = check_reinvent4_available()
+        from medagent.services.targetdiff_adapter import targetdiff_tool_status
+        availability["targetdiff"] = targetdiff_tool_status()
     except Exception:
         pass
 

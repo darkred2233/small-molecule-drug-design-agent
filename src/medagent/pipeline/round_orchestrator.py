@@ -23,7 +23,7 @@ from medagent.domain.schemas import (
     AutoGrow4CampaignConfig,
     CampaignConfig,
     CremCampaignConfig,
-    Reinvent4CampaignConfig,
+    TargetDiffCampaignConfig,
 )
 from medagent.pipeline.state import (
     CAMPAIGN_COMPLETED,
@@ -172,40 +172,43 @@ class RoundOrchestrator:
         db.flush()
         return campaign
 
-    def run_reinvent4_campaign(
+    def run_targetdiff_campaign(
         self,
         db: Session,
         project: Project,
         round_obj: ProjectRound,
-        config: Reinvent4CampaignConfig,
+        config: TargetDiffCampaignConfig,
         seeds: list[str],
-        reference_ligands: list[str] | None = None,
         seed_molecule_ids: list[str] | None = None,
     ) -> CampaignRun:
-        """运行 REINVENT4 campaign。"""
+        """运行 TargetDiff pocket-conditioned campaign。"""
         campaign = self._create_campaign_run(
-            db, project, round_obj, "reinvent4", config.model_dump(), seed_molecule_ids or []
+            db, project, round_obj, "targetdiff", config.model_dump(), seed_molecule_ids or []
         )
         campaign.status = CAMPAIGN_RUNNING
         campaign.started_at = datetime.now(UTC)
         db.flush()
 
         try:
-            from medagent.agents.reinvent4_agent import Reinvent4Agent
+            from medagent.services.targetdiff_resources import resolve_targetdiff_resources
 
-            agent = Reinvent4Agent()
+            bundle = resolve_targetdiff_resources(db, project, config)
+            campaign.resource_bundle_json = bundle.model_dump()
+
+            from medagent.agents.targetdiff_agent import TargetDiffAgent
+
+            agent = TargetDiffAgent()
             campaign_config = config.model_dump()
-            if reference_ligands:
-                campaign_config["reference_ligand_count"] = len(reference_ligands)
 
             task = AgentTask(
                 round=round_obj.round_number,
-                agent="reinvent4",
-                seed_molecules=reference_ligands or seeds,
-                constraints={"requested_count": config.sample_count},
+                agent="targetdiff",
+                seed_molecules=seeds,
+                constraints={"requested_count": config.num_molecules},
                 round_id=round_obj.round_id,
                 campaign_run_id=campaign.campaign_run_id,
                 campaign_config=campaign_config,
+                resource_bundle=bundle.model_dump(),
             )
             result = agent.run(task)
 
@@ -216,17 +219,13 @@ class RoundOrchestrator:
                 campaign.output_molecule_ids = molecule_ids
                 campaign.status = CAMPAIGN_COMPLETED
 
-                # optional docking-informed rerank
-                if config.enable_docking_rerank:
-                    self._docking_rerank(db, project, round_obj, molecule_ids, config.docking_rerank_top_n)
-
             else:
                 campaign.status = CAMPAIGN_FAILED
                 campaign.warnings_json = result.warnings
 
         except Exception as exc:
             campaign.status = CAMPAIGN_FAILED
-            campaign.warnings_json = [f"reinvent4_campaign_exception:{type(exc).__name__}:{exc}"]
+            campaign.warnings_json = [f"targetdiff_campaign_exception:{type(exc).__name__}:{exc}"]
 
         campaign.completed_at = datetime.now(UTC)
         db.flush()
@@ -414,11 +413,11 @@ class RoundOrchestrator:
                 effective_seed_ids,
             )
 
-        # REINVENT4
-        if campaign_config.reinvent4.enabled:
-            campaigns["reinvent4"] = self.run_reinvent4_campaign(
-                db, project, round_obj, campaign_config.reinvent4,
-                effective_seeds, reference_ligands, effective_seed_ids
+        # TargetDiff
+        if campaign_config.targetdiff.enabled:
+            campaigns["targetdiff"] = self.run_targetdiff_campaign(
+                db, project, round_obj, campaign_config.targetdiff,
+                effective_seeds, effective_seed_ids
             )
 
         # AutoGrow4
@@ -658,7 +657,7 @@ class RoundOrchestrator:
         """检测工具可用性。"""
         availability = {
             "crem": False,
-            "reinvent4": False,
+            "targetdiff": False,
             "autogrow4": False,
         }
 
@@ -669,10 +668,10 @@ class RoundOrchestrator:
         except Exception:
             pass
 
-        # REINVENT4
+        # TargetDiff
         try:
-            from medagent.services.reinvent4_adapter import check_reinvent4_available
-            availability["reinvent4"] = check_reinvent4_available()
+            from medagent.services.targetdiff_adapter import targetdiff_tool_status
+            availability["targetdiff"] = targetdiff_tool_status()
         except Exception:
             pass
 

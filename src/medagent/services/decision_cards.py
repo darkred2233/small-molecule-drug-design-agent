@@ -396,10 +396,6 @@ def _assessment_support_factors(molecule: Molecule, evidence: DecisionEvidence) 
             docking_parts.append(f"Vina {_fmt_number(evidence.docking.vina_score)}")
         if evidence.docking.cnn_score is not None:
             docking_parts.append(f"GNINA CNN {_fmt_number(evidence.docking.cnn_score)}")
-        if evidence.docking.diffdock_confidence is not None:
-            docking_parts.append(
-                f"DiffDock confidence {_fmt_number(evidence.docking.diffdock_confidence)}"
-            )
         if evidence.docking.key_hbond_count is not None:
             docking_parts.append(f"关键氢键 {evidence.docking.key_hbond_count} 个")
     if docking_parts:

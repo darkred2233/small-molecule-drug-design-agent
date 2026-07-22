@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -451,7 +450,6 @@ def _score_docking(result: DockingResult | None) -> ComponentScore:
         raw_output.get("estimated_affinity_like_score") if surrogate else result.vina_score
     )
     cnn_score = raw_output.get("estimated_pose_confidence") if surrogate else result.cnn_score
-    diffdock_confidence = None if surrogate else result.diffdock_confidence
     key_hbond_count = (
         raw_output.get("estimated_key_hbond_count") if surrogate else result.key_hbond_count
     )
@@ -460,9 +458,6 @@ def _score_docking(result: DockingResult | None) -> ComponentScore:
     if cnn_score is not None:
         pose_score = _clamp(float(cnn_score), 0, 1)
         pose_score_method = "gnina_cnn_score"
-    elif diffdock_confidence is not None:
-        pose_score = _diffdock_confidence_ranking_score(float(diffdock_confidence))
-        pose_score_method = "uncalibrated_sigmoid_for_within_project_ranking_only"
     else:
         pose_score = 0.55
         pose_score_method = "neutral_missing_pose_confidence"
@@ -477,7 +472,7 @@ def _score_docking(result: DockingResult | None) -> ComponentScore:
     if not surrogate and cnn_score is not None and cnn_score < 0.35:
         blockers.append("low_pose_confidence")
 
-    confidence_credit = 0.15 if surrogate else (0.9 if diffdock_confidence is not None else 1.0)
+    confidence_credit = 0.15 if surrogate else 1.0
 
     return ComponentScore(
         available=True,
@@ -491,7 +486,6 @@ def _score_docking(result: DockingResult | None) -> ComponentScore:
             "risk_score": round(risk, 3),
             "vina_score": vina_score,
             "cnn_score": None if surrogate else result.cnn_score,
-            "diffdock_confidence": diffdock_confidence,
             "pose_score_method": pose_score_method,
             "estimated_pose_confidence": cnn_score if surrogate else None,
             "key_hbond_count": None if surrogate else result.key_hbond_count,
@@ -502,17 +496,6 @@ def _score_docking(result: DockingResult | None) -> ComponentScore:
         },
         blockers=blockers,
     )
-
-
-def _diffdock_confidence_ranking_score(value: float) -> float:
-    """Map an uncalibrated DiffDock score monotonically for ranking, never as probability."""
-    if value >= 60:
-        return 1.0
-    if value <= -60:
-        return 0.0
-    return _clamp(1.0 / (1.0 + math.exp(-value)), 0, 1)
-
-
 def _score_admet(result: ADMETResult | None) -> ComponentScore:
     if result is None:
         return ComponentScore(

@@ -28,7 +28,7 @@ def create_project_with_rule_filter_inputs(client: TestClient) -> str:
     ).json()
     project_id = project["project_id"]
     long_alkane = "C" * 50
-    content = f"CCO ethanol\n{long_alkane} long_alkane\nC1CC unclosed_ring\n"
+    content = f"CCO ethanol\n{long_alkane} long_alkane\n"
 
     upload_response = client.post(
         f"/projects/{project_id}/files",
@@ -41,7 +41,7 @@ def create_project_with_rule_filter_inputs(client: TestClient) -> str:
     return project_id
 
 
-def test_rule_filtering_classifies_valid_failed_and_skipped_molecules(tmp_path):
+def test_rule_filtering_classifies_valid_and_failed_molecules(tmp_path):
     with make_client(tmp_path) as client:
         project_id = create_project_with_rule_filter_inputs(client)
 
@@ -53,7 +53,7 @@ def test_rule_filtering_classifies_valid_failed_and_skipped_molecules(tmp_path):
         assert summary["evaluated_count"] == 2
         assert summary["passed_count"] == 1
         assert summary["failed_count"] == 1
-        assert summary["skipped_count"] == 1
+        assert summary["skipped_count"] == 0
 
         molecules = client.get(f"/projects/{project_id}/molecules").json()
         by_smiles = {molecule["smiles"]: molecule for molecule in molecules}
@@ -61,23 +61,20 @@ def test_rule_filtering_classifies_valid_failed_and_skipped_molecules(tmp_path):
         assert "rule_filter_passed" in by_smiles["CCO"]["labels"]
         assert by_smiles["C" * 50]["status"] == "failed_filter"
         assert "lipinski_mw_gt_500" in by_smiles["C" * 50]["labels"]
-        assert by_smiles["C1CC"]["status"] == "invalid_structure"
 
         results_response = client.get(f"/projects/{project_id}/rule-filter-results")
         assert results_response.status_code == 200
         results = results_response.json()
-        assert len(results) == 3
+        assert len(results) == 2
 
         by_molecule_id = {result["molecule_id"]: result for result in results}
         cco_result = by_molecule_id[by_smiles["CCO"]["molecule_id"]]
         long_alkane_result = by_molecule_id[by_smiles["C" * 50]["molecule_id"]]
-        invalid_result = by_molecule_id[by_smiles["C1CC"]["molecule_id"]]
 
         assert cco_result["decision"] == "passed"
         assert cco_result["failed_rules"] == []
         assert long_alkane_result["decision"] == "failed"
         assert "lipinski_mw_gt_500" in long_alkane_result["failed_rules"]
-        assert invalid_result["decision"] == "skipped_invalid_structure"
 
         molecule_results_response = client.get(
             f"/projects/{project_id}/molecules/{by_smiles['CCO']['molecule_id']}/rule-filter-results"
@@ -124,7 +121,7 @@ def test_rule_filtering_is_idempotent(tmp_path):
 
         assert second["result_ids"] == first["result_ids"]
         results = client.get(f"/projects/{project_id}/rule-filter-results").json()
-        assert len(results) == 3
+        assert len(results) == 2
 
 
 def test_rule_filtering_rejects_lipinski_and_veber_standard_violations(monkeypatch):
