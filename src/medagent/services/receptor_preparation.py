@@ -156,16 +156,18 @@ def project_docking_config(
         return {}
 
     grid_box = site.grid_box or {}
-    receptor_reference = (
+    raw_receptor_reference = site.receptor_file or grid_box.get("receptor_file")
+    prepared_receptor_reference = (
         site.prepared_receptor_file
-        or site.receptor_file
         or grid_box.get("prepared_receptor_file")
-        or grid_box.get("receptor_file")
     )
+    receptor_reference = prepared_receptor_reference or raw_receptor_reference
     resolver = path_resolver or resolve_receptor_path
     return {
         "binding_site_id": site.binding_site_id,
         "protein_file": resolver(receptor_reference),
+        "raw_receptor_file": resolver(raw_receptor_reference),
+        "prepared_receptor_file": resolver(prepared_receptor_reference),
         "grid_center": grid_box.get("center") or grid_box.get("grid_center"),
         "grid_size": grid_box.get("size") or grid_box.get("grid_size"),
         "key_residues": site.key_residues or [],

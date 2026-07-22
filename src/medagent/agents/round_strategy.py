@@ -134,7 +134,7 @@ class RoundStrategyAgent:
 
         assessment_config = {
             "mode": "external_top_n",
-            "top_n": min(50, max(10, base_count)),
+            "top_n": min(10, max(3, (base_count + 19) // 20)),
             "skip_docking": False,
             "skip_admet": False,
             "skip_synthesis": False,

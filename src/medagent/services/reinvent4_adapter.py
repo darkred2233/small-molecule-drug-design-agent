@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -96,7 +97,8 @@ def check_reinvent4_available() -> dict[str, Any]:
         **runtime_config.as_status(),
     }
     prior_file = _resolve_prior_file()
-    result["model_configured"] = prior_file is not None
+    prior_error = _prior_file_validation_error(prior_file)
+    result["model_configured"] = prior_file is not None and prior_error is None
     result["prior_file"] = str(prior_file) if prior_file else None
 
     path = shutil.which(runtime_config.command or "reinvent")
@@ -116,7 +118,7 @@ def check_reinvent4_available() -> dict[str, Any]:
                 result["path"] = path
                 result["version"] = _reinvent_version()
                 if not result["model_configured"]:
-                    result["warning"] = "reinvent4_prior_not_configured"
+                    result["warning"] = prior_error or "reinvent4_prior_not_configured"
                 return result
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -145,7 +147,7 @@ def check_reinvent4_available() -> dict[str, Any]:
                 if not result["runtime_available"]:
                     result["warning"] = "reinvent4_runtime_probe_failed"
                 elif not result["model_configured"]:
-                    result["warning"] = "reinvent4_prior_not_configured"
+                    result["warning"] = prior_error or "reinvent4_prior_not_configured"
                 return result
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -171,6 +173,14 @@ def run_reinvent4_generation(
         reinvent4_status = check_reinvent4_available()
 
     request_prior = _resolve_prior_file(request.prior_file)
+    prior_error = _prior_file_validation_error(request_prior)
+    if prior_error is not None:
+        return Reinvent4Result(
+            adapter_mode="reinvent4_model_invalid",
+            tool_name="reinvent4",
+            success=False,
+            warnings=[prior_error],
+        )
     if (
         not reinvent4_status.get("available")
         and reinvent4_status.get("runtime_available")
@@ -185,6 +195,13 @@ def run_reinvent4_generation(
         }
 
     if not reinvent4_status.get("available"):
+        if reinvent4_status.get("warning") == "reinvent4_prior_file_invalid":
+            return Reinvent4Result(
+                adapter_mode="reinvent4_model_invalid",
+                tool_name="reinvent4",
+                success=False,
+                warnings=["reinvent4_prior_file_invalid"],
+            )
         if reinvent4_status.get("runtime_available") and not reinvent4_status.get(
             "model_configured"
         ):
@@ -1082,6 +1099,16 @@ def _resolve_prior_file(value: str | None = None) -> Path | None:
         return path if path.is_file() and path.stat().st_size > 0 else None
     except OSError:
         return None
+
+
+def _prior_file_validation_error(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return "reinvent4_prior_file_invalid" if archive.testzip() else None
+    except (OSError, zipfile.BadZipFile):
+        return "reinvent4_prior_file_invalid"
 
 
 def _reinvent4_warnings(

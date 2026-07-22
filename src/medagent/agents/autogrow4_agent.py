@@ -30,7 +30,7 @@ class AutoGrow4Agent(GenerationAgent):
         # 优先从 resource_bundle 读取
         bundle = task.resource_bundle
         if bundle:
-            receptor_file = bundle.get("receptor_file")
+            receptor_file = _local_file_path(bundle.get("receptor_file"))
             source_file = bundle.get("source_compounds_file")
             if not receptor_file:
                 return "autogrow4_resource_bundle_missing_receptor_file"
@@ -52,7 +52,7 @@ class AutoGrow4Agent(GenerationAgent):
             return None
 
         # 兼容旧模式：从 constraints 读取
-        receptor_file = task.constraints.get("receptor_file")
+        receptor_file = _local_file_path(task.constraints.get("receptor_file"))
         if not receptor_file:
             return "autogrow4_requires_receptor_file_or_resource_bundle"
         try:
@@ -88,7 +88,7 @@ class AutoGrow4Agent(GenerationAgent):
         campaign_config = task.campaign_config or {}
 
         if bundle:
-            enhanced_constraints["receptor_file"] = bundle["receptor_file"]
+            enhanced_constraints["receptor_file"] = _local_file_path(bundle["receptor_file"])
             enhanced_constraints["grid_center"] = bundle["grid_center"]
             enhanced_constraints["grid_size"] = bundle["grid_size"]
 
@@ -101,6 +101,9 @@ class AutoGrow4Agent(GenerationAgent):
 
         enhanced_constraints["num_generations"] = generations
         enhanced_constraints["population_size"] = population_size
+        enhanced_constraints["crossover_fraction"] = campaign_config.get(
+            "crossover_fraction", 0.5
+        )
 
         # source pool 作为 seed
         seeds = list(task.seed_molecules)
@@ -161,3 +164,9 @@ def _read_source_compounds(path: Path) -> list[str]:
             if smiles:
                 smiles_list.append(smiles)
     return smiles_list
+
+
+def _local_file_path(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value).removeprefix("local://")

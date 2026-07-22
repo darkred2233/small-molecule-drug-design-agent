@@ -859,7 +859,12 @@ def _replace_project_rankings(
         query = query.filter(Ranking.round_id.is_(None))
     else:
         query = query.filter(Ranking.round_id == round_id)
-    query.delete(synchronize_session=False)
+    # A bulk delete leaves already-loaded Ranking instances stale in the
+    # session. SQLite can reuse their primary keys below, causing an identity
+    # map conflict when rankings are regenerated in the same request.
+    for existing_ranking in query.all():
+        db.delete(existing_ranking)
+    db.flush()
     for index, scored in enumerate(ranked_molecules, start=1):
         if scored.final_decision == "reject":
             if scored.molecule.status not in TERMINAL_FAILURE_STATUSES:

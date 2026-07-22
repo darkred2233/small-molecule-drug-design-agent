@@ -10,6 +10,7 @@ from medagent.db.models import (
     Base,
     DockingResult,
     Molecule,
+    MoleculeProperty,
     Project,
     ProjectRound,
     Ranking,
@@ -148,6 +149,11 @@ def test_campaign_and_generated_molecule_persist_lineage():
         assert molecule.parent_molecule_ids == ["SEED-2", "SEED-1"]
         assert molecule.provenance_json["round_id"] == round_obj.round_id
         assert molecule.generation_metadata_json["rationale"] == "single mutation"
+        properties = db.query(MoleculeProperty).filter_by(molecule_id=molecule.molecule_id).one()
+        assert molecule.status == "structure_validated"
+        assert properties.mw is not None
+        assert properties.logp is not None
+        assert properties.tpsa is not None
 
 
 def test_explicit_seed_selection_preserves_user_order():
@@ -254,6 +260,24 @@ def test_round_report_excludes_other_round_assessments_and_orders_top_rankings()
                 molecule_id=molecule.molecule_id,
                 round_id=current_round.round_id,
                 vina_score=-8.0,
+                cnn_score=0.72,
+                key_hbond_count=2,
+                clash_count=0,
+                pose_file="C:/poses/MOL-REPORT-SCOPED.sdf",
+                raw_output={
+                    "selected_pose_rank": 1,
+                    "pose_count": 9,
+                    "pose_selection_method": "gnina_best_affinity",
+                    "best_pose_confirmed": True,
+                    "pose_interactions_computed": True,
+                    "pose_interactions": {
+                        "computed": True,
+                        "hbond_count": 3,
+                        "key_hbond_count": 2,
+                        "clash_count": 0,
+                        "key_residue_interactions": [{"residue": "CYS532"}],
+                    },
+                },
             ),
             ADMETResult(
                 molecule_id=molecule.molecule_id,
@@ -333,6 +357,11 @@ def test_round_report_excludes_other_round_assessments_and_orders_top_rankings()
         assert report["comparison_with_previous"]["current_top_score"] == 0.9
         assert report["comparison_with_previous"]["parent_top_score"] == 0.5
         assert report["comparison_with_previous"]["score_improvement"] == 0.4
+        docking = report["ranking"]["top_10"][1]["docking"]
+        assert docking["pose_interactions_computed"] is True
+        assert docking["pose_interactions"]["key_residue_interactions"] == [
+            {"residue": "CYS532"}
+        ]
 
 
 def test_next_round_auto_strategy_stays_ready_for_user_confirmation(monkeypatch):

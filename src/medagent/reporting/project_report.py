@@ -720,6 +720,8 @@ def _docking_summary(result: DockingResult | None) -> dict[str, Any] | None:
         "pose_selection_method": pose_selection_method,
         "best_pose_confirmed": best_pose_confirmed,
         "labels": result.labels or [],
+        "pose_interactions": raw_output.get("pose_interactions"),
+        "pose_interactions_computed": raw_output.get("pose_interactions_computed"),
         "raw_output": raw_output,
     }
 

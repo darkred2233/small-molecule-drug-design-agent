@@ -211,7 +211,7 @@ class StrategyValidator:
             warnings.append("评估模式无效，已调整为 external_top_n")
         validated["mode"] = mode
         if mode == "external_top_n":
-            validated["top_n"] = self._bounded_int(validated.get("top_n", 50), 1, 200, 50)
+            validated["top_n"] = self._bounded_int(validated.get("top_n", 10), 1, 200, 10)
         for field in ("skip_docking", "skip_admet", "skip_synthesis"):
             validated[field] = self._as_bool(validated.get(field, False))
         return validated

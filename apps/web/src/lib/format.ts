@@ -15,7 +15,7 @@ export function methodLabel(method: string | null | undefined): string {
 
 export function statusLabel(status: string | null | undefined): string {
   const labels: Record<string, string> = {
-    created: '已创建', draft: '策略草案', pending: '待确认', confirmed: '已确认', running: '执行中', completed: '已完成', failed: '失败',
+    created: '已创建', draft: '策略草案', pending: '待确认', confirmed: '已确认', running: '执行中', completed: '已完成', failed: '失败', disabled: '未启用', skipped: '已跳过',
     pipeline_queued: '已排队', pipeline_running: '执行中', pipeline_completed: '已完成', pipeline_failed: '失败',
   };
   return status ? labels[status.toLowerCase()] || status : '未知';

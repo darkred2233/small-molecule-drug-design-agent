@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import medagent.api.app as api_app
 from medagent.api.app import create_app
 from medagent.core.config import Settings
-from medagent.db.models import Critique
+from medagent.db.models import Base, Critique, Molecule, MoleculeProperty, Project
+from medagent.db.session import build_engine, build_session_factory
 from medagent.services import candidate_assessment
 from medagent.services.admet_adapter import (
     ChempropADMETOutput,
@@ -125,6 +126,111 @@ def _successful_docking_result(tmp_path, request) -> DockingToolResult:
         labels=["external_docking_adapter_used", "gnina_adapter"],
         stdout="Affinity: -8.4\nCNNscore: 0.72\nCNNaffinity: -7.8\n",
     )
+
+
+def test_gnina_failure_retries_with_prepared_cpu_vina_inputs(tmp_path, monkeypatch):
+    receptor = tmp_path / "receptor.pdb"
+    ligand = tmp_path / "ligand.sdf"
+    vina_receptor = tmp_path / "receptor.pdbqt"
+    vina_ligand = tmp_path / "ligand.pdbqt"
+    for path in (receptor, ligand, vina_receptor, vina_ligand):
+        path.write_text("fixture", encoding="utf-8")
+
+    tool_status = _minimal_tool_status_with_external()
+    tool_status["gnina"]["gpu_available"] = True
+    tool_status["vina"] = {"available": True, "mode": "docker", "docker_image": "vina:latest"}
+    requests = []
+
+    def fake_run_external_docking(request, status):
+        requests.append((request, status))
+        if len(requests) == 1:
+            return DockingToolResult(
+                adapter_mode="gnina_docker_docking",
+                tool_name="gnina",
+                success=False,
+                warnings=["external_docking_tool_failed"],
+                exit_code=1,
+            )
+        return DockingToolResult(
+            adapter_mode="vina_docker_docking",
+            tool_name="vina",
+            success=True,
+            vina_score=-7.4,
+            pose_file=str(tmp_path / "vina_pose.pdbqt"),
+            labels=["external_docking_adapter_used", "vina_adapter"],
+        )
+
+    monkeypatch.setattr(candidate_assessment, "run_external_docking", fake_run_external_docking)
+    monkeypatch.setattr(
+        candidate_assessment,
+        "_prepare_vina_docking_inputs",
+        lambda *args, **kwargs: (str(vina_receptor), str(vina_ligand), []),
+    )
+
+    result = candidate_assessment._attempt_external_docking(
+        SimpleNamespace(project_id="PROJ-GNINA-FALLBACK"),
+        SimpleNamespace(molecule_id="MOL-GNINA-FALLBACK", smiles="CCO"),
+        tool_status,
+        protein_file=str(receptor),
+        prepared_ligand_files={"MOL-GNINA-FALLBACK": str(ligand)},
+        grid_center=[1.0, 2.0, 3.0],
+        grid_size=[18.0, 19.0, 20.0],
+    )
+
+    assert result is not None
+    assert result.success is True
+    assert result.tool_name == "vina"
+    assert len(requests) == 2
+    assert requests[0][0].receptor_file == str(receptor)
+    assert requests[1][0].receptor_file == str(vina_receptor)
+    assert requests[1][0].ligand_file == str(vina_ligand)
+    assert requests[1][1]["gnina"]["available"] is False
+    assert "gnina_execution_failed_vina_cpu_fallback" in result.warnings
+    assert result.provenance["fallback"]["from_tool"] == "gnina"
+    assert result.provenance["gpu_used"] is False
+
+
+def test_assessment_backfills_missing_molecule_properties(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'assessment.db'}")
+    engine = build_engine(settings)
+    Base.metadata.create_all(bind=engine)
+    session_factory = build_session_factory(settings)
+
+    with session_factory() as db:
+        project = Project(
+            project_id="PROJ-PROPERTY-BACKFILL",
+            name="Property backfill",
+            target_id="TGT-PROPERTY-BACKFILL",
+            objective="regression test",
+        )
+        molecule = Molecule(
+            molecule_id="MOL-PROPERTY-BACKFILL",
+            project_id=project.project_id,
+            smiles="CCOc1ccccc1",
+            status="candidate_assessed",
+            labels=[],
+        )
+        db.add_all([project, molecule])
+        db.commit()
+
+        summary = candidate_assessment.run_project_admet(
+            db,
+            project,
+            [molecule],
+            tool_status=_minimal_tool_status_without_external(),
+            allow_external_tools=False,
+        )
+
+        properties = (
+            db.query(MoleculeProperty)
+            .filter_by(molecule_id=molecule.molecule_id)
+            .one_or_none()
+        )
+        assert summary.evaluated_count == 1
+        assert properties is not None
+        assert properties.mw is not None
+        assert properties.logp is not None
+        assert properties.tpsa is not None
 
 
 def _successful_diffdock_result(tmp_path, request) -> DockingToolResult:

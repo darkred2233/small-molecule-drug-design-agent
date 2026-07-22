@@ -74,10 +74,37 @@ def import_seed_ligands_as_molecules(db: Session, project: Project) -> dict:
             scaffold=None,
             source_agent="seed_ligand_import",
             status="imported_from_seed",
-            labels=["seed_ligand", "needs_structure_validation"],
+            labels=["seed_ligand"],
         )
         db.add(molecule)
         db.flush()
+
+        # Delayed import avoids the validation module's lightweight-check import
+        # from creating an import cycle at module initialization time.
+        from medagent.services.molecule_validation import (
+            merge_labels,
+            update_molecule_structure_fields,
+            upsert_molecule_property,
+            validate_smiles,
+        )
+
+        validation = validate_smiles(normalized_smiles)
+        if not validation.valid:
+            db.delete(molecule)
+            summary.invalid_count += 1
+            summary.skipped.append(
+                {
+                    "ligand_id": seed_ligand.ligand_id,
+                    "reason": validation.reason or "structure_validation_failed",
+                    "smiles": normalized_smiles,
+                }
+            )
+            continue
+
+        descriptors = validation.descriptors or {}
+        molecule.labels = merge_labels(molecule.labels, validation.labels)
+        update_molecule_structure_fields(molecule, descriptors)
+        upsert_molecule_property(db, molecule, descriptors)
 
         seen_in_batch.add(normalized_smiles)
         summary.imported_count += 1

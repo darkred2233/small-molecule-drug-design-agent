@@ -15,4 +15,11 @@ describe('workbench formatting', () => {
   it('maps terminal failure to the danger tone', () => {
     expect(statusTone('failed')).toBe('danger');
   });
+
+  it('labels disabled and skipped stages without reporting them as failures', () => {
+    expect(statusLabel('disabled')).toBe('未启用');
+    expect(statusLabel('skipped')).toBe('已跳过');
+    expect(statusTone('disabled')).toBe('neutral');
+    expect(statusTone('skipped')).toBe('neutral');
+  });
 });

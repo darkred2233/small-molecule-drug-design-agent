@@ -818,6 +818,7 @@ class Reinvent4CampaignConfig(BaseModel):
 
 
 class AutoGrow4CampaignConfig(BaseModel):
+    crossover_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
     enabled: bool = Field(default=True, title="是否启用")
     num_molecules: int = Field(default=100, ge=0, le=300, title="生成候选数")
     generations: int = Field(default=5, ge=1, le=50, title="遗传代数")

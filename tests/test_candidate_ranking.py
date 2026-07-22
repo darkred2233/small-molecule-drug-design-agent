@@ -1,3 +1,7 @@
+import warnings
+
+from sqlalchemy.exc import SAWarning
+
 from medagent.core.config import Settings
 from medagent.db.models import (
     ADMETResult,
@@ -125,6 +129,49 @@ def test_ranking_agent_run_is_failed_when_ranking_errors(tmp_path, monkeypatch):
         assert runs[0].agent_name == "ranking_agent"
         assert runs[0].status == "failed"
         assert runs[0].error_message == "ranking evidence unavailable"
+
+
+def test_repeated_ranking_refresh_replaces_tracked_rows_without_identity_conflict(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}")
+    engine = build_engine(settings)
+    Base.metadata.create_all(bind=engine)
+    session_factory = build_session_factory(settings)
+
+    with session_factory() as db:
+        project = Project(project_id="PROJ-RANKING-REFRESH", name="Ranking refresh")
+        molecule = Molecule(
+            molecule_id="MOL-RANKING-REFRESH",
+            project_id=project.project_id,
+            smiles="CCO",
+            status="candidate_assessed",
+            labels=[],
+        )
+        db.add_all([project, molecule])
+        db.flush()
+        _add_supporting_evidence(
+            db,
+            project.project_id,
+            molecule_id=molecule.molecule_id,
+            docking_labels=["external_docking_adapter_used", "gnina_adapter"],
+            vina_score=-7.0,
+            cnn_score=0.7,
+            admet_risk=0.1,
+            route_confidence=0.7,
+            route_labels=["external_retrosynthesis_adapter_used", "aizynthfinder_route"],
+        )
+        db.commit()
+
+        generate_project_rankings(db, project, molecules=[molecule], top_n=1)
+        first_ranking = db.query(Ranking).one()
+        assert first_ranking.rank == 1
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SAWarning)
+            generate_project_rankings(db, project, molecules=[molecule], top_n=1)
+
+        rankings = db.query(Ranking).all()
+        assert len(rankings) == 1
+        assert rankings[0].molecule_id == molecule.molecule_id
 
 
 def _add_supporting_evidence(

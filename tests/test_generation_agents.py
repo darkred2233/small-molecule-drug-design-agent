@@ -172,3 +172,36 @@ def test_autogrow4_agent_runs_when_receptor_and_grid_are_available(tmp_path, mon
     assert fake_adapter.calls[0]["constraints"]["receptor_file"] == str(receptor)
     assert result.molecules[0].provenance["agent"] == "autogrow4"
     assert result.molecules[0].provenance["source_strategy"] == "autogrow4"
+
+
+def test_autogrow4_agent_passes_genetic_controls_to_adapter(tmp_path, monkeypatch):
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text("HEADER TEST\n", encoding="utf-8")
+    fake_adapter = FakeStrategyAdapter("autogrow4")
+    monkeypatch.setitem(generation_base.STRATEGY_ADAPTERS, "autogrow4", fake_adapter)
+
+    result = AutoGrow4Agent().run(
+        AgentTask(
+            round=1,
+            agent="autogrow4",
+            seed_molecules=["CCN"],
+            constraints={
+                "requested_count": 1,
+                "receptor_file": str(receptor),
+                "grid_center": [1.0, 2.0, 3.0],
+                "grid_size": [20.0, 20.0, 20.0],
+            },
+            campaign_config={
+                "search_intensity": "quick",
+                "generations": 2,
+                "crossover_fraction": 0.0,
+            },
+            budget="low",
+        )
+    )
+
+    assert result.status == "completed"
+    constraints = fake_adapter.calls[0]["constraints"]
+    assert constraints["num_generations"] == 2
+    assert constraints["population_size"] == 30
+    assert constraints["crossover_fraction"] == 0.0

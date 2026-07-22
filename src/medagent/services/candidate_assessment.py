@@ -49,6 +49,7 @@ from medagent.services.docking_workflow import (
 )
 from medagent.services.ids import new_id
 from medagent.services.molecule_validation import merge_labels
+from medagent.services.pose_interactions import analyze_pose_interactions
 from medagent.services.pdbqt_validation import (
     is_valid_vina_ligand_pdbqt,
     is_valid_vina_receptor_pdbqt,
@@ -507,7 +508,12 @@ def run_project_docking(
     site_config = _binding_site_docking_config(db, project, binding_site_id)
     if site_config:
         binding_site_id = binding_site_id or site_config.get("binding_site_id")
-        protein_file = protein_file or site_config.get("protein_file")
+        if not protein_file:
+            protein_file = (
+                site_config.get("raw_receptor_file")
+                if _gnina_gpu_docking_available(tool_status)
+                else site_config.get("prepared_receptor_file")
+            ) or site_config.get("protein_file")
         grid_center = grid_center or site_config.get("grid_center")
         grid_size = grid_size or site_config.get("grid_size")
         if not key_residues:
@@ -632,6 +638,7 @@ def run_project_docking(
                 descriptors,
                 key_residues=key_residues,
                 external_result=external_result,
+                receptor_file=protein_file,
                 round_id=round_id,
             )
             external_adapter_modes.add(external_result.adapter_mode)
@@ -1893,6 +1900,7 @@ def _upsert_external_docking_result(
     descriptors: DescriptorSnapshot,
     key_residues: list[str],
     external_result: DockingToolResult,
+    receptor_file: str | None,
     round_id: str | None = None,
 ) -> DockingResult:
     vina_score = external_result.vina_score
@@ -1914,7 +1922,13 @@ def _upsert_external_docking_result(
         labels.append("pose_confident" if cnn_score >= 0.6 else "pose_uncertain")
     if diffdock_confidence is not None:
         labels.append("diffdock_confidence_recorded")
-    labels.append("pose_interactions_not_computed")
+    interaction_summary = analyze_pose_interactions(
+        pose_file=external_result.pose_file,
+        receptor_file=receptor_file,
+        key_residues=key_residues,
+    )
+    labels.extend(interaction_summary["labels"])
+    interaction_warnings = interaction_summary["warnings"]
 
     result = (
         db.query(DockingResult)
@@ -1929,8 +1943,8 @@ def _upsert_external_docking_result(
     result.vina_score = _rounded(vina_score)
     result.cnn_score = _rounded(cnn_score)
     result.diffdock_confidence = _rounded(diffdock_confidence)
-    result.key_hbond_count = None
-    result.clash_count = None
+    result.key_hbond_count = interaction_summary["key_hbond_count"]
+    result.clash_count = interaction_summary["clash_count"]
     result.pose_file = external_result.pose_file
     result.labels = _dedupe(labels)
     result.raw_output = {
@@ -1958,10 +1972,11 @@ def _upsert_external_docking_result(
         "best_pose_confirmed": external_result.best_pose_confirmed,
         "runtime_seconds": round(external_result.runtime_seconds, 3),
         "exit_code": external_result.exit_code,
-        "warnings": external_result.warnings,
+        "warnings": _dedupe([*external_result.warnings, *interaction_warnings]),
         "command": external_result.command,
         "provenance": external_result.provenance,
-        "pose_interactions_computed": False,
+        "pose_interactions_computed": interaction_summary["computed"],
+        "pose_interactions": interaction_summary,
     }
     return result
 
@@ -2086,9 +2101,18 @@ def _attempt_external_retrosynthesis(
             output_dir=str(output_dir),
             max_steps=max_synthesis_steps,
             docker_image=aizynthfinder_status.get("docker_image") or "aizynthfinder:latest",
+            timeout_seconds=_retrosynthesis_timeout_seconds(),
         ),
         aizynthfinder_status,
     )
+
+
+def _retrosynthesis_timeout_seconds() -> int:
+    raw_value = os.environ.get("MEDAGENT_AIZYNTHFINDER_TIMEOUT_SECONDS", "90")
+    try:
+        return max(10, min(int(raw_value), 900))
+    except (TypeError, ValueError):
+        return 90
 
 
 def _upsert_external_synthesis_route(
@@ -2294,6 +2318,23 @@ def _descriptor_snapshot(
     molecule: Molecule,
 ) -> DescriptorSnapshot | None:
     properties = db.query(MoleculeProperty).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+    properties_incomplete = properties is None or any(
+        getattr(properties, field_name) is None
+        for field_name in ("mw", "logp", "tpsa", "hbd", "hba")
+    )
+    if properties_incomplete:
+        from medagent.services.molecule_validation import ensure_molecule_property_record
+
+        validation = ensure_molecule_property_record(db, molecule)
+        if validation.valid:
+            db.flush()
+            properties = (
+                db.query(MoleculeProperty)
+                .filter_by(molecule_id=molecule.molecule_id)
+                .one_or_none()
+            )
+        else:
+            return None
     metadata_dict = properties.tool_metadata if properties is not None else None
     metadata_dict = metadata_dict or {}
     if properties is not None and properties.mw is not None:
@@ -2690,6 +2731,51 @@ def _attempt_external_docking(
             ),
         )
     external_result = run_external_docking(request, tool_status)
+    if (
+        external_result is not None
+        and not external_result.success
+        and selected_tool == "gnina"
+        and tool_status.get("vina", {}).get("available")
+    ):
+        vina_receptor, vina_ligand, fallback_preparation_warnings = _prepare_vina_docking_inputs(
+            project,
+            molecule,
+            receptor_file=protein_file,
+            ligand_file=prepared_ligand_files.get(molecule.molecule_id),
+        )
+        fallback_request = replace(
+            request,
+            receptor_file=vina_receptor,
+            ligand_file=vina_ligand or request.ligand_file,
+            timeout_seconds=_docking_timeout_seconds(
+                tool_status.get("vina", {}).get("configured_timeout_seconds")
+            ),
+        )
+        fallback_tool_status = copy.deepcopy(tool_status)
+        fallback_tool_status["gnina"] = {
+            **fallback_tool_status.get("gnina", {}),
+            "available": False,
+        }
+        if select_docking_tool(fallback_request, fallback_tool_status) == "vina":
+            vina_result = run_external_docking(fallback_request, fallback_tool_status)
+            if vina_result is not None and vina_result.success:
+                return _mark_vina_cpu_fallback(
+                    vina_result,
+                    reason="gnina_execution_failed_vina_cpu_fallback",
+                    source_result=external_result,
+                    preparation_warnings=[*preparation_warnings, *fallback_preparation_warnings],
+                )
+        external_result = replace(
+            external_result,
+            warnings=_dedupe(
+                [
+                    *preparation_warnings,
+                    *fallback_preparation_warnings,
+                    *external_result.warnings,
+                    "gnina_execution_failed_vina_cpu_fallback_failed",
+                ]
+            ),
+        )
     if external_result is None:
         selected_tool = select_docking_tool(request, tool_status)
         warning = "external_docking_adapter_unavailable_for_inputs"
@@ -2711,6 +2797,19 @@ def _attempt_external_docking(
             external_result,
             warnings=_dedupe(preparation_warnings + external_result.warnings),
         )
+    if external_result.success and selected_tool == "vina":
+        gnina_status = tool_status.get("gnina", {})
+        reason = (
+            "gnina_gpu_unavailable_vina_cpu_fallback"
+            if gnina_status.get("available") and gnina_status.get("gpu_available") is False
+            else "gnina_unavailable_vina_cpu_fallback"
+        )
+        return _mark_vina_cpu_fallback(
+            external_result,
+            reason=reason,
+            source_result=None,
+            preparation_warnings=preparation_warnings,
+        )
     return external_result
 
 
@@ -2723,11 +2822,36 @@ def _should_prepare_vina_inputs(
 ) -> bool:
     if not tool_status.get("vina", {}).get("available"):
         return False
-    if tool_status.get("gnina", {}).get("available"):
+    if _gnina_gpu_docking_available(tool_status):
         return False
     receptor_ready = is_valid_vina_receptor_pdbqt(Path(receptor_file))
     ligand_ready = bool(ligand_file) and is_valid_vina_ligand_pdbqt(Path(ligand_file))
     return not (receptor_ready and ligand_ready)
+
+
+def _mark_vina_cpu_fallback(
+    result: DockingToolResult,
+    *,
+    reason: str,
+    source_result: DockingToolResult | None,
+    preparation_warnings: list[str],
+) -> DockingToolResult:
+    fallback = {
+        "from_tool": source_result.tool_name if source_result is not None else "gnina",
+        "to_tool": "vina",
+        "reason": reason,
+        "source_exit_code": source_result.exit_code if source_result is not None else None,
+    }
+    return replace(
+        result,
+        labels=_dedupe([*(result.labels or []), "vina_cpu_fallback"]),
+        warnings=_dedupe([*preparation_warnings, *(result.warnings or []), reason]),
+        provenance={
+            **(result.provenance or {}),
+            "gpu_used": False,
+            "fallback": fallback,
+        },
+    )
 
 
 def _prepare_vina_docking_inputs(
@@ -3023,8 +3147,19 @@ def _smiles_input_hash(smiles: str) -> str:
 
 def _external_docking_available(tool_status: dict[str, Any]) -> bool:
     return bool(
-        tool_status["gnina"]["available"]
+        _gnina_gpu_docking_available(tool_status)
         or tool_status["vina"]["available"]
+    )
+
+
+def _gnina_gpu_docking_available(tool_status: dict[str, Any]) -> bool:
+    gnina_status = tool_status.get("gnina", {})
+    return bool(
+        gnina_status.get("available")
+        and not (
+            gnina_status.get("mode") == "docker"
+            and gnina_status.get("gpu_available") is False
+        )
     )
 
 

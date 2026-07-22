@@ -509,6 +509,13 @@ class RoundOrchestrator:
         campaign: CampaignRun,
     ) -> list[str]:
         """将 AgentResult 中的分子存入数据库。"""
+        from medagent.services.molecule_validation import (
+            merge_labels,
+            update_molecule_structure_fields,
+            upsert_molecule_property,
+            validate_smiles,
+        )
+
         molecule_ids: list[str] = []
         for candidate in result.molecules:
             molecule_id = new_id("mol")
@@ -541,6 +548,20 @@ class RoundOrchestrator:
                 labels=list(metadata.get("labels", [])),
             )
             db.add(mol)
+            db.flush()
+            validation = validate_smiles(mol.smiles)
+            mol.labels = merge_labels(mol.labels, validation.labels)
+            if validation.valid:
+                descriptors = validation.descriptors or {}
+                update_molecule_structure_fields(mol, descriptors)
+                upsert_molecule_property(db, mol, descriptors)
+                mol.status = "structure_validated"
+            else:
+                mol.status = "invalid_structure"
+                mol.generation_metadata_json = {
+                    **(mol.generation_metadata_json or {}),
+                    "validation_error": validation.reason,
+                }
             molecule_ids.append(molecule_id)
         db.flush()
         return molecule_ids

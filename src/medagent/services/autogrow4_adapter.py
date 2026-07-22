@@ -318,8 +318,13 @@ def _run_autogrow4_local(request: AutoGrow4Request) -> AutoGrow4Result:
                 ),
             )
 
-        # Parse output
-        generated_smiles, scores = _parse_autogrow4_output(output_dir)
+        # Parse complete ranked evidence separately from genetic products. A
+        # completed AutoGrow generation can retain source/elite states, which
+        # must never be persisted as newly generated candidates.
+        ranked_smiles, ranked_scores = _parse_autogrow4_output(output_dir)
+        generated_smiles, scores = _parse_autogrow4_output(
+            output_dir, generated_only=True
+        )
 
         # Copy output to request output_dir
         final_output_dir = Path(request.output_dir)
@@ -331,19 +336,36 @@ def _run_autogrow4_local(request: AutoGrow4Request) -> AutoGrow4Result:
                 dirs_exist_ok=True,
             )
 
-        success = (
-            exit_code == 0
-            and len(generated_smiles) > 0
-            and any(score is not None for score in scores)
+        has_scored_output = bool(ranked_smiles) and any(
+            score is not None for score in ranked_scores
+        )
+        has_generated_output = bool(generated_smiles) and _has_completed_generation_output(
+            output_dir, request
+        )
+        success = exit_code == 0 and has_generated_output
+        partial_output = exit_code != 0 and has_scored_output
+        source_only_output = exit_code == 0 and has_scored_output and not has_generated_output
+        adapter_mode = (
+            "autogrow4_local_partial"
+            if partial_output
+            else "autogrow4_local_source_evaluated_only"
+            if source_only_output
+            else "autogrow4_local"
         )
         return AutoGrow4Result(
-            adapter_mode="autogrow4_local",
+            adapter_mode=adapter_mode,
             tool_name="autogrow4",
             success=success,
             generated_smiles=generated_smiles,
             scores=scores,
-            labels=_autogrow4_labels(success, "autogrow4_local"),
-            warnings=_autogrow4_warnings(exit_code, generated_smiles, scores),
+            labels=_autogrow4_labels(success, adapter_mode),
+            warnings=_autogrow4_warnings(
+                exit_code,
+                generated_smiles,
+                scores,
+                partial_output=partial_output,
+                source_only_output=source_only_output,
+            ),
             stdout=stdout[:2000],
             stderr=stderr[:2000],
             exit_code=exit_code,
@@ -464,8 +486,12 @@ def _run_autogrow4_docker(request: AutoGrow4Request, docker_image: str) -> AutoG
                 ),
             )
 
-        # Parse output
-        generated_smiles, scores = _parse_autogrow4_output(output_dir)
+        # See the matching local execution path for why ranked source/elite
+        # states are kept separate from actual genetic products.
+        ranked_smiles, ranked_scores = _parse_autogrow4_output(output_dir)
+        generated_smiles, scores = _parse_autogrow4_output(
+            output_dir, generated_only=True
+        )
 
         # Copy output to request output_dir
         final_output_dir = Path(request.output_dir)
@@ -477,20 +503,36 @@ def _run_autogrow4_docker(request: AutoGrow4Request, docker_image: str) -> AutoG
                 dirs_exist_ok=True,
             )
 
-        success = (
-            exit_code == 0
-            and len(generated_smiles) > 0
-            and any(score is not None for score in scores)
+        has_scored_output = bool(ranked_smiles) and any(
+            score is not None for score in ranked_scores
+        )
+        has_generated_output = bool(generated_smiles) and _has_completed_generation_output(
+            output_dir, request
+        )
+        success = exit_code == 0 and has_generated_output
+        partial_output = exit_code != 0 and has_scored_output
+        source_only_output = exit_code == 0 and has_scored_output and not has_generated_output
+        adapter_mode = (
+            "autogrow4_docker_partial"
+            if partial_output
+            else "autogrow4_docker_source_evaluated_only"
+            if source_only_output
+            else "autogrow4_docker"
         )
         return AutoGrow4Result(
-            adapter_mode="autogrow4_docker",
+            adapter_mode=adapter_mode,
             tool_name="autogrow4",
             success=success,
             generated_smiles=generated_smiles,
             scores=scores,
-            labels=_autogrow4_labels(success, "autogrow4_docker"),
+            labels=_autogrow4_labels(success, adapter_mode),
             warnings=_autogrow4_warnings(
-                exit_code, generated_smiles, scores, docker=True
+                exit_code,
+                generated_smiles,
+                scores,
+                docker=True,
+                partial_output=partial_output,
+                source_only_output=source_only_output,
             ),
             stdout=stdout[:2000],
             stderr=stderr[:2000],
@@ -560,7 +602,11 @@ def _autogrow4_config(
     population_size = max(4, request.population_size)
     elite = max(1, population_size // 5)
     generated = population_size - elite
-    crossovers = generated // 2
+    constraints = request.constraints
+    crossover_fraction = _bounded_fraction(
+        constraints.get("crossover_fraction"), default=0.5
+    )
+    crossovers = round(generated * crossover_fraction)
     mutants = generated - crossovers
     vina_path = "/usr/bin/vina" if docker else str(shutil.which("vina") or "vina")
     obabel_path = "/usr/bin/obabel" if docker else str(shutil.which("obabel") or "obabel")
@@ -574,11 +620,16 @@ def _autogrow4_config(
         "size_x": size[0],
         "size_y": size[1],
         "size_z": size[2],
+        # With use_docked_source_compounds, AutoGrow evaluates the source pool
+        # as generation_0 and then evolves through the configured final
+        # generation number. A user request for one generation therefore maps
+        # directly to generation_1.
         "num_generations": max(1, request.num_generations),
         "number_of_crossovers_first_generation": crossovers,
         "number_of_mutants_first_generation": mutants,
         "number_of_crossovers": crossovers,
         "number_of_mutants": mutants,
+        "crossover_fraction": crossover_fraction,
         "number_elitism_advance_from_previous_gen": elite,
         "top_mols_to_seed_next_generation": elite,
         "diversity_mols_to_seed_first_generation": elite,
@@ -587,9 +638,33 @@ def _autogrow4_config(
         "dock_choice": "VinaDocking",
         "docking_executable": vina_path,
         "multithread_mode": "multithreading",
-        "number_of_processors": -1,
+        "number_of_processors": _positive_int(constraints.get("number_of_processors"), -1),
         "start_a_new_run": True,
+        "debug_mode": bool(constraints.get("debug_mode", False)),
+        "max_variants_per_compound": _positive_int(
+            constraints.get("max_variants_per_compound"), 3
+        ),
+        "gypsum_thoroughness": _positive_int(constraints.get("gypsum_thoroughness"), 3),
+        "gypsum_timeout_limit": _positive_int(constraints.get("gypsum_timeout_limit"), 10),
     }
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _bounded_fraction(value: Any, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        return default
+    return parsed
 
 
 def _grid_values(
@@ -615,54 +690,66 @@ def _grid_values(
 
 def _parse_autogrow4_output(
     output_dir: Path,
+    *,
+    generated_only: bool = False,
 ) -> tuple[list[str], list[float | None]]:
-    """Parse AutoGrow4 output directory for generated molecules."""
+    """Parse ranked AutoGrow4 output, optionally retaining only genetic products."""
     smiles_list: list[str] = []
     scores: list[float | None] = []
 
-    ranked_files = sorted(output_dir.rglob("*ranked*.smi"), key=_ranked_output_sort_key)
+    ranked_files = _ranked_output_files(output_dir)
     if ranked_files:
         for line in ranked_files[-1].read_text(encoding="utf-8", errors="ignore").splitlines():
             columns = line.split()
             if not columns or columns[0].lower() == "smiles":
                 continue
+            if generated_only and not _is_genetic_product_row(columns):
+                continue
             score: float | None = None
-            for value in reversed(columns[1:]):
+            numeric_values: list[float] = []
+            for value in columns[1:]:
                 try:
                     parsed_score = float(value)
-                    score = parsed_score if math.isfinite(parsed_score) else None
-                    break
+                    if math.isfinite(parsed_score):
+                        numeric_values.append(parsed_score)
                 except ValueError:
                     continue
+            # AutoGrow ranked SMI rows end with Vina score followed by ligand
+            # efficiency. Preserve the affinity-like Vina score when both are
+            # present; legacy three-column output has only one numeric score.
+            if numeric_values:
+                score = numeric_values[-2] if len(numeric_values) >= 2 else numeric_values[-1]
             if columns[0] not in smiles_list:
                 smiles_list.append(columns[0])
                 scores.append(score)
 
-    # Look for output CSV files
-    for csv_file in output_dir.rglob("*.csv"):
-        try:
-            with open(csv_file, newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    smi = row.get("SMILES") or row.get("smiles") or row.get("Smiles")
-                    score = row.get("score") or row.get("Score") or row.get("fitness")
-                    if smi and smi not in smiles_list:
-                        smiles_list.append(smi)
-                        if score:
-                            try:
-                                parsed_score = float(score)
-                                scores.append(
-                                    parsed_score if math.isfinite(parsed_score) else None
-                                )
-                            except ValueError:
+    # CSV/SDF fallbacks do not encode AutoGrow's mutant/crossover label, so
+    # they are evidence only and never a source of persisted genetic products.
+    if not generated_only:
+        for csv_file in output_dir.rglob("*.csv"):
+            try:
+                with open(csv_file, newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        smi = row.get("SMILES") or row.get("smiles") or row.get("Smiles")
+                        score = row.get("score") or row.get("Score") or row.get("fitness")
+                        if smi and smi not in smiles_list:
+                            smiles_list.append(smi)
+                            if score:
+                                try:
+                                    parsed_score = float(score)
+                                    scores.append(
+                                        parsed_score if math.isfinite(parsed_score) else None
+                                    )
+                                except ValueError:
+                                    scores.append(None)
+                            else:
                                 scores.append(None)
-                        else:
-                            scores.append(None)
-        except Exception:
-            continue
+            except Exception:
+                continue
 
     # Look for SDF files if no CSV found
-    if not smiles_list:
+    if not generated_only and not smiles_list:
         try:
             from rdkit import Chem
             for sdf_file in output_dir.rglob("*.sdf"):
@@ -677,6 +764,31 @@ def _parse_autogrow4_output(
             pass
 
     return smiles_list, scores
+
+
+def _is_genetic_product_row(columns: list[str]) -> bool:
+    """Return whether an AutoGrow ranked row names a mutant or crossover product."""
+    metadata = " ".join(columns[1:])
+    return re.search(r"(?:^|\W)Gen[_-]?\d+_", metadata, re.IGNORECASE) is not None
+
+
+def _has_completed_generation_output(output_dir: Path, request: AutoGrow4Request) -> bool:
+    latest_generation = _latest_ranked_generation(output_dir)
+    return latest_generation is not None and latest_generation >= max(1, request.num_generations)
+
+
+def _latest_ranked_generation(output_dir: Path) -> int | None:
+    ranked_files = _ranked_output_files(output_dir)
+    if not ranked_files:
+        return None
+    generation_match = re.search(
+        r"generation[_-]?(\d+)", str(ranked_files[-1]), re.IGNORECASE
+    )
+    return int(generation_match.group(1)) if generation_match else None
+
+
+def _ranked_output_files(output_dir: Path) -> list[Path]:
+    return sorted(output_dir.rglob("*ranked*.smi"), key=_ranked_output_sort_key)
 
 
 def _ranked_output_sort_key(path: Path) -> tuple[int, int, str]:
@@ -695,7 +807,13 @@ def _autogrow4_warnings(
     scores: list[float | None],
     *,
     docker: bool = False,
+    partial_output: bool = False,
+    source_only_output: bool = False,
 ) -> list[str]:
+    if partial_output:
+        return ["autogrow4_partial_generation_output"]
+    if source_only_output:
+        return ["autogrow4_generated_generation_missing"]
     if exit_code != 0:
         return ["autogrow4_docker_failed" if docker else "autogrow4_execution_failed"]
     if not generated_smiles:
@@ -728,14 +846,17 @@ def _autogrow4_provenance(
         "grid_center": grid[0] if grid else None,
         "grid_size": grid[1] if grid else None,
         "num_generations": request.num_generations,
+        "tool_num_generations": config["num_generations"],
+        "source_pool_evaluation_generation": 0,
         "population_size": request.population_size,
         "effective_population_size": (
             config["number_of_crossovers"]
             + config["number_of_mutants"]
             + config["number_elitism_advance_from_previous_gen"]
         ),
+        "crossover_fraction": config["crossover_fraction"],
         "optimization_mode": request.optimization_mode,
-        "score_semantics": "autogrow4_ranked_output_fitness",
+        "score_semantics": "autogrow4_vina_affinity_kcal_mol",
         "timeout_seconds": request.timeout_seconds,
     }
 

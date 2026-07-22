@@ -105,20 +105,29 @@ def _resolve_receptor_and_grid(
             BindingSite.binding_site_id == binding_site_id,
         ).first()
         if site and site.receptor_file:
-            grid_box = site.grid_box or {}
-            center = grid_box.get("center", [0, 0, 0])
-            size = grid_box.get("size", [20, 20, 20])
-            return site.receptor_file, center, size, binding_site_id
+            grid = _binding_site_grid(site)
+            if grid is None:
+                raise ValueError("AutoGrow4 selected binding site has no valid docking grid")
+            center, size = grid
+            return _local_file_path(site.receptor_file), center, size, binding_site_id
 
-    # 尝试使用项目关联的 binding site
-    site = db.query(BindingSite).filter(
-        BindingSite.project_id == project.project_id,
-    ).first()
-    if site and site.receptor_file:
-        grid_box = site.grid_box or {}
-        center = grid_box.get("center", [0, 0, 0])
-        size = grid_box.get("size", [20, 20, 20])
-        return site.receptor_file, center, size, site.binding_site_id
+    # Prefer an actually prepared, grid-defined site. Projects can retain an
+    # earlier uploaded-only site alongside the prepared receptor.
+    sites = (
+        db.query(BindingSite)
+        .filter(BindingSite.project_id == project.project_id)
+        .order_by(BindingSite.created_at.desc(), BindingSite.id.desc())
+        .all()
+    )
+    sites.sort(key=lambda site: site.preparation_status != "prepared")
+    for site in sites:
+        if not site.receptor_file:
+            continue
+        grid = _binding_site_grid(site)
+        if grid is None:
+            continue
+        center, size = grid
+        return _local_file_path(site.receptor_file), center, size, site.binding_site_id
 
     # 尝试使用 ProjectResource 中的 receptor
     if config.receptor_resource_id:
@@ -130,13 +139,35 @@ def _resolve_receptor_and_grid(
             metadata = resource.metadata_json or {}
             center = metadata.get("grid_center", [0, 0, 0])
             size = metadata.get("grid_size", [20, 20, 20])
-            return resource.file_path, center, size, None
+            return _local_file_path(resource.file_path), center, size, None
 
     raise ValueError(
         "AutoGrow4 requires receptor + binding pocket. "
         "Provide binding_site_id or receptor_resource_id in config, "
         "or ensure the project has a binding site with receptor file."
     )
+
+
+def _binding_site_grid(site: BindingSite) -> tuple[list[float], list[float]] | None:
+    grid_box = site.grid_box or {}
+    center = grid_box.get("center")
+    size = grid_box.get("size")
+    if not isinstance(center, list) or not isinstance(size, list):
+        return None
+    if len(center) != 3 or len(size) != 3:
+        return None
+    try:
+        center_values = [float(value) for value in center]
+        size_values = [float(value) for value in size]
+    except (TypeError, ValueError):
+        return None
+    if not all(value > 0 for value in size_values):
+        return None
+    return center_values, size_values
+
+
+def _local_file_path(path: str) -> str:
+    return path.removeprefix("local://")
 
 
 def _build_source_pool(

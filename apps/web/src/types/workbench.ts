@@ -214,6 +214,16 @@ export interface RoundSummary {
   admet_count: number;
   synthesis_count: number;
   ranking_count: number;
+  execution_progress: {
+    agent_run_id: string;
+    agent_name: string;
+    status: string;
+    stage: string;
+    message: string;
+    total_molecules: number | null;
+    completed_molecules: number | null;
+    percent: number | null;
+  } | null;
   top_molecules: Array<{ molecule_id: string; rank: number; overall_score: number | null; final_decision: string }>;
   campaigns: Array<{ campaign_run_id: string; method: string; status: string; output_count: number }>;
 }

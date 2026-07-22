@@ -174,6 +174,172 @@ def test_create_project_uses_selected_seed_ligands(tmp_path):
         assert seeds[0].source == "test-selection"
 
 
+def test_round_summary_exposes_the_active_assessment_progress(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post(
+            "/projects",
+            json={"name": "Round progress", "target_id": "TGT-BRAF"},
+        ).json()["project_id"]
+        round_id = "ROUND-PROGRESS"
+
+        with api_app.SessionLocal() as db:
+            db.add_all(
+                [
+                    ProjectRound(
+                        round_id=round_id,
+                        project_id=project_id,
+                        round_number=1,
+                        status="running",
+                    ),
+                    CampaignRun(
+                        campaign_run_id="CAMPAIGN-PROGRESS",
+                        project_id=project_id,
+                        round_id=round_id,
+                        method="crem",
+                        status="completed",
+                    ),
+                    AgentRun(
+                        agent_run_id="RUN-PROGRESS",
+                        project_id=project_id,
+                        round_id=round_id,
+                        agent_name="synthesis_agent",
+                        model_name="aizynthfinder_docker",
+                        status="running",
+                        output_json={
+                            "progress": {
+                                "stage": "逆合成分析",
+                                "message": "正在处理合成可行性 16/50。",
+                                "total_molecules": 50,
+                                "completed_molecules": 15,
+                                "percent": 30.0,
+                            }
+                        },
+                    ),
+                ]
+            )
+            db.commit()
+
+        response = client.get(f"/projects/{project_id}/rounds/{round_id}/summary")
+
+        assert response.status_code == 200
+        progress = response.json()["execution_progress"]
+        assert progress == {
+            "agent_run_id": "RUN-PROGRESS",
+            "agent_name": "synthesis_agent",
+            "status": "running",
+            "stage": "逆合成分析",
+            "message": "正在处理合成可行性 16/50。",
+            "total_molecules": 50,
+            "completed_molecules": 15,
+            "percent": 30.0,
+        }
+
+
+def test_strategy_confirmation_queues_background_round_execution(tmp_path, monkeypatch):
+    import medagent.api.rounds_router as rounds_router
+
+    scheduled_runs = []
+
+    def fake_round_runner(**kwargs):
+        scheduled_runs.append(kwargs)
+
+    monkeypatch.setattr(rounds_router, "_run_confirmed_round", fake_round_runner)
+
+    strategy_draft = {
+        "objective": "Queue the round without blocking the HTTP response.",
+        "campaign_config": {
+            "crem": {"enabled": True, "num_molecules": 5, "edit_depth": 1},
+            "reinvent4": {"enabled": False, "sample_count": 0},
+            "autogrow4": {"enabled": False, "num_molecules": 0},
+        },
+        "seed_policy": {"source": "all_seeds"},
+        "assessment_config": {"mode": "external_top_n", "top_n": 3},
+        "rationale": "Keep the test campaign intentionally small.",
+        "warnings": [],
+        "requires_user_confirmation": True,
+    }
+
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Queued round"}).json()["project_id"]
+        round_id = client.post(
+            f"/projects/{project_id}/rounds",
+            json={"round_number": 1},
+        ).json()["round_id"]
+
+        with api_app.SessionLocal() as db:
+            round_obj = db.query(ProjectRound).filter_by(round_id=round_id).one()
+            round_obj.status = "ready"
+            round_obj.user_conditions_json = {"strategy_draft": strategy_draft}
+            db.commit()
+
+        response = client.post(
+            f"/projects/{project_id}/rounds/{round_id}/strategy/confirm",
+            json={"confirmed": True},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "round_id": round_id,
+            "status": "queued",
+            "message": "轮次已排队执行，可在执行进度页查看实时阶段和结果。",
+            "result": None,
+        }
+        assert len(scheduled_runs) == 1
+        assert scheduled_runs[0]["project_id"] == project_id
+        assert scheduled_runs[0]["round_id"] == round_id
+        assert scheduled_runs[0]["settings"] is client.app.state.settings
+        assert scheduled_runs[0]["campaign_config"]["crem"]["num_molecules"] == 5
+
+        with api_app.SessionLocal() as db:
+            round_obj = db.query(ProjectRound).filter_by(round_id=round_id).one()
+            confirmation = db.query(AgentRun).filter_by(
+                round_id=round_id,
+                agent_name="strategy_confirmation",
+            ).one()
+
+        assert round_obj.status == "queued"
+        assert confirmation.status == "confirmed"
+
+
+def test_background_round_failure_marks_the_round_failed(tmp_path, monkeypatch):
+    import medagent.api.rounds_router as rounds_router
+    from medagent.pipeline.round_orchestrator import RoundOrchestrator
+
+    def fail_round_execution(*args, **kwargs):
+        raise RuntimeError("planned background execution failure")
+
+    monkeypatch.setattr(RoundOrchestrator, "run_round", fail_round_execution)
+
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Failed background round"}).json()["project_id"]
+        round_id = client.post(
+            f"/projects/{project_id}/rounds",
+            json={"round_number": 1},
+        ).json()["round_id"]
+
+        rounds_router._run_confirmed_round(
+            project_id=project_id,
+            round_id=round_id,
+            campaign_config={},
+            assessment_config={},
+            seeds=[],
+            seed_molecule_ids=[],
+            settings=client.app.state.settings,
+        )
+
+        with api_app.SessionLocal() as db:
+            round_obj = db.query(ProjectRound).filter_by(round_id=round_id).one()
+            failure = db.query(AgentRun).filter_by(
+                round_id=round_id,
+                agent_name="round_execution",
+            ).one()
+
+        assert round_obj.status == "failed"
+        assert round_obj.completed_at is not None
+        assert failure.status == "failed"
+        assert failure.error_message == "planned background execution failure"
+
+
 def test_database_rule_filter_evidence_link_resolves_without_rag_chunk(tmp_path):
     with make_client(tmp_path) as client:
         project_id = client.post("/projects", json={"name": "DB evidence"}).json()["project_id"]
@@ -827,6 +993,14 @@ $$$$
                         "selected_pose_rank": 1,
                         "pose_count": 10,
                         "pose_selection_method": "diffdock_rank_1_by_confidence",
+                        "pose_interactions_computed": True,
+                        "pose_interactions": {
+                            "computed": True,
+                            "hbond_count": 2,
+                            "key_hbond_count": 1,
+                            "clash_count": 0,
+                            "key_residue_interactions": [{"residue": "CYS797"}],
+                        },
                     },
                 )
             )
@@ -884,6 +1058,10 @@ $$$$
         assert candidate["docking"]["best_pose_confirmed"] is True
         assert candidate["docking"]["pose_artifact_available"] is True
         assert candidate["docking"]["pose_file"] == str(pose_file)
+        assert candidate["docking"]["pose_interactions_computed"] is True
+        assert candidate["docking"]["pose_interactions"]["key_residue_interactions"] == [
+            {"residue": "CYS797"}
+        ]
         pose_coordinates = candidate["docking"]["pose_coordinates"]
         assert pose_coordinates["format"] == "sdf"
         assert pose_coordinates["atom_count"] == 2

@@ -145,6 +145,18 @@ def build_round_report(db: Session, project: Project, round_obj: ProjectRound) -
             report["admet_distribution"] = _admet_risk_distribution(admet_results)
 
     # 排名结果
+    docking_by_molecule_id: dict[str, DockingResult] = {}
+    if molecule_ids:
+        docking_by_molecule_id = {
+            result.molecule_id: result
+            for result in db.query(DockingResult)
+            .filter(
+                DockingResult.molecule_id.in_(molecule_ids),
+                DockingResult.round_id == round_obj.round_id,
+            )
+            .all()
+        }
+
     rankings = db.query(Ranking).filter_by(round_id=round_obj.round_id).order_by(Ranking.rank.asc()).all()
     report["ranking"] = {
         "total_count": len(rankings),
@@ -155,6 +167,9 @@ def build_round_report(db: Session, project: Project, round_obj: ProjectRound) -
                 "overall_score": r.overall_score,
                 "final_decision": r.final_decision,
                 "score_breakdown": r.score_breakdown or {},
+                "docking": _docking_evidence_summary(
+                    docking_by_molecule_id.get(r.molecule_id)
+                ),
             }
             for r in rankings[:10]
         ],
@@ -208,6 +223,26 @@ def _docking_score_distribution(docking_results: list[DockingResult]) -> dict[st
         "max": max(scores),
         "mean": sum(scores) / len(scores),
         "median": sorted(scores)[len(scores) // 2],
+    }
+
+
+def _docking_evidence_summary(result: DockingResult | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    raw_output = result.raw_output or {}
+    return {
+        "vina_score": result.vina_score,
+        "cnn_score": result.cnn_score,
+        "key_hbond_count": result.key_hbond_count,
+        "clash_count": result.clash_count,
+        "pose_file": result.pose_file,
+        "selected_pose_rank": raw_output.get("selected_pose_rank"),
+        "pose_count": raw_output.get("pose_count"),
+        "pose_selection_method": raw_output.get("pose_selection_method"),
+        "best_pose_confirmed": raw_output.get("best_pose_confirmed"),
+        "pose_interactions_computed": raw_output.get("pose_interactions_computed"),
+        "pose_interactions": raw_output.get("pose_interactions"),
+        "labels": result.labels or [],
     }
 
 

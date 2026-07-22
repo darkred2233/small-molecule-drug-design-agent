@@ -59,6 +59,17 @@ def test_seed_ligands_can_be_imported_into_molecules(tmp_path):
         assert {item["status"] for item in molecules} == {"imported_from_seed"}
         assert all("seed_ligand" in item["labels"] for item in molecules)
 
+        properties_response = client.get(
+            f"/projects/{project_id}/molecules/{molecules[0]['molecule_id']}/properties"
+        )
+        assert properties_response.status_code == 200
+        properties = properties_response.json()
+        assert properties["mw"] is not None
+        assert properties["logp"] is not None
+        assert properties["tpsa"] is not None
+        assert properties["hbd"] is not None
+        assert properties["hba"] is not None
+
 
 def test_import_seeds_is_idempotent_and_single_molecule_can_be_read(tmp_path):
     with make_client(tmp_path) as client:

@@ -96,7 +96,12 @@ def select_docking_tool(
     tool_status: dict[str, Any],
 ) -> str | None:
     has_grid = _is_vector3(request.grid_center) and _is_vector3(request.grid_size)
-    if tool_status.get("gnina", {}).get("available") and has_grid:
+    gnina_status = tool_status.get("gnina", {})
+    gnina_gpu_ready = not (
+        gnina_status.get("mode") == "docker"
+        and gnina_status.get("gpu_available") is False
+    )
+    if gnina_status.get("available") and gnina_gpu_ready and has_grid:
         return "gnina"
     if (
         tool_status.get("vina", {}).get("available")

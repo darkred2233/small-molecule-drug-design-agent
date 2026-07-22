@@ -86,6 +86,27 @@ mode |   affinity | CNNscore | CNNaffinity
     assert parsed["cnn_affinity"] == -7.8
 
 
+def test_select_docking_tool_uses_vina_when_docker_gnina_has_no_gpu(tmp_path):
+    request = DockingToolRequest(
+        receptor_file=str(tmp_path / "protein.pdbqt"),
+        ligand_file=str(tmp_path / "ligand.pdbqt"),
+        output_dir=str(tmp_path / "poses"),
+        grid_center=[1.0, 2.0, 3.0],
+        grid_size=[18.0, 19.0, 20.0],
+        molecule_id="MOL-GPU-FALLBACK",
+    )
+
+    selected = docking_adapters.select_docking_tool(
+        request,
+        {
+            "gnina": {"available": True, "mode": "docker", "gpu_available": False},
+            "vina": {"available": True, "mode": "docker"},
+        },
+    )
+
+    assert selected == "vina"
+
+
 def test_gnina_command_uses_receptor_ligand_grid_and_output(tmp_path, monkeypatch):
     # Mock GPU check to return False (CPU mode)
     monkeypatch.setattr(docking_adapters, "_check_gpu_available", lambda: False)

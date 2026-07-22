@@ -75,6 +75,53 @@ def validate_project_molecules(db: Session, project: Project) -> dict:
     return summary.as_dict()
 
 
+def ensure_molecule_property_record(db: Session, molecule: Molecule) -> ValidationResult:
+    """Validate one structure and persist its descriptors without changing workflow status."""
+    result = validate_smiles(molecule.smiles)
+    molecule.labels = merge_labels(molecule.labels, result.labels)
+    if result.valid:
+        descriptors = result.descriptors or {}
+        update_molecule_structure_fields(molecule, descriptors)
+        upsert_molecule_property(db, molecule, descriptors)
+    return result
+
+
+def backfill_project_molecule_properties(db: Session, project: Project) -> dict:
+    """Fill missing descriptor records while preserving each molecule's workflow state."""
+    summary = {
+        "scanned_count": 0,
+        "backfilled_count": 0,
+        "already_complete_count": 0,
+        "invalid_count": 0,
+        "invalid_molecule_ids": [],
+    }
+    molecules = (
+        db.query(Molecule)
+        .filter_by(project_id=project.project_id)
+        .order_by(Molecule.id.asc())
+        .all()
+    )
+    for molecule in molecules:
+        summary["scanned_count"] += 1
+        properties = db.query(MoleculeProperty).filter_by(molecule_id=molecule.molecule_id).one_or_none()
+        if properties is not None and all(
+            getattr(properties, field_name) is not None
+            for field_name in ("mw", "logp", "tpsa", "hbd", "hba")
+        ):
+            summary["already_complete_count"] += 1
+            continue
+
+        result = ensure_molecule_property_record(db, molecule)
+        if result.valid:
+            summary["backfilled_count"] += 1
+        else:
+            summary["invalid_count"] += 1
+            summary["invalid_molecule_ids"].append(molecule.molecule_id)
+
+    db.commit()
+    return summary
+
+
 def validate_smiles(smiles: str) -> ValidationResult:
     rdkit_result = validate_smiles_with_rdkit(smiles)
     if rdkit_result.available:

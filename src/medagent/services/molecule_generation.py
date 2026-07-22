@@ -19,6 +19,14 @@ TARGET_FALLBACK_SEED_SMILES = {
 }
 
 
+def _positive_generation_count(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 @dataclass(frozen=True)
 class GenerationCandidate:
     smiles: str
@@ -292,11 +300,19 @@ class RdkitGrowLinkAutoGrow4Strategy:
                 if receptor_file and Path(receptor_file).exists():
                     with tempfile.TemporaryDirectory(prefix="autogrow4_gen_") as tmp_dir:
                         request = AutoGrow4Request(
-                            seed_smiles=seeds[:5],
+                            # AutoGrow4 evolves its complete source pool. This is
+                            # separate from requested_count, the candidate count
+                            # retained after the genetic search.
+                            seed_smiles=seeds,
                             receptor_file=receptor_file,
                             output_dir=tmp_dir,
-                            num_generations=5,
-                            population_size=requested_count,
+                            num_generations=_positive_generation_count(
+                                constraints.get("num_generations"), default=5
+                            ),
+                            population_size=_positive_generation_count(
+                                constraints.get("population_size"),
+                                default=max(requested_count, 4),
+                            ),
                             constraints=constraints,
                             timeout_seconds=int(
                                 autogrow4_status.get("configured_timeout_seconds") or 1200

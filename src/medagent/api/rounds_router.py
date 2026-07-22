@@ -5,11 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from medagent.db.models import CampaignRun, Project, ProjectRound, RoundReport
-from medagent.db.session import get_db
+from medagent.db.models import AgentRun, CampaignRun, Project, ProjectRound, RoundReport
+from medagent.db.session import build_session_factory, get_db
 from medagent.services.ids import new_id
 from medagent.domain.schemas import (
     CampaignRunRead,
@@ -352,6 +352,17 @@ def get_round_summary(
         for c in campaigns
     ]
 
+    active_run = (
+        db.query(AgentRun)
+        .filter(
+            AgentRun.round_id == round_id,
+            AgentRun.status.in_(("queued", "running", "pipeline_queued", "pipeline_running")),
+        )
+        .order_by(AgentRun.updated_at.desc(), AgentRun.id.desc())
+        .first()
+    )
+    execution_progress = _execution_progress(active_run)
+
     return {
         "round_id": round_obj.round_id,
         "round_number": round_obj.round_number,
@@ -365,6 +376,7 @@ def get_round_summary(
         "ranking_count": ranking_count,
         "top_molecules": top_molecules,
         "campaigns": campaign_summary,
+        "execution_progress": execution_progress,
     }
 
 
@@ -756,14 +768,14 @@ def confirm_and_execute_strategy(
     project_id: str,
     round_id: str,
     body: RoundStrategyConfirmRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> RoundStrategyExecuteResponse:
     """确认策略并执行本轮。
 
     用户确认策略草稿后，启动本轮生成、评估、排名流程。
     """
-    from medagent.db.models import AgentRun
-
     project = _ensure_project(db, project_id)
     pr = _get_round(db, project_id, round_id)
 
@@ -852,57 +864,94 @@ def confirm_and_execute_strategy(
     db.add(audit_run)
     db.flush()
 
-    # 执行本轮
-    from medagent.pipeline.round_orchestrator import RoundOrchestrator
-    from medagent.core.config import get_settings
+    pr.status = "queued"
+    db.commit()
+    background_tasks.add_task(
+        _run_confirmed_round,
+        project_id=project.project_id,
+        round_id=pr.round_id,
+        campaign_config=campaign_config.model_dump(),
+        assessment_config=assessment_config,
+        seeds=seeds,
+        seed_molecule_ids=seed_molecule_ids,
+        settings=request.app.state.settings,
+    )
 
-    orch = RoundOrchestrator(get_settings())
-
-    try:
-        result = orch.run_round(
-            db,
-            project,
-            pr,
-            campaign_config,
-            assessment_config=assessment_config,
-            seeds=seeds,
-            seed_molecule_ids=seed_molecule_ids,
-        )
-        db.commit()
-
-        return RoundStrategyExecuteResponse(
-            round_id=pr.round_id,
-            status="completed",
-            message="轮次执行完成",
-            result=result,
-        )
-    except Exception as exc:
-        db.rollback()
-
-        # 记录执行失败审计
-        failure_audit = AgentRun(
-            agent_run_id=new_id("RUN"),
-            project_id=project.project_id,
-            round_id=pr.round_id,
-            agent_name="round_execution",
-            model_name="orchestrator",
-            status="failed",
-            input_json={"round_id": pr.round_id},
-            output_json={"error": str(exc)},
-        )
-        db.add(failure_audit)
-        db.commit()
-
-        return RoundStrategyExecuteResponse(
-            round_id=pr.round_id,
-            status="failed",
-            message=f"轮次执行失败: {str(exc)}",
-        )
+    return RoundStrategyExecuteResponse(
+        round_id=pr.round_id,
+        status="queued",
+        message="轮次已排队执行，可在执行进度页查看实时阶段和结果。",
+    )
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _execution_progress(active_run: AgentRun | None) -> dict[str, Any] | None:
+    if active_run is None:
+        return None
+
+    progress = (active_run.output_json or {}).get("progress") or {}
+    return {
+        "agent_run_id": active_run.agent_run_id,
+        "agent_name": active_run.agent_name,
+        "status": active_run.status,
+        "stage": progress.get("stage") or active_run.agent_name,
+        "message": progress.get("message") or "正在准备执行。",
+        "total_molecules": progress.get("total_molecules"),
+        "completed_molecules": progress.get("completed_molecules"),
+        "percent": progress.get("percent"),
+    }
+
+
+def _run_confirmed_round(
+    *,
+    project_id: str,
+    round_id: str,
+    campaign_config: dict[str, Any],
+    assessment_config: dict[str, Any],
+    seeds: list[str],
+    seed_molecule_ids: list[str],
+    settings: Any,
+) -> None:
+    from medagent.pipeline.round_orchestrator import RoundOrchestrator
+
+    session_factory = build_session_factory(settings)
+    with session_factory() as db:
+        project = _ensure_project(db, project_id)
+        round_obj = _get_round(db, project_id, round_id)
+        orchestrator = RoundOrchestrator(settings)
+        try:
+            orchestrator.run_round(
+                db,
+                project,
+                round_obj,
+                _campaign_config_from_payload(campaign_config),
+                assessment_config=assessment_config,
+                seeds=seeds,
+                seed_molecule_ids=seed_molecule_ids,
+            )
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            failed_round = _get_round(db, project_id, round_id)
+            failed_round.status = "failed"
+            failed_round.completed_at = datetime.now(UTC)
+            db.add(
+                AgentRun(
+                    agent_run_id=new_id("RUN"),
+                    project_id=project_id,
+                    round_id=round_id,
+                    agent_name="round_execution",
+                    model_name="orchestrator",
+                    status="failed",
+                    input_json={"round_id": round_id},
+                    output_json={"error": str(exc)},
+                    error_message=str(exc),
+                )
+            )
+            db.commit()
 
 def _ensure_project(db: Session, project_id: str) -> Project:
     project = db.query(Project).filter(Project.project_id == project_id).first()

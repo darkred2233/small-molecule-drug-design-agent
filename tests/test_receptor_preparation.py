@@ -157,7 +157,7 @@ def test_candidate_assessment_uses_binding_site_receptor_and_grid(tmp_path, monk
         assert all(request.grid_center == [4.0, 5.0, 6.0] for request, _ in docking_requests)
         assert all(request.grid_size == [16.0, 17.0, 18.0] for request, _ in docking_requests)
         assert all(
-            request.receptor_file.endswith(("egfr_receptor.pdb", "egfr_receptor.pdbqt"))
+            request.receptor_file.endswith("egfr_receptor.pdb")
             for request, _ in docking_requests
         )
 
