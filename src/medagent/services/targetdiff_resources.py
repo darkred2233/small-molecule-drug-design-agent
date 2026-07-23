@@ -91,14 +91,16 @@ def _bundle_from_resource(resource: ProjectResource) -> TargetDiffResourceBundle
 
 
 def _bundle_from_binding_site(site: BindingSite) -> TargetDiffResourceBundle:
-    path = site.prepared_receptor_file or site.receptor_file
+    grid_box = site.grid_box or {}
+    path = grid_box.get("pocket_file")
     return TargetDiffResourceBundle(
-        pocket_file=_pdb_file(path, "TargetDiff binding site receptor"),
+        pocket_file=_pdb_file(path, "TargetDiff binding site pocket"),
         binding_site_id=site.binding_site_id,
         provenance={
             "source": "binding_site",
             "preparation_status": site.preparation_status,
-            "used_prepared_receptor": bool(site.prepared_receptor_file),
+            "input_status": "predicted_not_experimentally_validated",
+            "pocket_artifact": path,
         },
     )
 

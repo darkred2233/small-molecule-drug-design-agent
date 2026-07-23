@@ -822,6 +822,7 @@ class AutoGrow4CampaignConfig(BaseModel):
     generations: int = Field(default=5, ge=1, le=50, title="遗传代数")
     search_intensity: SearchIntensity = Field(default="normal", title="搜索强度")
     source_pool_policy: SourcePoolPolicy = Field(default="auto", title="source pool 策略")
+    previous_top_n: int = Field(default=20, ge=1, le=200, title="上一轮 Vina 回流分子数")
     receptor_resource_id: str | None = Field(default=None, title="receptor 资源编号")
     binding_site_id: str | None = Field(default=None, title="binding site 编号")
 

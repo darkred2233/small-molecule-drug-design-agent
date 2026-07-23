@@ -15,8 +15,18 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from medagent.db.models import BindingSite, Project, ProjectResource, SeedLigand, TargetDrugLibrary
+from medagent.db.models import (
+    BindingSite,
+    DockingResult,
+    Molecule,
+    Project,
+    ProjectResource,
+    ProjectRound,
+    SeedLigand,
+    TargetDrugLibrary,
+)
 from medagent.domain.schemas import AutoGrow4CampaignConfig, AutoGrow4ResourceBundle
+from medagent.services.pdbqt_validation import is_valid_vina_receptor_pdbqt
 
 
 # search_intensity 映射
@@ -70,7 +80,7 @@ def resolve_autogrow4_resources(
 
     return AutoGrow4ResourceBundle(
         receptor_file=receptor_file,
-        prepared_receptor_file=None,
+        prepared_receptor_file=receptor_file,
         binding_site_id=binding_site_id,
         grid_center=grid_center,
         grid_size=grid_size,
@@ -103,13 +113,14 @@ def _resolve_receptor_and_grid(
     if binding_site_id:
         site = db.query(BindingSite).filter(
             BindingSite.binding_site_id == binding_site_id,
+            BindingSite.project_id == project.project_id,
         ).first()
-        if site and site.receptor_file:
+        if site and _prepared_pdbqt(site):
             grid = _binding_site_grid(site)
             if grid is None:
                 raise ValueError("AutoGrow4 selected binding site has no valid docking grid")
             center, size = grid
-            return _local_file_path(site.receptor_file), center, size, binding_site_id
+            return _prepared_pdbqt(site), center, size, binding_site_id
 
     # Prefer an actually prepared, grid-defined site. Projects can retain an
     # earlier uploaded-only site alongside the prepared receptor.
@@ -121,30 +132,35 @@ def _resolve_receptor_and_grid(
     )
     sites.sort(key=lambda site: site.preparation_status != "prepared")
     for site in sites:
-        if not site.receptor_file:
+        if not _prepared_pdbqt(site):
             continue
         grid = _binding_site_grid(site)
         if grid is None:
             continue
         center, size = grid
-        return _local_file_path(site.receptor_file), center, size, site.binding_site_id
+        return _prepared_pdbqt(site), center, size, site.binding_site_id
 
     # 尝试使用 ProjectResource 中的 receptor
     if config.receptor_resource_id:
         resource = db.query(ProjectResource).filter(
             ProjectResource.resource_id == config.receptor_resource_id,
+            ProjectResource.project_id == project.project_id,
             ProjectResource.resource_type == "receptor",
         ).first()
         if resource and resource.file_path:
             metadata = resource.metadata_json or {}
-            center = metadata.get("grid_center", [0, 0, 0])
-            size = metadata.get("grid_size", [20, 20, 20])
-            return _local_file_path(resource.file_path), center, size, None
+            center = metadata.get("grid_center")
+            size = metadata.get("grid_size")
+            if not _valid_grid(center, size):
+                raise ValueError("AutoGrow4 receptor resource has no valid P2Rank-derived docking grid")
+            receptor_file = _local_file_path(resource.file_path)
+            if _is_valid_pdbqt_file(receptor_file):
+                return receptor_file, center, size, None
 
     raise ValueError(
         "AutoGrow4 requires receptor + binding pocket. "
         "Provide binding_site_id or receptor_resource_id in config, "
-        "or ensure the project has a binding site with receptor file."
+        "or ensure the project has a binding site with a valid prepared PDBQT receptor."
     )
 
 
@@ -166,8 +182,32 @@ def _binding_site_grid(site: BindingSite) -> tuple[list[float], list[float]] | N
     return center_values, size_values
 
 
+def _valid_grid(center: Any, size: Any) -> bool:
+    if not isinstance(center, list) or not isinstance(size, list):
+        return False
+    if len(center) != 3 or len(size) != 3:
+        return False
+    try:
+        return all(float(value) > 0 for value in size) and len([float(value) for value in center]) == 3
+    except (TypeError, ValueError):
+        return False
+
+
 def _local_file_path(path: str) -> str:
     return path.removeprefix("local://")
+
+
+def _prepared_pdbqt(site: BindingSite) -> str | None:
+    candidate = site.prepared_receptor_file
+    if not candidate:
+        return None
+    path = _local_file_path(candidate)
+    return path if _is_valid_pdbqt_file(path) else None
+
+
+def _is_valid_pdbqt_file(path: str) -> bool:
+    candidate = Path(path)
+    return candidate.suffix.lower() == ".pdbqt" and is_valid_vina_receptor_pdbqt(candidate)
 
 
 def _build_source_pool(
@@ -181,7 +221,10 @@ def _build_source_pool(
 
     policy = config.source_pool_policy
 
-    if policy in ("auto", "user_uploaded"):
+    if policy == "previous_top":
+        compounds = _previous_top_compounds(db, project, config.previous_top_n)
+        provenance["sources"].append({"type": "previous_top", "count": len(compounds)})
+    elif policy in ("auto", "user_uploaded"):
         # 用户上传的 seed ligands
         seeds = db.query(SeedLigand).filter(
             SeedLigand.project_id == project.project_id,
@@ -220,6 +263,33 @@ def _build_source_pool(
     provenance["policy"] = policy
 
     return unique_compounds, provenance
+
+
+def _previous_top_compounds(
+    db: Session, project: Project, limit: int
+) -> list[tuple[str, str]]:
+    previous_round = (
+        db.query(ProjectRound)
+        .filter(ProjectRound.project_id == project.project_id, ProjectRound.status == "completed")
+        .order_by(ProjectRound.round_number.desc(), ProjectRound.id.desc())
+        .first()
+    )
+    if previous_round is None:
+        return []
+    rows = (
+        db.query(Molecule, DockingResult)
+        .join(
+            DockingResult,
+            (DockingResult.molecule_id == Molecule.molecule_id)
+            & (DockingResult.round_id == previous_round.round_id),
+        )
+        .filter(Molecule.project_id == project.project_id, Molecule.round_id == previous_round.round_id)
+        .filter(DockingResult.vina_score.is_not(None))
+        .order_by(DockingResult.vina_score.asc(), Molecule.molecule_id.asc())
+        .limit(limit)
+        .all()
+    )
+    return [(molecule.smiles, molecule.molecule_id) for molecule, _ in rows if molecule.smiles]
 
 
 def _write_source_compounds(

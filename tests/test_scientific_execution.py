@@ -55,6 +55,35 @@ def test_execution_plan_requires_a_frozen_release_for_formal_rounds():
     assert "source_releases_not_frozen" in plan.blockers
 
 
+def test_predicted_pocket_is_usable_for_computational_stages_with_a_warning():
+    plan = build_execution_plan(
+        _snapshot(
+            target_resource={
+                "target_id": "TGT-EGFR",
+                "prepared_receptor": True,
+                "pocket_predicted": True,
+                "artifact_hashes_complete": True,
+            },
+            tools={
+                "crem": {"available": False},
+                "targetdiff": {"available": True},
+                "autogrow4": {"available": True},
+                "vina": {"available": True},
+                "gnina": {"available": True},
+                "admet_ai": {"available": True},
+                "aizynthfinder": {"available": True, "model_configured": True},
+                "rdkit": {"available": True},
+            },
+        ),
+        formal_round=True,
+    )
+
+    assert plan.stage("prepare_target_resource").allowed is True
+    assert plan.stage("generate_candidates").allowed is True
+    assert plan.stage("vina_screen").allowed is True
+    assert "predicted_not_experimentally_validated" in plan.stage("vina_screen").warnings
+
+
 def test_generation_stage_allows_targetdiff_when_crem_is_unavailable():
     plan = build_execution_plan(
         _snapshot(

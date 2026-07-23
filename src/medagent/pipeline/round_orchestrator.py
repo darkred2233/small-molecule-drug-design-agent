@@ -474,7 +474,7 @@ class RoundOrchestrator:
         # TargetDiff
         if campaign_config.targetdiff.enabled:
             if (
-                target_resource.get("verified_pocket")
+                target_resource.get("pocket_predicted")
                 and target_resource.get("targetdiff_pocket")
                 and bool((tools.get("targetdiff") or {}).get("available"))
             ):
@@ -491,7 +491,7 @@ class RoundOrchestrator:
         # AutoGrow4
         if campaign_config.autogrow4.enabled:
             if (
-                target_resource.get("verified_pocket")
+                target_resource.get("pocket_predicted")
                 and target_resource.get("prepared_receptor")
                 and bool((tools.get("autogrow4") or {}).get("available"))
             ):

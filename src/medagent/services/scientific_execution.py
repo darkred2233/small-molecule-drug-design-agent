@@ -196,9 +196,11 @@ def build_execution_plan(
     blocked, unavailable, approximate, or eligible for actual computation.
     """
     resource = snapshot.target_resource
-    has_verified_pocket = bool(resource.get("verified_pocket"))
+    # P2Rank produces a computational input, not experimental validation.  A
+    # predicted pocket is sufficient to run computational stages when the
+    # material artifacts are present; every consumer receives the warning.
+    has_predicted_pocket = bool(resource.get("pocket_predicted") or resource.get("verified_pocket"))
     has_prepared_receptor = bool(resource.get("prepared_receptor"))
-    has_reference_ligand = bool(resource.get("reference_ligand"))
     has_artifact_hashes = bool(resource.get("artifact_hashes_complete"))
     source_releases_frozen = bool(snapshot.source_release_ids)
 
@@ -207,41 +209,43 @@ def build_execution_plan(
         blockers.append("source_releases_not_frozen")
 
     generation_warnings: list[str] = []
-    if not has_verified_pocket:
-        generation_warnings.append("structure_conditioned_generators_blocked_without_verified_pocket")
+    if has_predicted_pocket:
+        generation_warnings.append("predicted_not_experimentally_validated")
+    else:
+        generation_warnings.append("structure_conditioned_generators_blocked_without_predicted_pocket")
     generation_tool, crem_available = _tool_available(snapshot, "crem")
-    targetdiff_available = snapshot.tool_available("targetdiff") and has_verified_pocket
+    targetdiff_available = snapshot.tool_available("targetdiff") and has_predicted_pocket
     autogrow_available = (
-        snapshot.tool_available("autogrow4") and has_verified_pocket and has_prepared_receptor
+        snapshot.tool_available("autogrow4") and has_predicted_pocket and has_prepared_receptor
     )
     generation_allowed = crem_available or targetdiff_available or autogrow_available
     generation_reasons = [] if generation_allowed else ["no_generation_tool_available"]
-    if not has_verified_pocket:
-        generation_reasons.append("verified_pocket_required_for_targetdiff_or_autogrow4")
+    if not has_predicted_pocket:
+        generation_reasons.append("pocket_predicted_required_for_targetdiff_or_autogrow4")
     elif not has_prepared_receptor and snapshot.tool_available("autogrow4"):
         generation_reasons.append("prepared_receptor_required_for_autogrow4")
 
     vina_tool, vina_available = _tool_available(snapshot, "vina")
     vina_reasons: list[str] = []
-    if not has_verified_pocket:
-        vina_reasons.append("verified_pocket_required")
+    if not has_predicted_pocket:
+        vina_reasons.append("pocket_predicted_required")
     if not has_prepared_receptor:
         vina_reasons.append("prepared_receptor_required")
     if not vina_available:
         vina_reasons.append("vina_unavailable")
     vina_allowed = not vina_reasons
-    vina_warnings = [] if has_reference_ligand else ["redock_validation_not_available"]
+    vina_warnings = ["predicted_not_experimentally_validated"]
 
     gnina_tool, gnina_available = _tool_available(snapshot, "gnina")
     gnina_reasons: list[str] = []
-    if not has_verified_pocket:
-        gnina_reasons.append("verified_pocket_required")
+    if not has_predicted_pocket:
+        gnina_reasons.append("pocket_predicted_required")
     if not has_prepared_receptor:
         gnina_reasons.append("prepared_receptor_required")
     if not gnina_available:
         gnina_reasons.append("gnina_unavailable")
     gnina_allowed = not gnina_reasons
-    gnina_warnings = [] if has_reference_ligand else ["redock_validation_not_available"]
+    gnina_warnings = ["predicted_not_experimentally_validated"]
 
     admet_tool, admet_available = _tool_available(snapshot, "admet_ai", "chemprop")
     if admet_available:
@@ -281,15 +285,15 @@ def build_execution_plan(
         )
 
     structure_ready_reasons: list[str] = []
-    if not has_verified_pocket:
-        structure_ready_reasons.append("verified_pocket_required")
+    if not has_predicted_pocket:
+        structure_ready_reasons.append("pocket_predicted_required")
     if not has_artifact_hashes:
         structure_ready_reasons.append("artifact_hashes_incomplete")
 
     stages = (
         StagePlan(
             "prepare_target_resource",
-            has_verified_pocket and has_prepared_receptor and has_artifact_hashes,
+            has_predicted_pocket and has_prepared_receptor and has_artifact_hashes,
             "resource_validation" if not structure_ready_reasons else "blocked",
             EvidenceLevel.L2 if not structure_ready_reasons else EvidenceLevel.L0,
             EvidenceKind.COMPUTATIONAL if not structure_ready_reasons else EvidenceKind.NOT_EXECUTED,
