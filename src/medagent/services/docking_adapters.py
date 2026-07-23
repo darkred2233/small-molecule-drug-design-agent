@@ -16,6 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from medagent.services.tool_config import get_tool_runtime_config, resolve_configured_path
+from medagent.services.wsl_runtime import (
+    build_wsl_command,
+    windows_path_to_wsl,
+    wsl_file_exists,
+)
 
 
 _FLOAT_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
@@ -72,7 +77,10 @@ def run_external_docking(
             warnings=validation_warnings,
         )
     if selected_tool == "gnina":
-        return run_gnina_docking(str(tool_status["gnina"].get("path") or "gnina"), request)
+        gnina_status = tool_status["gnina"]
+        return run_gnina_docking(
+            str(gnina_status.get("path") or "gnina"), request, runtime_status=gnina_status
+        )
     if selected_tool == "vina":
         return run_vina_docking(str(tool_status["vina"].get("path") or "vina"), request)
     return None
@@ -109,26 +117,55 @@ def validate_docking_request(
 
 
 def build_gnina_command(executable: str, request: DockingToolRequest) -> tuple[list[str], str]:
-    pose_file = str(Path(request.output_dir) / f"{_safe_pose_prefix(request.molecule_id)}_gnina_pose.sdf")
+    pose_file = str(
+        Path(request.output_dir) / f"{_safe_pose_prefix(request.molecule_id)}_gnina_pose.sdf"
+    )
     command = [
-        executable, "-r", request.receptor_file, "-l", request.ligand_file, "-o", pose_file,
-        "--exhaustiveness", str(request.exhaustiveness), *_grid_args(request),
+        executable,
+        "-r",
+        request.receptor_file,
+        "-l",
+        request.ligand_file,
+        "-o",
+        pose_file,
+        "--exhaustiveness",
+        str(request.exhaustiveness),
+        *_grid_args(request),
     ]
     return command, pose_file
 
 
 def build_vina_command(executable: str, request: DockingToolRequest) -> tuple[list[str], str]:
-    pose_file = str(Path(request.output_dir) / f"{_safe_pose_prefix(request.molecule_id)}_vina_pose.pdbqt")
+    pose_file = str(
+        Path(request.output_dir) / f"{_safe_pose_prefix(request.molecule_id)}_vina_pose.pdbqt"
+    )
     command = [
-        executable, "--receptor", request.receptor_file, "--ligand", request.ligand_file,
-        "--out", pose_file, "--exhaustiveness", str(request.exhaustiveness), *_grid_args(request),
+        executable,
+        "--receptor",
+        request.receptor_file,
+        "--ligand",
+        request.ligand_file,
+        "--out",
+        pose_file,
+        "--exhaustiveness",
+        str(request.exhaustiveness),
+        *_grid_args(request),
     ]
     return command, pose_file
 
 
-def run_gnina_docking(executable: str, request: DockingToolRequest) -> DockingToolResult:
+def run_gnina_docking(
+    executable: str,
+    request: DockingToolRequest,
+    *,
+    runtime_status: dict[str, Any] | None = None,
+) -> DockingToolResult:
     Path(request.output_dir).mkdir(parents=True, exist_ok=True)
     command, pose_file = build_gnina_command(executable, request)
+    execution_mode = "local_cli"
+    if runtime_status and runtime_status.get("runtime_scope") == "wsl":
+        command = _build_wsl_gnina_command(executable, request, pose_file, runtime_status)
+        execution_mode = "wsl_cli"
     exit_code, stdout, stderr, runtime_seconds = _run_command(command, request.timeout_seconds)
     parsed = parse_gnina_output(_combined_output(stdout, stderr))
     pose_exists = pose_artifact_available(pose_file)
@@ -137,15 +174,25 @@ def run_gnina_docking(executable: str, request: DockingToolRequest) -> DockingTo
     if exit_code == 0 and parsed["vina_score"] is not None and not pose_exists:
         warnings.append("external_docking_pose_file_missing")
     return DockingToolResult(
-        adapter_mode="gnina_local_docking", tool_name="gnina", success=success,
-        vina_score=parsed["vina_score"], cnn_score=parsed["cnn_score"],
-        cnn_affinity=parsed["cnn_affinity"], pose_file=pose_file if success else None,
-        selected_pose_rank=parsed["selected_pose_rank"], pose_count=parsed["pose_count"],
+        adapter_mode="gnina_local_docking",
+        tool_name="gnina",
+        success=success,
+        vina_score=parsed["vina_score"],
+        cnn_score=parsed["cnn_score"],
+        cnn_affinity=parsed["cnn_affinity"],
+        pose_file=pose_file if success else None,
+        selected_pose_rank=parsed["selected_pose_rank"],
+        pose_count=parsed["pose_count"],
         pose_selection_method=parsed["pose_selection_method"],
         best_pose_confirmed=bool(parsed["best_pose_confirmed"] and pose_exists),
-        labels=_result_labels("gnina", success), warnings=warnings, stdout=stdout, stderr=stderr,
-        exit_code=exit_code, runtime_seconds=runtime_seconds, command=command,
-        provenance=_docking_provenance(request, "local_cli", executable),
+        labels=_result_labels("gnina", success),
+        warnings=warnings,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        runtime_seconds=runtime_seconds,
+        command=command,
+        provenance=_docking_provenance(request, execution_mode, executable),
     )
 
 
@@ -160,13 +207,22 @@ def run_vina_docking(executable: str, request: DockingToolRequest) -> DockingToo
     if exit_code == 0 and parsed["vina_score"] is not None and not pose_exists:
         warnings.append("external_docking_pose_file_missing")
     return DockingToolResult(
-        adapter_mode="vina_local_docking", tool_name="vina", success=success,
-        vina_score=parsed["vina_score"], pose_file=pose_file if success else None,
-        selected_pose_rank=parsed["selected_pose_rank"], pose_count=parsed["pose_count"],
+        adapter_mode="vina_local_docking",
+        tool_name="vina",
+        success=success,
+        vina_score=parsed["vina_score"],
+        pose_file=pose_file if success else None,
+        selected_pose_rank=parsed["selected_pose_rank"],
+        pose_count=parsed["pose_count"],
         pose_selection_method=parsed["pose_selection_method"],
         best_pose_confirmed=bool(parsed["best_pose_confirmed"] and pose_exists),
-        labels=_result_labels("vina", success), warnings=warnings, stdout=stdout, stderr=stderr,
-        exit_code=exit_code, runtime_seconds=runtime_seconds, command=command,
+        labels=_result_labels("vina", success),
+        warnings=warnings,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        runtime_seconds=runtime_seconds,
+        command=command,
         provenance=_docking_provenance(request, "local_cli", executable),
     )
 
@@ -183,18 +239,51 @@ def _check_local_cli(name: str, *, default_command: str, timeout_seconds: int) -
     config = get_tool_runtime_config(
         name, default_command=default_command, default_timeout_seconds=timeout_seconds
     )
-    executable = _find_local_executable(config.command)
+    is_wsl = config.runtime == "wsl"
+    wsl_executable = _configured_wsl_executable(config.command) if is_wsl else None
+    executable = (
+        wsl_executable
+        if is_wsl
+        and wsl_executable
+        and wsl_file_exists(
+            wsl_executable,
+            distribution=config.wsl_distribution,
+            user=config.wsl_user,
+        )
+        else _find_local_executable(config.command)
+        if not is_wsl
+        else None
+    )
     result: dict[str, Any] = {
-        "available": False, "runtime_available": False, "mode": "local_cli", "path": executable,
-        "version": None, "gpu_available": _local_gpu_available() if name == "gnina" else False,
-        "warning": None, **config.as_status(),
+        "available": False,
+        "runtime_available": False,
+        "mode": "wsl_cli" if is_wsl else "local_cli",
+        "path": executable,
+        "version": None,
+        "gpu_available": _runtime_gpu_available(config) if name == "gnina" else False,
+        "warning": None,
+        **config.as_status(),
     }
     if executable is None:
         result["warning"] = f"{name}_local_executable_not_found"
         return result
     try:
+        probe_command = [executable, "--version"]
+        if is_wsl:
+            probe_command = build_wsl_command(
+                probe_command,
+                distribution=config.wsl_distribution,
+                user=config.wsl_user,
+                environment=config.environment_dict(),
+            )
         probe = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=15, check=False
+            probe_command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8" if is_wsl else None,
+            errors="replace" if is_wsl else None,
+            timeout=15,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         result["warning"] = f"{name}_local_runtime_probe_failed"
@@ -220,8 +309,10 @@ def parse_gnina_output(stdout: str) -> dict[str, Any]:
         cnn_affinity = cnn_affinity if cnn_affinity is not None else row.get("cnn_affinity")
     selected = any(value is not None for value in (affinity, cnn_score, cnn_affinity))
     return {
-        "vina_score": _rounded(affinity), "cnn_score": _rounded(cnn_score),
-        "cnn_affinity": _rounded(cnn_affinity), "selected_pose_rank": 1 if selected else None,
+        "vina_score": _rounded(affinity),
+        "cnn_score": _rounded(cnn_score),
+        "cnn_affinity": _rounded(cnn_affinity),
+        "selected_pose_rank": 1 if selected else None,
         "pose_count": len(rows) if rows else (1 if selected else None),
         "pose_selection_method": "gnina_output_mode_1" if selected else None,
         "best_pose_confirmed": selected,
@@ -235,7 +326,8 @@ def parse_vina_output(stdout: str) -> dict[str, Any]:
         score = rows[0].get("affinity")
     score = _rounded(score)
     return {
-        "vina_score": score, "selected_pose_rank": 1 if score is not None else None,
+        "vina_score": score,
+        "selected_pose_rank": 1 if score is not None else None,
         "pose_count": len(rows) if rows else (1 if score is not None else None),
         "pose_selection_method": "vina_lowest_affinity_mode_1" if score is not None else None,
         "best_pose_confirmed": score is not None,
@@ -249,7 +341,9 @@ def pose_artifact_available(pose_file: str | None) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
-def pose_coordinates_from_file(pose_file: str | None, *, max_atoms: int = 120) -> dict[str, Any] | None:
+def pose_coordinates_from_file(
+    pose_file: str | None, *, max_atoms: int = 120
+) -> dict[str, Any] | None:
     if not pose_artifact_available(pose_file):
         return None
     path = Path(str(pose_file))
@@ -260,22 +354,49 @@ def pose_coordinates_from_file(pose_file: str | None, *, max_atoms: int = 120) -
     parsed = _parse_v2000_pose_atoms(text, max_atoms)
     pose_format = "sdf"
     if parsed is None and path.suffix.lower() in {".pdb", ".pdbqt"}:
-        parsed, pose_format = _parse_pdb_pose_atoms(text, max_atoms), path.suffix.lower().lstrip(".")
+        parsed, pose_format = (
+            _parse_pdb_pose_atoms(text, max_atoms),
+            path.suffix.lower().lstrip("."),
+        )
     if parsed is None:
         return None
     atom_count, atoms = parsed
-    return {"format": pose_format, "atom_count": atom_count, "returned_atom_count": len(atoms), "truncated": atom_count > len(atoms), "atoms": atoms}
+    return {
+        "format": pose_format,
+        "atom_count": atom_count,
+        "returned_atom_count": len(atoms),
+        "truncated": atom_count > len(atoms),
+        "atoms": atoms,
+    }
 
 
 def _run_command(command: list[str], timeout_seconds: int) -> tuple[int | None, str, str, float]:
     started = time.perf_counter()
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds, check=False)
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8" if command and command[0] == "wsl" else None,
+            errors="replace" if command and command[0] == "wsl" else None,
+            timeout=timeout_seconds,
+            check=False,
+        )
     except subprocess.TimeoutExpired as exc:
-        return None, _text(exc.stdout), _text(exc.stderr) or "docking_tool_timeout", time.perf_counter() - started
+        return (
+            None,
+            _text(exc.stdout),
+            _text(exc.stderr) or "docking_tool_timeout",
+            time.perf_counter() - started,
+        )
     except OSError as exc:
         return None, "", str(exc), time.perf_counter() - started
-    return completed.returncode, completed.stdout or "", completed.stderr or "", time.perf_counter() - started
+    return (
+        completed.returncode,
+        completed.stdout or "",
+        completed.stderr or "",
+        time.perf_counter() - started,
+    )
 
 
 def _grid_args(request: DockingToolRequest) -> list[str]:
@@ -283,9 +404,18 @@ def _grid_args(request: DockingToolRequest) -> list[str]:
         return []
     assert request.grid_center is not None and request.grid_size is not None
     return [
-        "--center_x", str(float(request.grid_center[0])), "--center_y", str(float(request.grid_center[1])),
-        "--center_z", str(float(request.grid_center[2])), "--size_x", str(float(request.grid_size[0])),
-        "--size_y", str(float(request.grid_size[1])), "--size_z", str(float(request.grid_size[2])),
+        "--center_x",
+        str(float(request.grid_center[0])),
+        "--center_y",
+        str(float(request.grid_center[1])),
+        "--center_z",
+        str(float(request.grid_center[2])),
+        "--size_x",
+        str(float(request.grid_size[0])),
+        "--size_y",
+        str(float(request.grid_size[1])),
+        "--size_z",
+        str(float(request.grid_size[2])),
     ]
 
 
@@ -370,7 +500,9 @@ def _parse_pdb_pose_atoms(text: str, max_atoms: int) -> tuple[int, list[dict[str
     atoms: list[dict[str, Any]] = []
     for index, line in enumerate(source[:max_atoms], start=1):
         try:
-            x, y, z = (round(float(line[start:end]), 4) for start, end in ((30, 38), (38, 46), (46, 54)))
+            x, y, z = (
+                round(float(line[start:end]), 4) for start, end in ((30, 38), (38, 46), (46, 54))
+            )
         except ValueError:
             continue
         element = line[76:78].strip() or re.sub(r"[^A-Za-z]", "", line[12:16]).title()[:2]
@@ -388,26 +520,110 @@ def _find_local_executable(command: str | None) -> str | None:
     return found or None
 
 
+def _configured_wsl_executable(command: str | None) -> str | None:
+    if not command:
+        return None
+    if command.startswith("/"):
+        return command
+    configured = resolve_configured_path(command)
+    return windows_path_to_wsl(configured) if configured else command
+
+
 def _local_gpu_available() -> bool:
     executable = shutil.which("nvidia-smi")
     if executable is None:
         return False
     try:
-        return subprocess.run([executable, "-L"], capture_output=True, text=True, timeout=5, check=False).returncode == 0
+        return (
+            subprocess.run(
+                [executable, "-L"], capture_output=True, text=True, timeout=5, check=False
+            ).returncode
+            == 0
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
 
 
-def _docking_provenance(request: DockingToolRequest, execution_mode: str, executable: str) -> dict[str, Any]:
-    return {"execution_mode": execution_mode, "executable": executable, "receptor_file": request.receptor_file, "ligand_file": request.ligand_file, "grid_center": request.grid_center, "grid_size": request.grid_size, "exhaustiveness": request.exhaustiveness}
+def _runtime_gpu_available(config: Any) -> bool:
+    if config.runtime != "wsl":
+        return _local_gpu_available()
+    command = build_wsl_command(
+        ["nvidia-smi", "-L"],
+        distribution=config.wsl_distribution,
+        user=config.wsl_user,
+    )
+    try:
+        return (
+            subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _build_wsl_gnina_command(
+    executable: str,
+    request: DockingToolRequest,
+    pose_file: str,
+    runtime_status: dict[str, Any],
+) -> list[str]:
+    tool_command = [
+        executable,
+        "-r",
+        windows_path_to_wsl(str(Path(request.receptor_file).resolve())),
+        "-l",
+        windows_path_to_wsl(str(Path(request.ligand_file).resolve())),
+        "-o",
+        windows_path_to_wsl(str(Path(pose_file).resolve())),
+        "--exhaustiveness",
+        str(request.exhaustiveness),
+        *_grid_args(request),
+    ]
+    environment = runtime_status.get("runtime_environment")
+    return build_wsl_command(
+        tool_command,
+        distribution=str(runtime_status.get("wsl_distribution") or "Ubuntu"),
+        user=str(runtime_status.get("wsl_user") or "root"),
+        environment=environment if isinstance(environment, dict) else None,
+    )
+
+
+def _docking_provenance(
+    request: DockingToolRequest, execution_mode: str, executable: str
+) -> dict[str, Any]:
+    return {
+        "execution_mode": execution_mode,
+        "executable": executable,
+        "receptor_file": request.receptor_file,
+        "ligand_file": request.ligand_file,
+        "grid_center": request.grid_center,
+        "grid_size": request.grid_size,
+        "exhaustiveness": request.exhaustiveness,
+    }
 
 
 def _result_labels(tool_name: str, success: bool) -> list[str]:
-    return [f"{tool_name}_local_executed", "external_docking_pose_confirmed"] if success else ["external_docking_adapter_failed"]
+    return (
+        [f"{tool_name}_local_executed", "external_docking_pose_confirmed"]
+        if success
+        else ["external_docking_adapter_failed"]
+    )
 
 
 def _find_named_float(text: str, label: str) -> float | None:
-    match = re.search(rf"(?<![A-Za-z]){re.escape(label)}(?![A-Za-z])\s*[:=]\s*({_FLOAT_PATTERN})", text, re.IGNORECASE)
+    match = re.search(
+        rf"(?<![A-Za-z]){re.escape(label)}(?![A-Za-z])\s*[:=]\s*({_FLOAT_PATTERN})",
+        text,
+        re.IGNORECASE,
+    )
     return float(match.group(1)) if match else None
 
 
@@ -433,7 +649,10 @@ def _is_vector3(values: list[float] | None) -> bool:
 
 
 def _has_vina_prepared_pair(request: DockingToolRequest) -> bool:
-    return Path(request.receptor_file).suffix.lower() == ".pdbqt" and Path(request.ligand_file).suffix.lower() == ".pdbqt"
+    return (
+        Path(request.receptor_file).suffix.lower() == ".pdbqt"
+        and Path(request.ligand_file).suffix.lower() == ".pdbqt"
+    )
 
 
 def _safe_pose_prefix(molecule_id: str | None) -> str:

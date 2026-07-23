@@ -83,14 +83,18 @@ pnpm dev
 
 ## Local Chemistry Tools
 
-Run `./scripts/install_local_tools.ps1` from PowerShell to create project-local
-Python environments and install the supported local tools. Run
+Run `./scripts/install_local_tools.ps1 -InstallWsl` from PowerShell to create
+the project-local Windows tools and the isolated Ubuntu WSL runtimes. Run
 `./.venv/Scripts/python.exe scripts/check_local_tools.py --json` to inspect the
 actual readiness state after installation.
 
 Vina, Open Babel, AiZynthFinder, RDKit, CReM, and ADMET-AI run directly on the
-Windows host. GNINA and TargetDiff require an Ubuntu WSL distribution with GPU
-support; after installing Ubuntu WSL, run `scripts/install_wsl_gpu_tools.sh`
-inside that distribution. TargetDiff remains unavailable until its official
-checkpoint is installed and verified. AutoGrow4 remains unavailable until its
-source checkout and isolated environment complete successfully.
+Windows host. GNINA, TargetDiff, and AutoGrow4 run in dedicated Ubuntu WSL
+environments under `/opt/medagent/envs`; GNINA and TargetDiff use the NVIDIA GPU.
+AutoGrow4 is pinned to `v4.0.3` and runs in `/opt/medagent/envs/autogrow4-v403`
+with Python 3.7, RDKit 2020.03.1, NumPy 1.18.1, SciPy 1.4.1, Matplotlib
+3.2.1, and Open Babel 3.1.1. These legacy pins are required by its bundled
+Gypsum-DL implementation.
+The TargetDiff checkpoint must exist at
+`.local/tools/TargetDiff/pretrained_models/pretrained_diffusion.pt` before the
+WSL installer can complete its checkpoint smoke test.

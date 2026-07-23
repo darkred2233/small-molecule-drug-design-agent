@@ -89,7 +89,10 @@ def test_successful_process_without_pose_is_not_reported_as_docking_evidence(tmp
 
 
 def test_local_status_probes_a_host_executable_without_a_container(monkeypatch):
-    monkeypatch.setattr(docking_adapters, "_find_local_executable", lambda _command: "C:/tools/gnina.exe")
+    monkeypatch.setenv("MEDAGENT_GNINA_RUNTIME", "host")
+    monkeypatch.setattr(
+        docking_adapters, "_find_local_executable", lambda _command: "C:/tools/gnina.exe"
+    )
     monkeypatch.setattr(
         docking_adapters.subprocess,
         "run",
@@ -101,6 +104,41 @@ def test_local_status_probes_a_host_executable_without_a_container(monkeypatch):
     assert status["available"] is True
     assert status["mode"] == "local_cli"
     assert status["path"] == "C:/tools/gnina.exe"
+
+
+def test_gnina_wsl_execution_maps_windows_artifact_paths(tmp_path, monkeypatch):
+    request = _request(tmp_path)
+    captured = {}
+
+    def fake_run(command, _timeout):
+        captured["command"] = command
+        pose = tmp_path / "poses" / "MOL_LOCAL_1_gnina_pose.sdf"
+        pose.parent.mkdir(parents=True, exist_ok=True)
+        pose.write_text("local GNINA pose\n", encoding="utf-8")
+        return 0, "1 | -8.3 | 0.61 | -7.1\n", "", 0.01
+
+    monkeypatch.setattr(docking_adapters, "_run_command", fake_run)
+    result = run_external_docking(
+        request,
+        {
+            "gnina": {
+                "available": True,
+                "path": "/opt/tools/gnina",
+                "runtime_scope": "wsl",
+                "wsl_distribution": "Ubuntu",
+                "wsl_user": "root",
+                "runtime_environment": {"LD_LIBRARY_PATH": "/opt/medagent/envs/gnina-runtime/lib"},
+            }
+        },
+    )
+
+    assert result is not None and result.success is True
+    assert captured["command"][:6] == ["wsl", "-d", "Ubuntu", "-u", "root", "--"]
+    shell_command = captured["command"][-1]
+    assert "/mnt/" in shell_command
+    assert "receptor.pdb" in shell_command and "ligand.sdf" in shell_command
+    assert "LD_LIBRARY_PATH=/opt/medagent/envs/gnina-runtime/lib" in shell_command
+    assert result.pose_file == str(tmp_path / "poses" / "MOL_LOCAL_1_gnina_pose.sdf")
 
 
 def test_parsers_keep_gnina_and_vina_score_semantics_separate():

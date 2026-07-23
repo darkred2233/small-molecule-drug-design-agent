@@ -3,8 +3,15 @@
 # these values for a workstation without modifying this file.
 tools:
   gnina:
-    command: .local/tools/gnina/gnina.exe
+    runtime: wsl
+    wsl_distribution: Ubuntu
+    wsl_user: root
+    command: .local/tools/gnina-linux/gnina
+    environment:
+      LD_LIBRARY_PATH: /opt/medagent/envs/gnina-runtime/lib
     timeout_seconds: 300
+    required_paths:
+      - .local/tools/gnina-linux/gnina
   vina:
     command: .local/tools/vina/vina.exe
     timeout_seconds: 300
@@ -15,12 +22,18 @@ tools:
     command: chemprop
     timeout_seconds: 300
   autogrow4:
-    python_executable: .local/envs/autogrow4/python.exe
+    runtime: wsl
+    wsl_distribution: Ubuntu
+    wsl_user: root
+    python_executable: /opt/medagent/envs/autogrow4-v403/bin/python
     working_directory: .local/tools/AutoGrow4
     command: RunAutogrow.py
     timeout_seconds: 1200
     required_paths:
       - .local/tools/AutoGrow4/RunAutogrow.py
+      - .local/tools/AutoGrow4/autogrow/docking/scoring/nn_score_exe/nnscore1/NNScore.py
+      - .local/tools/AutoGrow4/autogrow/docking/scoring/nn_score_exe/nnscore2/NNScore2.py
+      - .local/tools/AutoGrow4/autogrow/docking/docking_executables/vina/autodock_vina_1_1_2_linux_x86/bin/vina
   aizynthfinder:
     python_executable: .local/envs/aizynthfinder/Scripts/python.exe
     command: .local/envs/aizynthfinder/Scripts/aizynthcli.exe
@@ -28,10 +41,15 @@ tools:
     required_paths:
       - data/aizynthfinder/config.yml
   targetdiff:
-    python_executable: .local/envs/targetdiff/python.exe
+    runtime: wsl
+    wsl_distribution: Ubuntu
+    wsl_user: root
+    python_executable: /opt/medagent/envs/targetdiff/bin/python
     working_directory: .local/tools/TargetDiff
-    command: scripts/sample_for_pdb.py
+    command: scripts/sample_for_pocket.py
     timeout_seconds: 1800
     required_paths:
-      - .local/tools/TargetDiff/scripts/sample_for_pdb.py
-      - .local/models/targetdiff/pretrained.pt
+      - .local/tools/TargetDiff/scripts/sample_for_pocket.py
+      - .local/tools/TargetDiff/configs/sampling.yml
+      - .local/tools/TargetDiff/pretrained_models/pretrained_diffusion.pt
+      - .local/models/targetdiff/pretrained_diffusion.pt

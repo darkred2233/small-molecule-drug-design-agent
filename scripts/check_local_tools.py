@@ -35,7 +35,9 @@ def collect_status() -> dict[str, dict[str, Any]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check project-local chemistry tools")
     parser.add_argument("--json", action="store_true", help="emit machine-readable status")
-    parser.add_argument("--strict", action="store_true", help="fail unless core local tools are available")
+    parser.add_argument(
+        "--strict", action="store_true", help="fail unless core local tools are available"
+    )
     args = parser.parse_args()
     status = collect_status()
     if args.json:
@@ -43,10 +45,21 @@ def main() -> int:
     else:
         for name, result in status.items():
             mark = "OK" if result.get("available") else "MISSING"
-            detail = result.get("path") or result.get("python_executable") or result.get("warning") or ""
+            detail = (
+                result.get("path") or result.get("python_executable") or result.get("warning") or ""
+            )
             print(f"{mark:7} {name:14} {detail}")
     if args.strict:
-        required = ("rdkit", "crem", "admet_ai", "vina", "aizynthfinder")
+        required = (
+            "rdkit",
+            "crem",
+            "admet_ai",
+            "gnina",
+            "vina",
+            "targetdiff",
+            "autogrow4",
+            "aizynthfinder",
+        )
         return 0 if all(status[name].get("available") for name in required) else 1
     return 0
 

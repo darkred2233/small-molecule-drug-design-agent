@@ -36,9 +36,19 @@ function Ensure-Venv {
 }
 
 function Ensure-SourceArchive {
-    param([string]$Url, [string]$Destination, [string]$ExpectedEntry)
+    param(
+        [string]$Url,
+        [string]$Destination,
+        [string]$ExpectedEntry,
+        [string]$Ref = ""
+    )
     $expected = Join-Path $Destination $ExpectedEntry
-    if (Test-Path -LiteralPath $expected) {
+    $refMarker = Join-Path $Destination ".medagent-source-ref"
+    $refMatches = -not $Ref -or (
+        (Test-Path -LiteralPath $refMarker) -and
+        ((Get-Content -Raw -LiteralPath $refMarker).Trim() -eq $Ref)
+    )
+    if ((Test-Path -LiteralPath $expected) -and $refMatches) {
         Write-Host "[local-tools] reusing existing source: $Destination"
         return
     }
@@ -47,16 +57,21 @@ function Ensure-SourceArchive {
     }
     $repository = $Url -replace '^https://github.com/', '' -replace '\.git$', ''
     $metadata = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository" -Headers @{"User-Agent"="MedAgent-local-installer"}
-    $archiveUrl = "https://api.github.com/repos/$repository/zipball/$($metadata.default_branch)"
-    $archive = Join-Path $downloads "$($metadata.name)-$($metadata.default_branch).zip"
+    $archiveRef = if ($Ref) { $Ref } else { $metadata.default_branch }
+    $archiveUrl = "https://api.github.com/repos/$repository/zipball/$archiveRef"
+    $archive = Join-Path $downloads "$($metadata.name)-$($archiveRef -replace '[^A-Za-z0-9._-]', '_').zip"
     $expanded = Join-Path $downloads "$($metadata.name)-expanded"
     Invoke-WebRequest -Uri $archiveUrl -Headers @{"User-Agent"="MedAgent-local-installer"} -OutFile $archive -TimeoutSec 60
+    if (Test-Path -LiteralPath $expanded) {
+        Remove-Item -LiteralPath $expanded -Recurse -Force
+    }
     New-Item -ItemType Directory -Force -Path $expanded | Out-Null
     Expand-Archive -LiteralPath $archive -DestinationPath $expanded -Force
     $source = Get-ChildItem -LiteralPath $expanded -Directory | Select-Object -First 1
     if (-not $source) { throw "GitHub archive contains no source directory: $archiveUrl" }
     Move-Item -LiteralPath $source.FullName -Destination $Destination
     if (-not (Test-Path -LiteralPath $expected)) { throw "source archive lacks ${ExpectedEntry}: $archiveUrl" }
+    if ($Ref) { Set-Content -LiteralPath $refMarker -Value $Ref -Encoding ascii }
 }
 
 if (-not (Test-Path -LiteralPath $python)) {
@@ -72,12 +87,14 @@ if (-not $SkipPythonPackages) {
 }
 
 Invoke-InstallStep "AutoDock Vina Windows binary" {
+    $vinaVersion = "1.2.7"
     $vinaRoot = Join-Path $tools "vina"
     $vinaExe = Join-Path $vinaRoot "vina.exe"
     if (-not (Test-Path -LiteralPath $vinaExe)) {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ccsb-scripps/AutoDock-Vina/releases/latest" -Headers @{"User-Agent"="MedAgent-local-installer"}
-        $asset = @($release.assets | Where-Object { $_.name -match "(?i)(windows|win).*(zip|exe)$" }) | Select-Object -First 1
-        if (-not $asset) { throw "the latest Vina release has no Windows archive" }
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ccsb-scripps/AutoDock-Vina/releases/tags/v$vinaVersion" -Headers @{"User-Agent"="MedAgent-local-installer"}
+        $assetName = "vina_${vinaVersion}_win.exe"
+        $asset = @($release.assets | Where-Object { $_.name -eq $assetName }) | Select-Object -First 1
+        if (-not $asset) { throw "Vina release v$vinaVersion lacks $assetName" }
         $archive = Join-Path $downloads $asset.name
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
         New-Item -ItemType Directory -Force -Path $vinaRoot | Out-Null
@@ -99,7 +116,7 @@ Invoke-InstallStep "Open Babel isolated runtime" {
     $chemtools = Join-Path $envs "chemtools"
     $chemPython = Ensure-Venv $chemtools
     & $chemPython -m pip install --upgrade pip
-    & $chemPython -m pip install --only-binary=:all: "openbabel-wheel>=3.1.1.22"
+    & $chemPython -m pip install --only-binary=:all: "openbabel-wheel==3.1.1.23"
     $obabel = Join-Path $chemtools "Scripts\obabel.exe"
     if (-not (Test-Path -LiteralPath $obabel)) { throw "openbabel-wheel did not provide obabel.exe" }
     & $obabel -V
@@ -109,39 +126,37 @@ Invoke-InstallStep "AiZynthFinder isolated runtime" {
     $aizynth = Join-Path $envs "aizynthfinder"
     $aizynthPython = Ensure-Venv $aizynth
     & $aizynthPython -m pip install --upgrade pip
-    & $aizynthPython -m pip install --prefer-binary aizynthfinder
+    & $aizynthPython -m pip install --prefer-binary "aizynthfinder==4.4.1"
     & $aizynthPython -m aizynthfinder.interfaces.aizynthcli --help
 }
 
-Invoke-InstallStep "AutoGrow4 source and isolated runtime" {
+Invoke-InstallStep "AutoGrow4 source" {
     $autogrowRoot = Join-Path $tools "AutoGrow4"
-    Ensure-SourceArchive "https://github.com/durrantlab/autogrow4.git" $autogrowRoot "RunAutogrow.py"
-    $autogrowPython = Ensure-Venv (Join-Path $envs "autogrow4")
-    & $autogrowPython -m pip install --upgrade pip
-    $requirements = Join-Path $autogrowRoot "requirements.txt"
-    if (Test-Path -LiteralPath $requirements) {
-        & $autogrowPython -m pip install --prefer-binary -r $requirements
-    } else {
-        & $autogrowPython -m pip install --prefer-binary numpy pandas scipy matplotlib rdkit
-    }
-    & $autogrowPython (Join-Path $autogrowRoot "RunAutogrow.py") --help
+    Ensure-SourceArchive "https://github.com/durrantlab/autogrow4.git" $autogrowRoot "RunAutogrow.py" "v4.0.3"
 }
 
 Invoke-InstallStep "TargetDiff source checkout" {
-    Ensure-SourceArchive "https://github.com/guanjq/targetdiff.git" (Join-Path $tools "TargetDiff") "scripts\sample_for_pdb.py"
+    Ensure-SourceArchive "https://github.com/guanjq/targetdiff.git" `
+        (Join-Path $tools "TargetDiff") "scripts\sample_for_pocket.py" `
+        "142f1eb7178480d435fe0b8cb95a99beb48997c7"
 }
 
 if ($InstallWsl) {
-    Invoke-InstallStep "Ubuntu WSL runtime for GNINA and TargetDiff" {
+    Invoke-InstallStep "Ubuntu WSL runtimes for GNINA, TargetDiff, and AutoGrow4" {
         $ubuntu = (& wsl --list --quiet 2>$null | Where-Object { $_.Trim() -match "^Ubuntu" } | Select-Object -First 1)
         if (-not $ubuntu) {
             & wsl --install --distribution Ubuntu --no-launch
-            Write-Warning "Ubuntu has been requested. A Windows restart may be required before GNINA and TargetDiff can be installed in WSL."
+            Write-Warning "Ubuntu has been requested. Restart Windows if WSL asks for it, then rerun this command."
+            return
         }
+        $drive = $root.Substring(0, 1).ToLowerInvariant()
+        $rest = $root.Substring(2).Replace("\", "/")
+        $installer = "/mnt/$drive$rest/scripts/install_wsl_gpu_tools.sh"
+        & wsl -d $ubuntu.Trim() -u root -- bash $installer
     }
 }
 
-& $python (Join-Path $root "scripts\check_local_tools.py") --json
+& $python (Join-Path $root "scripts\check_local_tools.py") --strict --json
 if ($failures.Count) {
     Write-Warning "[local-tools] incomplete steps:`n$($failures -join "`n")"
     exit 1

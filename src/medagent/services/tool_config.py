@@ -27,7 +27,14 @@ class ToolRuntimeConfig:
     required_paths: tuple[str, ...]
     config_source: str
     config_loaded: bool
+    runtime: str = "host"
+    wsl_distribution: str = "Ubuntu"
+    wsl_user: str = "root"
+    runtime_environment: tuple[tuple[str, str], ...] = ()
     environment_overrides: tuple[str, ...] = ()
+
+    def environment_dict(self) -> dict[str, str]:
+        return dict(self.runtime_environment)
 
     def as_status(self) -> dict[str, Any]:
         return {
@@ -39,7 +46,10 @@ class ToolRuntimeConfig:
             "config_source": self.config_source,
             "config_loaded": self.config_loaded,
             "config_environment_overrides": list(self.environment_overrides),
-            "runtime_scope": "local_host",
+            "runtime_scope": self.runtime,
+            "wsl_distribution": self.wsl_distribution if self.runtime == "wsl" else None,
+            "wsl_user": self.wsl_user if self.runtime == "wsl" else None,
+            "runtime_environment": self.environment_dict(),
         }
 
 
@@ -81,6 +91,20 @@ def get_tool_runtime_config(
         timeout_value = section.get("timeout_seconds")
 
     required_paths = _string_list(section.get("required_paths"))
+    runtime = (
+        _environment_value([f"MEDAGENT_{env_prefix}_RUNTIME", f"{env_prefix}_RUNTIME"], overrides)
+        or str(section.get("runtime") or "host").strip().lower()
+    )
+    if runtime not in {"host", "wsl"}:
+        runtime = "host"
+    wsl_distribution = (
+        _environment_value([f"MEDAGENT_{env_prefix}_WSL_DISTRIBUTION"], overrides)
+        or str(section.get("wsl_distribution") or "Ubuntu").strip()
+    )
+    wsl_user = (
+        _environment_value([f"MEDAGENT_{env_prefix}_WSL_USER"], overrides)
+        or str(section.get("wsl_user") or "root").strip()
+    )
     return ToolRuntimeConfig(
         name=normalized_name,
         command=command,
@@ -90,6 +114,10 @@ def get_tool_runtime_config(
         required_paths=required_paths,
         config_source=config_source,
         config_loaded=config_loaded,
+        runtime=runtime,
+        wsl_distribution=wsl_distribution,
+        wsl_user=wsl_user,
+        runtime_environment=_string_mapping(section.get("environment")),
         environment_overrides=tuple(overrides),
     )
 
@@ -152,6 +180,16 @@ def _string_list(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     return tuple(str(item).strip() for item in value if str(item).strip())
+
+
+def _string_mapping(value: Any) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, dict):
+        return ()
+    return tuple(
+        (str(key).strip(), str(item).strip())
+        for key, item in value.items()
+        if str(key).strip() and str(item).strip()
+    )
 
 
 def _resolve_path(value: str) -> Path:
