@@ -4,6 +4,9 @@ from medagent.api.app import create_app
 from medagent.core.config import Settings
 from medagent.services import candidate_assessment
 from medagent.services.docking_adapters import DockingToolResult
+from medagent.db.models import Base, BindingSite, Project
+from medagent.db.session import build_engine, build_session_factory
+from medagent.services.receptor_preparation import project_docking_config
 
 
 def make_client(tmp_path):
@@ -56,6 +59,36 @@ def create_filtered_molecules(client: TestClient, project_id: str) -> None:
     assert client.post(f"/projects/{project_id}/molecules/import-seeds").status_code == 201
     assert client.post(f"/projects/{project_id}/molecules/validate").status_code == 200
     assert client.post(f"/projects/{project_id}/molecules/filter-rules").status_code == 200
+
+
+def test_active_structure_docking_config_requires_an_explicit_matching_site(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'docking-config.db'}")
+    engine = build_engine(settings)
+    Base.metadata.create_all(bind=engine)
+    session_factory = build_session_factory(settings)
+    receptor = tmp_path / "receptor.pdbqt"
+    receptor.write_text("ATOM      1  N   MET A   1       0.0   0.0   0.0\n", encoding="utf-8")
+
+    with session_factory() as db:
+        project = Project(
+            project_id="PROJ-DOCKING-CONSTRAINT",
+            name="Docking constraint",
+            target_id="TGT-EGFR",
+            active_structure_id="STR-ACTIVE",
+        )
+        inactive_site = BindingSite(
+            binding_site_id="SITE-INACTIVE",
+            project_id=project.project_id,
+            target_id="TGT-EGFR",
+            structure_id="STR-INACTIVE",
+            prepared_receptor_file=f"local://{receptor}",
+            grid_box={"center": [1, 2, 3], "size": [20, 20, 20]},
+        )
+        db.add_all([project, inactive_site])
+        db.commit()
+
+        assert project_docking_config(db, project) == {}
+        assert project_docking_config(db, project, inactive_site.binding_site_id) == {}
 
 
 def test_prepare_receptor_creates_project_binding_site(tmp_path):

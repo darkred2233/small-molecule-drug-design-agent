@@ -27,6 +27,22 @@ class FailingLLMClient:
         raise ValueError("provider unavailable")
 
 
+class CapturingLLMClient:
+    def __init__(self):
+        self.schema = None
+
+    def generate_structured(self, **kwargs):
+        self.schema = kwargs["schema"]
+        return {
+            "objective": "select a persisted pocket",
+            "campaign_config": {
+                "crem": {"enabled": True, "num_molecules": 10},
+                "targetdiff": {"enabled": False, "num_molecules": 0},
+                "autogrow4": {"enabled": False, "num_molecules": 0},
+            },
+        }
+
+
 def make_session() -> Session:
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
@@ -68,6 +84,93 @@ def test_round_strategy_uses_deterministic_fallback_when_llm_is_unavailable(monk
     assert strategy["seed_policy"]["molecule_ids"] == ["MOL-2", "MOL-1", "MOL-3"]
     assert strategy["requires_user_confirmation"] is True
     assert any("deterministic fallback" in warning for warning in strategy["warnings"])
+
+
+def test_round_strategy_schema_enumerates_only_persisted_project_binding_sites(monkeypatch):
+    client = CapturingLLMClient()
+    agent = RoundStrategyAgent(llm_client=client)
+    monkeypatch.setattr(
+        agent,
+        "_collect_context",
+        lambda db, project, parent_round_id: {
+            "project_objective": "test",
+            "active_structure_id": "STR-1",
+            "active_binding_site_id": "SITE-2",
+            "available_binding_site_ids": ["SITE-1", "SITE-2"],
+            "data_summary": {"seed_ligand_count": 1, "binding_site_count": 2},
+            "has_previous_round": False,
+        },
+    )
+
+    agent.generate_strategy_draft(
+        db=None,
+        project=SimpleNamespace(name="Pocket project", target_id="TGT-1"),
+        round_number=1,
+        tool_availability={"crem": True},
+    )
+
+    campaigns = client.schema["properties"]["campaign_config"]["properties"]
+    assert campaigns["targetdiff"]["properties"]["binding_site_id"]["enum"] == [
+        "SITE-1",
+        "SITE-2",
+    ]
+    assert "pocket_resource_id" not in campaigns["targetdiff"]["properties"]
+    assert campaigns["autogrow4"]["properties"]["binding_site_id"]["enum"] == [
+        "SITE-1",
+        "SITE-2",
+    ]
+
+
+def test_strategy_validator_disables_an_invented_binding_site_id():
+    validated = StrategyValidator().validate_and_fix(
+        {
+            "campaign_config": {
+                "crem": {"enabled": True, "num_molecules": 10},
+                "targetdiff": {
+                    "enabled": True,
+                    "num_molecules": 10,
+                    "binding_site_id": "SITE-INVENTED",
+                },
+                "autogrow4": {"enabled": False, "num_molecules": 0},
+            }
+        },
+        tool_availability={"crem": True, "targetdiff": True},
+        data_context={
+            "active_binding_site_id": "SITE-REAL",
+            "available_binding_site_ids": ["SITE-REAL"],
+            "data_summary": {"seed_ligand_count": 1, "binding_site_count": 1},
+        },
+    )
+
+    assert validated["campaign_config"]["targetdiff"]["enabled"] is False
+    assert validated["campaign_config"]["targetdiff"]["binding_site_id"] is None
+    assert any("SITE-INVENTED" in warning for warning in validated["warnings"])
+
+
+def test_strategy_validator_clears_legacy_targetdiff_pocket_resource_id():
+    validated = StrategyValidator().validate_and_fix(
+        {
+            "campaign_config": {
+                "crem": {"enabled": False},
+                "targetdiff": {
+                    "enabled": True,
+                    "num_molecules": 10,
+                    "pocket_resource_id": "POCKET-LEGACY",
+                    "binding_site_id": "SITE-REAL",
+                },
+                "autogrow4": {"enabled": False},
+            }
+        },
+        tool_availability={"targetdiff": True},
+        data_context={
+            "active_binding_site_id": "SITE-REAL",
+            "available_binding_site_ids": ["SITE-REAL"],
+            "data_summary": {"binding_site_count": 1},
+        },
+    )
+
+    assert validated["campaign_config"]["targetdiff"]["enabled"] is True
+    assert validated["campaign_config"]["targetdiff"]["pocket_resource_id"] is None
 
 
 def test_strategy_validator_clamps_values_and_keeps_ranked_explicit_seed_order():

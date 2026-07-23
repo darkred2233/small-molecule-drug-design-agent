@@ -20,6 +20,7 @@ def apply_all(database_url: str | None = None) -> dict[str, object]:
     from migrations.add_round_provenance import apply_migration as add_round_provenance
     from migrations.add_seed_ligand_activity_type import apply_migration as add_activity_type
     from migrations.add_scientific_execution_tables import apply_migration as add_scientific_execution
+    from migrations.add_project_structure_workflow import apply_migration as add_project_structure_workflow
 
     url = database_url or os.getenv("MEDAGENT_DATABASE_URL") or get_settings().database_url
     return {
@@ -28,6 +29,7 @@ def apply_all(database_url: str | None = None) -> dict[str, object]:
         "llm_critique_fields": add_llm_critique_fields(url),
         "round_provenance": add_round_provenance(url),
         "scientific_execution": add_scientific_execution(url),
+        "project_structure_workflow": add_project_structure_workflow(url),
     }
 
 

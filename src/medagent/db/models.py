@@ -37,6 +37,8 @@ class Project(TimestampMixin, Base):
     objective: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="created")
     constraints_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    active_structure_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    active_binding_site_id: Mapped[str | None] = mapped_column(String(80), index=True)
 
     messages: Mapped[list["ConversationMessage"]] = relationship(back_populates="project")
     constraints: Mapped[list["OptimizationConstraint"]] = relationship(back_populates="project")
@@ -130,6 +132,28 @@ class UploadedFile(TimestampMixin, Base):
     file_type: Mapped[str] = mapped_column(String(80))
     storage_path: Mapped[str] = mapped_column(Text)
     parse_status: Mapped[str] = mapped_column(String(80), default="uploaded")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ProjectStructure(TimestampMixin, Base):
+    """One immutable receptor source collected for a project."""
+
+    __tablename__ = "project_structures"
+    __table_args__ = (UniqueConstraint("project_id", "source", "source_identifier"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    structure_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    source: Mapped[str] = mapped_column(String(40))
+    source_identifier: Mapped[str] = mapped_column(String(160))
+    source_url: Mapped[str | None] = mapped_column(Text)
+    assembly_id: Mapped[str | None] = mapped_column(String(80))
+    source_file_id: Mapped[str] = mapped_column(ForeignKey("uploaded_files.file_id"), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="collected")
+    prepared_receptor_file: Mapped[str | None] = mapped_column(Text)
+    prepared_receptor_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    preparation_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 

@@ -287,6 +287,8 @@ def build_execution_plan(
     structure_ready_reasons: list[str] = []
     if not has_predicted_pocket:
         structure_ready_reasons.append("pocket_predicted_required")
+    if not has_prepared_receptor:
+        structure_ready_reasons.append("prepared_receptor_required")
     if not has_artifact_hashes:
         structure_ready_reasons.append("artifact_hashes_incomplete")
 

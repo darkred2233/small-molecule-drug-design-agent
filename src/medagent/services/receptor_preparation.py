@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -11,10 +12,26 @@ from urllib.request import urlopen
 from sqlalchemy.orm import Session
 
 from medagent.core.config import Settings
-from medagent.db.models import BindingSite, Project, Target, UploadedFile
+from medagent.db.models import (
+    BindingSite,
+    Project,
+    ScientificArtifact,
+    Target,
+    UploadedFile,
+)
 from medagent.services.file_ingestion import parse_pdb_summary, path_from_storage_uri, safe_filename
 from medagent.services.ids import new_id
 from medagent.services.pdbqt_validation import is_valid_vina_receptor_pdbqt
+from medagent.services.autogrow4_resources import eligible_autogrow4_source_count
+from medagent.services.scientific_execution import (
+    CapabilitySnapshot,
+    EvidenceKind,
+    EvidenceLevel,
+    ScientificResult,
+    artifact_snapshot,
+)
+from medagent.services.scientific_persistence import persist_scientific_result
+from medagent.services.structure_workflow import get_project_structure, structure_source_file
 
 
 @dataclass
@@ -22,6 +39,214 @@ class ReceptorPreparationResult:
     binding_site: BindingSite
     warnings: list[str] = field(default_factory=list)
     tool_status: dict[str, Any] = field(default_factory=dict)
+
+
+def prepare_project_structure_receptor(
+    db: Session,
+    settings: Settings,
+    project: Project,
+    structure_id: str,
+) -> dict[str, Any]:
+    structure, source_file = structure_source_file(db, settings, project, structure_id)
+    source_path = path_from_storage_uri(settings, source_file.storage_path)
+    output_dir = (
+        Path(settings.storage_local_root)
+        / project.project_id
+        / "structures"
+        / structure.structure_id
+        / "prepared"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    receptor_path = output_dir / "receptor.pdb"
+    if source_path.resolve() != receptor_path.resolve():
+        shutil.copy2(source_path, receptor_path)
+
+    tool_status = receptor_preparation_tool_status()
+    prepared_path, warnings = _prepare_receptor_for_vina(receptor_path, output_dir, tool_status)
+    digest = _sha256_file(prepared_path) if prepared_path is not None else None
+    manifest = _persist_structure_preparation_manifest(
+        db,
+        project,
+        structure.structure_id,
+        receptor_path,
+        prepared_path,
+        tool_status,
+        warnings,
+    )
+    structure.prepared_receptor_file = _local_uri(prepared_path) if prepared_path else None
+    structure.prepared_receptor_sha256 = digest
+    structure.preparation_json = {
+        "adapter_mode": "project_structure_receptor_preparation",
+        "source_file_id": source_file.file_id,
+        "source_sha256": (source_file.metadata_json or {}).get("sha256"),
+        "warnings": warnings,
+        "tool_status": tool_status,
+        "manifest_id": manifest.manifest_id,
+    }
+    selected = _selected_structure_site(db, project, structure.structure_id)
+    structure.status = "ready" if prepared_path is not None and selected is not None else "prepared"
+    for site in db.query(BindingSite).filter_by(
+        project_id=project.project_id, structure_id=structure.structure_id
+    ):
+        site.prepared_receptor_file = structure.prepared_receptor_file
+        site.preparation_json = {
+            **(site.preparation_json or {}),
+            "receptor_preparation": structure.preparation_json,
+        }
+    db.commit()
+    db.refresh(structure)
+    return {
+        "structure_id": structure.structure_id,
+        "status": structure.status,
+        "prepared_receptor_file": structure.prepared_receptor_file,
+        "prepared_receptor_sha256": structure.prepared_receptor_sha256,
+        "warnings": warnings,
+    }
+
+
+def select_project_binding_site(
+    db: Session,
+    settings: Settings,
+    project: Project,
+    binding_site_id: str,
+) -> BindingSite:
+    site = (
+        db.query(BindingSite)
+        .filter_by(project_id=project.project_id, binding_site_id=binding_site_id)
+        .one_or_none()
+    )
+    if site is None:
+        raise ValueError("binding_site_id does not belong to this project.")
+    if not project.active_structure_id or site.structure_id != project.active_structure_id:
+        raise ValueError("binding_site_id was not predicted from the active project structure.")
+    grid = site.grid_box or {}
+    if not _is_vector3(grid.get("center")) or not _is_vector3(grid.get("size")):
+        raise ValueError("binding_site_id does not contain a complete docking grid.")
+    pocket_path = _local_path(grid.get("pocket_file"))
+    if pocket_path is None or not pocket_path.is_file():
+        raise ValueError("binding_site_id does not contain a valid pocket PDB artifact.")
+    project.active_binding_site_id = site.binding_site_id
+    structure = get_project_structure(db, project, project.active_structure_id)
+    if structure is not None and structure.prepared_receptor_file:
+        structure.status = "ready"
+    db.commit()
+    db.refresh(site)
+    return site
+
+
+def project_structure_readiness(
+    db: Session,
+    settings: Settings,
+    project: Project,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    if not project.active_structure_id:
+        return _empty_readiness(["active_structure_required"])
+    structure = get_project_structure(db, project, project.active_structure_id)
+    if structure is None:
+        return _empty_readiness(["active_structure_not_found"])
+    source_file = (
+        db.query(UploadedFile)
+        .filter_by(project_id=project.project_id, file_id=structure.source_file_id)
+        .one_or_none()
+    )
+    source_metadata = source_file.metadata_json or {} if source_file is not None else {}
+    source_path = (
+        path_from_storage_uri(settings, source_file.storage_path) if source_file is not None else None
+    )
+    expected_source_hash = source_metadata.get("sha256")
+    source_ready = bool(
+        source_path
+        and source_path.is_file()
+        and isinstance(expected_source_hash, str)
+        and expected_source_hash
+        and _sha256_file(source_path) == expected_source_hash
+    )
+    if source_path is None or not source_path.is_file():
+        reasons.append("source_receptor_missing")
+    elif not expected_source_hash:
+        reasons.append("source_receptor_hash_missing")
+    elif not source_ready:
+        reasons.append("source_receptor_hash_mismatch")
+
+    prepared_path = _local_path(structure.prepared_receptor_file)
+    prepared_ready = bool(
+        prepared_path
+        and prepared_path.is_file()
+        and structure.prepared_receptor_sha256
+        and _sha256_file(prepared_path) == structure.prepared_receptor_sha256
+    )
+    if not prepared_ready:
+        reasons.append("prepared_receptor_required")
+
+    site = _selected_structure_site(db, project, structure.structure_id)
+    if site is None:
+        reasons.append("binding_site_selection_required")
+    grid = site.grid_box if site is not None else {}
+    grid_ready = bool(_is_vector3(grid.get("center")) and _is_vector3(grid.get("size")))
+    if site is not None and not grid_ready:
+        reasons.append("binding_site_grid_required")
+    pocket_path = _local_path(grid.get("pocket_file")) if site is not None else None
+    pocket_artifact = (
+        db.query(ScientificArtifact).filter_by(artifact_id=site.artifact_id).one_or_none()
+        if site is not None and site.artifact_id
+        else None
+    )
+    pocket_exists = bool(pocket_path and pocket_path.is_file())
+    pocket_ready = bool(
+        pocket_exists
+        and pocket_artifact is not None
+        and pocket_artifact.sha256
+        and _sha256_file(pocket_path) == pocket_artifact.sha256
+    )
+    if site is not None and not pocket_exists:
+        reasons.append("pocket_pdb_required")
+    elif site is not None and pocket_artifact is None:
+        reasons.append("pocket_pdb_hash_missing")
+    elif site is not None and not pocket_ready:
+        reasons.append("pocket_pdb_hash_mismatch")
+
+    source_compound_count = eligible_autogrow4_source_count(db, project)
+    targetdiff_ready = source_ready and pocket_ready
+    docking_ready = source_ready and prepared_ready and grid_ready
+    autogrow_ready = docking_ready and source_compound_count > 0
+    return {
+        "ready": source_ready and prepared_ready and pocket_ready and grid_ready,
+        "structure_id": structure.structure_id,
+        "binding_site_id": site.binding_site_id if site is not None else None,
+        "source_receptor": {
+            "file_id": source_file.file_id if source_file is not None else None,
+            "sha256": source_metadata.get("sha256"),
+            "size_bytes": source_metadata.get("size_bytes"),
+        },
+        "prepared_receptor_pdbqt": (
+            {
+                "uri": structure.prepared_receptor_file,
+                "sha256": structure.prepared_receptor_sha256,
+            }
+            if prepared_ready
+            else None
+        ),
+        "pocket_pdb": (
+            {"uri": grid.get("pocket_file"), "sha256": pocket_artifact.sha256}
+            if pocket_ready and pocket_path is not None
+            else None
+        ),
+        "grid": {"center": grid.get("center"), "size": grid.get("size")} if grid_ready else None,
+        "tools": {
+            "targetdiff": {"ready": targetdiff_ready},
+            "autogrow4": {
+                "ready": autogrow_ready,
+                "source_compound_count": source_compound_count,
+                "reason_codes": []
+                if autogrow_ready
+                else ["receptor_grid_and_source_compounds_required"],
+            },
+            "vina": {"ready": docking_ready},
+            "gnina": {"ready": docking_ready},
+        },
+        "reason_codes": reasons,
+    }
 
 
 def prepare_project_receptor(
@@ -149,6 +374,14 @@ def project_docking_config(
 ) -> dict[str, Any]:
     if binding_site_id:
         site = get_project_binding_site(db, project, binding_site_id)
+        if (
+            site is not None
+            and project.active_structure_id
+            and site.structure_id != project.active_structure_id
+        ):
+            site = None
+    elif project.active_structure_id:
+        site = None
     else:
         sites = list_project_binding_sites(db, project)
         site = _first_site_with_docking_config(sites)
@@ -207,6 +440,7 @@ def binding_site_to_payload(site: BindingSite) -> dict[str, Any]:
     grid_box = site.grid_box or {}
     return {
         "binding_site_id": site.binding_site_id,
+        "structure_id": site.structure_id,
         "project_id": site.project_id,
         "target_id": site.target_id,
         "pdb_id": site.pdb_id,
@@ -349,10 +583,24 @@ def _prepare_receptor_for_vina(
     tool_status: dict[str, Any],
 ) -> tuple[Path | None, list[str]]:
     if is_valid_vina_receptor_pdbqt(receptor_path):
+        tool_status["execution"] = {
+            "adapter_mode": "existing_pdbqt",
+            "command": [],
+            "input_file": str(receptor_path),
+            "output_file": str(receptor_path),
+            "exit_code": 0,
+        }
         return receptor_path, []
 
     obabel = tool_status["obabel"].get("path")
     if not obabel:
+        tool_status["execution"] = {
+            "adapter_mode": "unavailable",
+            "command": [],
+            "input_file": str(receptor_path),
+            "output_file": None,
+            "exit_code": None,
+        }
         return None, ["receptor_pdbqt_preparation_tool_not_installed"]
 
     output_path = output_dir / f"{receptor_path.stem}.pdbqt"
@@ -374,6 +622,16 @@ def _prepare_receptor_for_vina(
         str(temp_path),
         "-xr",
     ]
+    execution = {
+        "adapter_mode": "openbabel_rigid_receptor",
+        "command": command,
+        "input_file": str(receptor_path),
+        "output_file": str(output_path),
+        "exit_code": None,
+        "stdout": None,
+        "stderr": None,
+    }
+    tool_status["execution"] = execution
     try:
         completed = subprocess.run(
             command,
@@ -383,12 +641,21 @@ def _prepare_receptor_for_vina(
             check=False,
         )
     except subprocess.TimeoutExpired:
+        execution["stderr"] = "Open Babel receptor preparation timed out."
         temp_path.unlink(missing_ok=True)
         return None, ["receptor_pdbqt_preparation_timeout"]
     except OSError:
+        execution["stderr"] = "Open Babel receptor preparation could not be started."
         temp_path.unlink(missing_ok=True)
         return None, ["receptor_pdbqt_preparation_failed"]
 
+    execution.update(
+        {
+            "exit_code": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+    )
     try:
         if completed.returncode != 0:
             return None, ["receptor_pdbqt_preparation_failed"]
@@ -398,6 +665,57 @@ def _prepare_receptor_for_vina(
         return output_path, []
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _persist_structure_preparation_manifest(
+    db: Session,
+    project: Project,
+    structure_id: str,
+    receptor_path: Path,
+    prepared_path: Path | None,
+    tool_status: dict[str, Any],
+    warnings: list[str],
+):
+    execution = dict(tool_status.get("execution") or {})
+    obabel_status = dict(tool_status.get("obabel") or {})
+    snapshot = CapabilitySnapshot.create(
+        tools={"receptor_preparation": tool_status},
+        runtime={"adapter_mode": execution.get("adapter_mode")},
+    )
+    if prepared_path is None:
+        result = ScientificResult.unavailable(
+            stage="receptor_preparation",
+            tool_name="openbabel",
+            status="blocked",
+            warnings=warnings,
+        )
+    else:
+        result = ScientificResult(
+            stage="receptor_preparation",
+            status="succeeded",
+            evidence_level=EvidenceLevel.L2,
+            evidence_kind=EvidenceKind.COMPUTATIONAL,
+            execution_mode=str(execution.get("adapter_mode") or "receptor_preparation"),
+            tool_name="openbabel",
+            tool_version=obabel_status.get("version"),
+            warnings=warnings,
+            parameters={"rigid_receptor": True},
+        )
+    result.input_artifacts = artifact_snapshot({"source_receptor_pdb": receptor_path})
+    result.output_artifacts = artifact_snapshot(
+        {"prepared_receptor_pdbqt": prepared_path}
+    )
+    result.provenance = execution
+    return persist_scientific_result(
+        db,
+        result,
+        snapshot=snapshot,
+        request={
+            "structure_id": structure_id,
+            "source_receptor_sha256": _sha256_file(receptor_path),
+        },
+        project_id=project.project_id,
+    )
 
 
 def _summarize_receptor(receptor_path: Path) -> dict[str, Any]:
@@ -423,7 +741,26 @@ def _preparation_labels(
 
 def _executable_status(command: str) -> dict[str, Any]:
     path = shutil.which(command)
-    return {"available": path is not None, "path": path}
+    status: dict[str, Any] = {"available": path is not None, "path": path, "version": None}
+    if command != "obabel" or path is None:
+        return status
+    try:
+        process = subprocess.Popen(
+            [path, "-V"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        version_output, _ = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        return status
+    except OSError:
+        return status
+    version_output = version_output.strip()
+    status["version"] = version_output.splitlines()[0] if version_output else None
+    return status
 
 
 def _is_vector3(values: list[float] | None) -> bool:
@@ -434,3 +771,54 @@ def _local_uri(path: Path | None) -> str | None:
     if path is None:
         return None
     return f"local://{path}"
+
+
+def _local_path(uri: str | None) -> Path | None:
+    if not uri:
+        return None
+    if uri.startswith("local://"):
+        return Path(uri.removeprefix("local://"))
+    return Path(uri)
+
+
+def _sha256_file(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _selected_structure_site(
+    db: Session, project: Project, structure_id: str
+) -> BindingSite | None:
+    if not project.active_binding_site_id:
+        return None
+    return (
+        db.query(BindingSite)
+        .filter_by(
+            project_id=project.project_id,
+            structure_id=structure_id,
+            binding_site_id=project.active_binding_site_id,
+        )
+        .one_or_none()
+    )
+
+
+def _empty_readiness(reason_codes: list[str]) -> dict[str, Any]:
+    return {
+        "ready": False,
+        "structure_id": None,
+        "binding_site_id": None,
+        "source_receptor": None,
+        "prepared_receptor_pdbqt": None,
+        "pocket_pdb": None,
+        "grid": None,
+        "tools": {
+            name: {"ready": False}
+            for name in ("targetdiff", "autogrow4", "vina", "gnina")
+        },
+        "reason_codes": reason_codes,
+    }

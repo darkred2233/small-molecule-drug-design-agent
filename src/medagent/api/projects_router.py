@@ -160,5 +160,7 @@ def _project_to_read(project: Project) -> ProjectRead:
         target_id=project.target_id,
         objective=project.objective,
         status=project.status,
+        active_structure_id=project.active_structure_id,
+        active_binding_site_id=project.active_binding_site_id,
         created_at=project.created_at,
     )

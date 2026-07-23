@@ -17,6 +17,7 @@ from medagent.core.config import Settings
 from medagent.db.models import BindingSite, Project, Target, TargetResourceLink, UploadedFile
 from medagent.services.file_ingestion import path_from_storage_uri, safe_filename
 from medagent.services.ids import new_id
+from medagent.services.structure_workflow import register_uploaded_structure, structure_source_file
 from medagent.services.scientific_execution import (
     CapabilitySnapshot,
     EvidenceKind,
@@ -129,16 +130,29 @@ def run_project_p2rank(
     db: Session,
     settings: Settings,
     project: Project,
-    source_file_id: str,
+    source_file_id: str | None = None,
+    structure_id: str | None = None,
 ) -> P2RankProjectResult:
     """Predict all pockets for one project-owned PDB and persist real artifacts."""
     if not project.target_id or db.query(Target).filter_by(target_id=project.target_id).one_or_none() is None:
         raise ValueError("Project target_id does not match a known target.")
-    source_file = (
-        db.query(UploadedFile)
-        .filter_by(project_id=project.project_id, file_id=source_file_id)
-        .one_or_none()
-    )
+    structure = None
+    if structure_id:
+        structure, source_file = structure_source_file(db, settings, project, structure_id)
+        source_file_id = source_file.file_id
+    elif source_file_id:
+        structure = register_uploaded_structure(
+            db,
+            settings,
+            project,
+            source_file_id,
+        )
+        structure, source_file = structure_source_file(
+            db, settings, project, structure.structure_id
+        )
+        source_file_id = source_file.file_id
+    else:
+        raise ValueError("Either structure_id or source_file_id is required.")
     if source_file is None:
         raise ValueError("source_file_id does not belong to this project.")
     source_path = path_from_storage_uri(settings, source_file.storage_path)
@@ -245,6 +259,7 @@ def run_project_p2rank(
             pockets,
             run_directory,
             str(status.get("version") or "unknown"),
+            structure_id=structure.structure_id if structure is not None else None,
         )
     except (OSError, ValueError, csv.Error) as exc:
         return _persist_failure(
@@ -259,6 +274,7 @@ def run_project_p2rank(
         output_paths.setdefault(role, path)
     for site, pocket_path in zip(binding_sites, pocket_paths, strict=True):
         output_paths[f"pocket_{site.binding_site_id}"] = pocket_path
+    output_artifacts = artifact_snapshot(output_paths)
 
     scientific_result = ScientificResult(
         stage="pocket_prediction",
@@ -278,14 +294,30 @@ def run_project_p2rank(
             "threads": 1,
         },
         input_artifacts=artifact_snapshot({"receptor_pdb": input_path}),
-        output_artifacts=artifact_snapshot(output_paths),
+        output_artifacts=output_artifacts,
         provenance={
             "command": command,
             "stdout": completed.stdout,
             "stderr": completed.stderr,
             "exit_code": completed.returncode,
         },
-        payload={"binding_site_ids": [site.binding_site_id for site in binding_sites]},
+        payload={
+            "structure_id": structure.structure_id if structure is not None else None,
+            "binding_sites": [
+                {
+                    "binding_site_id": site.binding_site_id,
+                    "structure_id": site.structure_id,
+                    "center": (site.grid_box or {}).get("center"),
+                    "size": (site.grid_box or {}).get("size"),
+                    "key_residues": site.key_residues or [],
+                    "pocket_artifact": output_artifacts.get(
+                        f"pocket_{site.binding_site_id}", {}
+                    ),
+                    "grid_derivation": (site.grid_box or {}).get("derivation"),
+                }
+                for site in binding_sites
+            ],
+        },
     )
     manifest = persist_scientific_result(
         db,
@@ -295,6 +327,13 @@ def run_project_p2rank(
         project_id=project.project_id,
     )
     _link_project_artifacts(db, project, scientific_result, binding_sites)
+    if structure is not None:
+        structure.status = "pocket_predicted"
+        structure.metadata_json = {
+            **(structure.metadata_json or {}),
+            "latest_p2rank_manifest_id": manifest.manifest_id,
+            "binding_site_ids": [site.binding_site_id for site in binding_sites],
+        }
     return P2RankProjectResult(
         status="succeeded",
         warnings=scientific_result.warnings,
@@ -352,6 +391,7 @@ def _create_binding_sites(
     pockets: list[P2RankPocket],
     run_directory: Path,
     tool_version: str,
+    structure_id: str | None = None,
 ) -> tuple[list[BindingSite], list[Path]]:
     atoms_by_residue = _pdb_atoms_by_residue(receptor_path)
     prepared_sites: list[tuple[P2RankPocket, Path, list[str], list[float], list[float]]] = []
@@ -376,6 +416,7 @@ def _create_binding_sites(
             target_id=project.target_id or "",
             pdb_id=Path(source_file.filename).stem.upper(),
             source_file_id=source_file.file_id,
+            structure_id=structure_id,
             receptor_file=f"local://{receptor_path}",
             prepared_receptor_file=None,
             preparation_status="pocket_predicted",

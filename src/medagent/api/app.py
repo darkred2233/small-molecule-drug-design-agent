@@ -59,6 +59,7 @@ from medagent.domain.schemas import (
     MoleculeValidationResponse,
     ProjectCreate,
     ProjectRead,
+    ProjectStructureRead,
     ProjectStatus,
     P2RankPredictRequest,
     P2RankPredictResponse,
@@ -75,12 +76,16 @@ from medagent.domain.schemas import (
     RankingRead,
     RankingRunResponse,
     ReceptorPrepareRequest,
+    RcsbStructureImportRequest,
+    StructurePreparationRead,
+    StructureReadinessRead,
     ReasoningTraceRead,
     RuleFilterResponse,
     RuleFilterResultRead,
     SeedLigandRead,
     SynthesisRouteRead,
     UploadedFileRead,
+    UploadedStructureRegisterRequest,
 )
 from medagent.services.advisor import (
     AdvisorSuggestionNotFoundError,
@@ -132,8 +137,18 @@ from medagent.services.receptor_preparation import (
     get_project_binding_site,
     list_project_binding_sites,
     prepare_project_receptor,
+    prepare_project_structure_receptor,
+    project_structure_readiness,
+    select_project_binding_site,
 )
 from medagent.services.p2rank_adapter import run_project_p2rank
+from medagent.services.structure_workflow import (
+    activate_project_structure,
+    import_rcsb_structure,
+    list_project_structures,
+    register_uploaded_structure,
+    structure_to_payload,
+)
 from medagent.services.rule_filtering import filter_project_molecules
 
 SessionLocal: sessionmaker[Session]
@@ -1216,6 +1231,82 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [_rule_filter_result_to_read(result) for result in results]
 
     @app.post(
+        "/projects/{project_id}/structures/import-rcsb",
+        response_model=ProjectStructureRead,
+        status_code=201,
+        tags=["project-structures"],
+        summary="Import an experimental receptor from RCSB PDB",
+    )
+    def import_project_rcsb_structure(
+        project_id: str,
+        payload: RcsbStructureImportRequest,
+        db: Session = Depends(get_db),
+    ):
+        project = _get_project(db, project_id)
+        try:
+            structure = import_rcsb_structure(
+                db, app_settings, project, payload.pdb_id, payload.assembly_id
+            )
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return structure_to_payload(db, project, structure)
+
+    @app.post(
+        "/projects/{project_id}/structures/register-upload",
+        response_model=ProjectStructureRead,
+        status_code=201,
+        tags=["project-structures"],
+        summary="Register an uploaded PDB as a project receptor structure",
+    )
+    def register_project_uploaded_structure(
+        project_id: str,
+        payload: UploadedStructureRegisterRequest,
+        db: Session = Depends(get_db),
+    ):
+        project = _get_project(db, project_id)
+        try:
+            structure = register_uploaded_structure(
+                db, app_settings, project, payload.source_file_id
+            )
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return structure_to_payload(db, project, structure)
+
+    @app.get(
+        "/projects/{project_id}/structures",
+        response_model=list[ProjectStructureRead],
+        tags=["project-structures"],
+        summary="List project receptor structures",
+    )
+    def list_structures(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        return [
+            structure_to_payload(db, project, structure)
+            for structure in list_project_structures(db, project)
+        ]
+
+    @app.post(
+        "/projects/{project_id}/structures/{structure_id}/activate",
+        response_model=ProjectStructureRead,
+        tags=["project-structures"],
+        summary="Activate one project receptor structure",
+    )
+    def activate_structure(
+        project_id: str,
+        structure_id: str,
+        db: Session = Depends(get_db),
+    ):
+        project = _get_project(db, project_id)
+        try:
+            structure = activate_project_structure(db, project, structure_id)
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return structure_to_payload(db, project, structure)
+
+    @app.post(
         "/projects/{project_id}/receptors/prepare",
         response_model=BindingSiteRead,
         status_code=201,
@@ -1247,6 +1338,82 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return binding_site_to_payload(result.binding_site)
 
     @app.post(
+        "/projects/{project_id}/structures/{structure_id}/p2rank",
+        response_model=P2RankPredictResponse,
+        tags=["pocket-prediction"],
+        summary="Predict pockets for one project structure",
+    )
+    def predict_structure_pockets(
+        project_id: str,
+        structure_id: str,
+        db: Session = Depends(get_db),
+    ):
+        project = _get_project(db, project_id)
+        try:
+            result = run_project_p2rank(
+                db, app_settings, project, structure_id=structure_id
+            )
+            db.commit()
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            **result.as_dict(),
+            "binding_sites": [binding_site_to_payload(site) for site in result.binding_sites],
+        }
+
+    @app.post(
+        "/projects/{project_id}/structures/{structure_id}/prepare",
+        response_model=StructurePreparationRead,
+        tags=["receptor-preparation"],
+        summary="Prepare one project structure as a Vina receptor PDBQT",
+    )
+    def prepare_structure(
+        project_id: str,
+        structure_id: str,
+        db: Session = Depends(get_db),
+    ):
+        project = _get_project(db, project_id)
+        try:
+            return prepare_project_structure_receptor(
+                db, app_settings, project, structure_id
+            )
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/projects/{project_id}/binding-sites/{binding_site_id}/select",
+        response_model=BindingSiteRead,
+        tags=["pocket-prediction"],
+        summary="Select a persisted pocket from the active project structure",
+    )
+    def select_binding_site(
+        project_id: str,
+        binding_site_id: str,
+        db: Session = Depends(get_db),
+    ):
+        project = _get_project(db, project_id)
+        try:
+            site = select_project_binding_site(
+                db, app_settings, project, binding_site_id
+            )
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return binding_site_to_payload(site)
+
+    @app.get(
+        "/projects/{project_id}/structure-readiness",
+        response_model=StructureReadinessRead,
+        tags=["project-structures"],
+        summary="Get the frozen-input readiness for structure-conditioned tools",
+    )
+    def get_structure_readiness(project_id: str, db: Session = Depends(get_db)):
+        project = _get_project(db, project_id)
+        return project_structure_readiness(db, app_settings, project)
+
+    @app.post(
         "/projects/{project_id}/p2rank/predict",
         response_model=P2RankPredictResponse,
         tags=["pocket-prediction"],
@@ -1259,7 +1426,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         project = _get_project(db, project_id)
         try:
-            result = run_project_p2rank(db, app_settings, project, payload.source_file_id)
+            result = run_project_p2rank(
+                db,
+                app_settings,
+                project,
+                source_file_id=payload.source_file_id,
+                structure_id=payload.structure_id,
+            )
             db.commit()
         except ValueError as exc:
             db.rollback()
@@ -2312,6 +2485,8 @@ def _project_to_read(project: Project) -> ProjectRead:
         target_id=project.target_id,
         objective=project.objective,
         status=project.status,
+        active_structure_id=project.active_structure_id,
+        active_binding_site_id=project.active_binding_site_id,
         created_at=project.created_at,
     )
 

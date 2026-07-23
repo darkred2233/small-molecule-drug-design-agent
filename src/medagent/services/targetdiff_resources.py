@@ -16,6 +16,26 @@ def resolve_targetdiff_resources(
     config: TargetDiffCampaignConfig,
 ) -> TargetDiffResourceBundle:
     """Choose a validated project PDB pocket without crossing project boundaries."""
+    if config.binding_site_id:
+        site = (
+            db.query(BindingSite)
+            .filter(
+                BindingSite.binding_site_id == config.binding_site_id,
+                BindingSite.project_id == project.project_id,
+            )
+            .first()
+        )
+        if site is None:
+            raise ValueError("TargetDiff selected binding site was not found in this project")
+        if project.active_structure_id and site.structure_id != project.active_structure_id:
+            raise ValueError("TargetDiff selected binding site is not from the active project structure")
+        return _bundle_from_binding_site(site)
+
+    if project.active_structure_id:
+        raise ValueError(
+            "TargetDiff requires an explicit binding_site_id from the active project structure"
+        )
+
     if config.pocket_resource_id:
         resource = (
             db.query(ProjectResource)
@@ -31,49 +51,8 @@ def resolve_targetdiff_resources(
             raise ValueError("TargetDiff selected resource must have type binding_pocket")
         return _bundle_from_resource(resource)
 
-    if config.binding_site_id:
-        site = (
-            db.query(BindingSite)
-            .filter(
-                BindingSite.binding_site_id == config.binding_site_id,
-                BindingSite.project_id == project.project_id,
-            )
-            .first()
-        )
-        if site is None:
-            raise ValueError("TargetDiff selected binding site was not found in this project")
-        return _bundle_from_binding_site(site)
-
-    resources = (
-        db.query(ProjectResource)
-        .filter(
-            ProjectResource.project_id == project.project_id,
-            ProjectResource.resource_type == "binding_pocket",
-        )
-        .order_by(ProjectResource.created_at.desc(), ProjectResource.id.desc())
-        .all()
-    )
-    for resource in resources:
-        try:
-            return _bundle_from_resource(resource)
-        except ValueError:
-            continue
-
-    sites = (
-        db.query(BindingSite)
-        .filter(BindingSite.project_id == project.project_id)
-        .order_by(BindingSite.created_at.desc(), BindingSite.id.desc())
-        .all()
-    )
-    sites.sort(key=lambda site: site.preparation_status != "prepared")
-    for site in sites:
-        try:
-            return _bundle_from_binding_site(site)
-        except ValueError:
-            continue
-
     raise ValueError(
-        "TargetDiff requires a project binding_pocket PDB resource or a binding site with a local PDB receptor"
+        "TargetDiff requires an explicit project pocket_resource_id or binding_site_id"
     )
 
 

@@ -131,6 +131,7 @@ class StrategyValidator:
         if targetdiff.get("enabled") and not has_targetdiff_pocket:
             targetdiff["enabled"] = False
             warnings.append("TargetDiff requires a local pocket PDB or binding site; disabled for this round")
+        self._bind_selected_site(targetdiff, data_context, warnings, "TargetDiff")
 
         autogrow4 = normalized["autogrow4"]
         autogrow4["num_molecules"] = self._bounded_count(
@@ -166,7 +167,42 @@ class StrategyValidator:
             autogrow4["enabled"] = False
             warnings.append("AutoGrow4 需要 source compound pool，当前轮次已禁用")
 
+        self._bind_selected_site(autogrow4, data_context, warnings, "AutoGrow4")
         return normalized
+
+    @staticmethod
+    def _bind_selected_site(
+        config: dict[str, Any],
+        data_context: dict[str, Any],
+        warnings: list[str],
+        method_name: str,
+    ) -> None:
+        if method_name == "TargetDiff":
+            config["pocket_resource_id"] = None
+        if not config.get("enabled"):
+            return
+        allowed_ids = {
+            str(value) for value in data_context.get("available_binding_site_ids") or []
+        }
+        requested = config.get("binding_site_id")
+        active = data_context.get("active_binding_site_id")
+        if requested and requested not in allowed_ids:
+            config["binding_site_id"] = None
+            config["enabled"] = False
+            warnings.append(
+                f"{method_name} binding_site_id {requested} is not a persisted site for the active structure; disabled"
+            )
+            return
+        if requested:
+            return
+        if active and active in allowed_ids:
+            config["binding_site_id"] = active
+            return
+        config["binding_site_id"] = None
+        config["enabled"] = False
+        warnings.append(
+            f"{method_name} requires a user-confirmed binding_site_id from the active structure; disabled"
+        )
 
     def _validate_property_constraints(
         self,

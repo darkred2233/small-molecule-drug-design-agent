@@ -55,7 +55,7 @@ class RoundStrategyAgent:
         try:
             llm_response = self.llm_client.generate_structured(
                 prompt=prompt,
-                schema=self._strategy_draft_schema(),
+                schema=self._strategy_draft_schema(context),
                 temperature=0.3,
             )
         except Exception as exc:
@@ -192,11 +192,25 @@ class RoundStrategyAgent:
         uploaded_files = db.query(UploadedFile).filter_by(project_id=project.project_id).all()
         documents = db.query(RagDocument).filter_by(project_id=project.project_id).all()
         binding_sites = db.query(BindingSite).filter_by(project_id=project.project_id).all()
+        available_binding_sites = [
+            site
+            for site in binding_sites
+            if project.active_structure_id
+            and site.structure_id == project.active_structure_id
+            and (site.grid_box or {}).get("pocket_file")
+            and (site.grid_box or {}).get("center")
+            and (site.grid_box or {}).get("size")
+        ]
 
         context: dict[str, Any] = {
             "project_objective": project.objective,
             "project_constraints": project.constraints_json or {},
             "target_id": project.target_id,
+            "active_structure_id": project.active_structure_id,
+            "active_binding_site_id": project.active_binding_site_id,
+            "available_binding_site_ids": [
+                site.binding_site_id for site in available_binding_sites
+            ],
             "data_summary": {
                 "seed_ligand_count": len(seed_ligands),
                 "seed_ligand_sources": dict(Counter(item.source or "unknown" for item in seed_ligands)),
@@ -217,10 +231,10 @@ class RoundStrategyAgent:
                 "resource_count": len(resources),
                 "resource_types": dict(Counter(item.resource_type for item in resources)),
                 "resource_scopes": dict(Counter(item.scope for item in resources)),
-                "binding_site_count": len(binding_sites),
+                "binding_site_count": len(available_binding_sites),
                 "prepared_binding_site_count": sum(
                     1
-                    for item in binding_sites
+                    for item in available_binding_sites
                     if item.prepared_receptor_file or item.preparation_status == "prepared"
                 ),
             },
@@ -331,7 +345,11 @@ class RoundStrategyAgent:
         ])
         return "\n".join(prompt_parts)
 
-    def _strategy_draft_schema(self) -> dict[str, Any]:
+    def _strategy_draft_schema(self, context: dict[str, Any]) -> dict[str, Any]:
+        binding_site_schema = {
+            "type": "string",
+            "enum": list(context.get("available_binding_site_ids") or []),
+        }
         return {
             "type": "object",
             "properties": {
@@ -356,8 +374,7 @@ class RoundStrategyAgent:
                                     "type": "string",
                                     "enum": ["fast", "balanced", "thorough"],
                                 },
-                                "pocket_resource_id": {"type": "string"},
-                                "binding_site_id": {"type": "string"},
+                                "binding_site_id": binding_site_schema,
                             },
                         },
                         "autogrow4": {
@@ -371,6 +388,7 @@ class RoundStrategyAgent:
                                     "type": "string",
                                     "enum": ["auto", "target_ligands", "previous_top", "user_uploaded"],
                                 },
+                                "binding_site_id": binding_site_schema,
                             },
                         },
                     },

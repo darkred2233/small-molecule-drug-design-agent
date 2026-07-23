@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -9,6 +10,7 @@ from medagent.db.models import (
     BindingSite,
     ExecutionManifest,
     Project,
+    ProjectStructure,
     ScientificArtifact,
     Target,
     TargetResourceLink,
@@ -115,6 +117,10 @@ def test_p2rank_prediction_persists_all_predicted_pockets_and_audit_artifacts(tm
         manifest = db.query(ExecutionManifest).filter_by(project_id=project.project_id).one()
         assert manifest.status == "succeeded"
         assert manifest.output_artifacts["predictions_csv"]["sha256"]
+        audited_site = manifest.result_json["payload"]["binding_sites"][0]
+        assert audited_site["center"] == sites[0].grid_box["center"]
+        assert audited_site["size"] == sites[0].grid_box["size"]
+        assert audited_site["pocket_artifact"]["sha256"]
 
 
 def test_p2rank_reports_runtime_blocked_without_creating_sites(tmp_path, monkeypatch):
@@ -211,8 +217,36 @@ def test_p2rank_pocket_makes_targetdiff_eligible_in_the_project_preflight(tmp_pa
 
     with session_factory() as db:
         project = db.query(Project).filter_by(project_id="PROJ-P2RANK").one()
-        result = run_project_p2rank(db, settings, project, "FILE-P2RANK")
+        source = db.query(UploadedFile).filter_by(file_id="FILE-P2RANK").one()
+        source_path = Path(source.storage_path.removeprefix("local://"))
+        source.metadata_json = {
+            "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            "size_bytes": source_path.stat().st_size,
+        }
+        prepared_path = tmp_path / "receptor.pdbqt"
+        prepared_path.write_text("ATOM prepared receptor\n", encoding="utf-8")
+        structure = ProjectStructure(
+            structure_id="STR-P2RANK",
+            project_id=project.project_id,
+            target_id=project.target_id,
+            source="upload",
+            source_identifier=source.file_id,
+            source_file_id=source.file_id,
+            status="prepared",
+            prepared_receptor_file=f"local://{prepared_path}",
+            prepared_receptor_sha256=hashlib.sha256(prepared_path.read_bytes()).hexdigest(),
+        )
+        project.active_structure_id = structure.structure_id
+        db.add(structure)
+        db.flush()
+
+        result = run_project_p2rank(
+            db, settings, project, structure_id=structure.structure_id
+        )
         assert result.status == "succeeded"
+        selected_site = result.binding_sites[0]
+        project.active_binding_site_id = selected_site.binding_site_id
+        db.commit()
 
         preflight = prepare_round_preflight(
             db,
@@ -232,8 +266,16 @@ def test_p2rank_pocket_makes_targetdiff_eligible_in_the_project_preflight(tmp_pa
     resource = preflight["snapshot"]["target_resource"]
     stages = {stage["stage"]: stage for stage in preflight["plan"]["stages"]}
     assert resource["package_status"] == "pocket_predicted"
+    assert resource["structure_id"] == "STR-P2RANK"
+    assert resource["binding_site_id"] == selected_site.binding_site_id
     assert resource["pocket_predicted"] is True
     assert resource["targetdiff_pocket"] is True
+    assert resource["prepared_receptor"] is True
+    assert resource["source_receptor"]["sha256"] == source.metadata_json["sha256"]
+    assert resource["pocket_pdb"]["sha256"]
+    assert resource["prepared_receptor_pdbqt"]["sha256"] == structure.prepared_receptor_sha256
+    assert resource["grid"]["center"] == selected_site.grid_box["center"]
+    assert resource["grid"]["size"] == selected_site.grid_box["size"]
     assert resource["artifact_hashes_complete"] is True
     assert stages["generate_candidates"]["allowed"] is True
     assert "predicted_not_experimentally_validated" in stages["generate_candidates"]["warnings"]
@@ -294,6 +336,12 @@ def test_p2rank_api_predicts_only_from_a_project_owned_uploaded_receptor(tmp_pat
             f"/projects/{project['project_id']}/p2rank/predict",
             json={"source_file_id": upload.json()["file_id"]},
         )
+
+        assert response.status_code == 200, response.text
+        site = response.json()["binding_sites"][0]
+        assert site["structure_id"]
+        project_state = client.get(f"/projects/{project['project_id']}").json()
+        assert project_state["active_structure_id"] == site["structure_id"]
 
     assert response.status_code == 200
     body = response.json()

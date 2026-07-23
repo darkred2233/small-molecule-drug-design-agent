@@ -89,8 +89,9 @@ def test_apply_all_is_idempotent_on_current_schema(tmp_path):
         "seed_ligand_activity_type": False,
         "llm_critique_fields": [],
         "round_provenance": {"added_columns": [], "round_reports_created": False},
-        "scientific_execution": {"added_columns": [], "created_tables": []},
-    }
+            "scientific_execution": {"added_columns": [], "created_tables": []},
+            "project_structure_workflow": {"added_columns": [], "created_tables": []},
+        }
 
     assert apply_all(database_url) == expected
     assert apply_all(database_url) == expected

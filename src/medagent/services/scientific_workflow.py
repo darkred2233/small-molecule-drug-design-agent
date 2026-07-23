@@ -7,8 +7,19 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from medagent.db.models import BindingSite, Project, ProjectRound, ScientificArtifact
-from medagent.services.scientific_execution import CapabilitySnapshot, build_execution_plan
+from medagent.db.models import (
+    BindingSite,
+    Project,
+    ProjectRound,
+    ProjectStructure,
+    ScientificArtifact,
+    UploadedFile,
+)
+from medagent.services.scientific_execution import (
+    CapabilitySnapshot,
+    build_execution_plan,
+    sha256_file,
+)
 from medagent.services.scientific_persistence import (
     create_job,
     create_workflow_packet,
@@ -305,47 +316,110 @@ def _overlay_project_predicted_pocket(
     project: Project,
     resource: dict[str, Any],
 ) -> dict[str, Any]:
-    """Expose the latest auditable project-local P2Rank pocket to its preflight.
+    """Freeze the explicitly selected project structure and P2Rank pocket.
 
     Predicted pockets are deliberately project-scoped: an uploaded receptor is
     not promoted into the target's shared resource package merely by running a
     computational predictor.
     """
     effective_resource = dict(resource)
-    sites = (
+    if not project.active_structure_id or not project.active_binding_site_id:
+        return effective_resource
+
+    structure = (
+        db.query(ProjectStructure)
+        .filter_by(
+            project_id=project.project_id,
+            target_id=project.target_id,
+            structure_id=project.active_structure_id,
+        )
+        .one_or_none()
+    )
+    site = (
         db.query(BindingSite)
         .filter_by(
             project_id=project.project_id,
             target_id=project.target_id,
+            structure_id=project.active_structure_id,
+            binding_site_id=project.active_binding_site_id,
             preparation_status="pocket_predicted",
         )
-        .order_by(BindingSite.created_at.desc(), BindingSite.id.desc())
-        .all()
+        .one_or_none()
     )
-    for site in sites:
-        pocket_file = str((site.grid_box or {}).get("pocket_file") or "")
-        pocket_path = Path(pocket_file.removeprefix("local://"))
-        artifact = (
-            db.query(ScientificArtifact).filter_by(artifact_id=site.artifact_id).one_or_none()
-            if site.artifact_id
-            else None
-        )
-        if not pocket_file or not pocket_path.is_file() or artifact is None or not artifact.sha256:
-            continue
-
-        warnings = list(effective_resource.get("warnings") or [])
-        if "predicted_not_experimentally_validated" not in warnings:
-            warnings.append("predicted_not_experimentally_validated")
-        effective_resource.update(
-            {
-                "package_status": "pocket_predicted",
-                "binding_site_id": site.binding_site_id,
-                "pocket_predicted": True,
-                "targetdiff_pocket": True,
-                "pocket_file": pocket_file,
-                "artifact_hashes_complete": True,
-                "warnings": warnings,
-            }
-        )
+    if structure is None or site is None:
         return effective_resource
+
+    source_file = (
+        db.query(UploadedFile)
+        .filter_by(project_id=project.project_id, file_id=structure.source_file_id)
+        .one_or_none()
+    )
+    artifact = (
+        db.query(ScientificArtifact).filter_by(artifact_id=site.artifact_id).one_or_none()
+        if site.artifact_id
+        else None
+    )
+    grid = dict(site.grid_box or {})
+    source_path = _local_artifact_path(source_file.storage_path if source_file else None)
+    pocket_path = _local_artifact_path(grid.get("pocket_file"))
+    prepared_path = _local_artifact_path(structure.prepared_receptor_file)
+    source_metadata = dict(source_file.metadata_json or {}) if source_file else {}
+
+    source_hash = _verified_hash(source_path, source_metadata.get("sha256"))
+    pocket_hash = _verified_hash(pocket_path, artifact.sha256 if artifact else None)
+    prepared_hash = _verified_hash(prepared_path, structure.prepared_receptor_sha256)
+    if source_hash is None or pocket_hash is None:
+        return effective_resource
+
+    warnings = list(effective_resource.get("warnings") or [])
+    if "predicted_not_experimentally_validated" not in warnings:
+        warnings.append("predicted_not_experimentally_validated")
+    effective_resource.update(
+        {
+            "package_status": "pocket_predicted",
+            "structure_id": structure.structure_id,
+            "binding_site_id": site.binding_site_id,
+            "pocket_predicted": True,
+            "targetdiff_pocket": True,
+            "prepared_receptor": prepared_hash is not None,
+            "source_receptor": {
+                "file_id": source_file.file_id if source_file else None,
+                "uri": source_file.storage_path if source_file else None,
+                "sha256": source_hash,
+                "size_bytes": source_path.stat().st_size if source_path else None,
+            },
+            "pocket_file": grid.get("pocket_file"),
+            "pocket_pdb": {
+                "artifact_id": artifact.artifact_id if artifact else None,
+                "uri": grid.get("pocket_file"),
+                "sha256": pocket_hash,
+                "size_bytes": pocket_path.stat().st_size if pocket_path else None,
+            },
+            "prepared_receptor_pdbqt": (
+                {
+                    "uri": structure.prepared_receptor_file,
+                    "sha256": prepared_hash,
+                    "size_bytes": prepared_path.stat().st_size if prepared_path else None,
+                }
+                if prepared_hash is not None
+                else None
+            ),
+            "grid": {"center": grid.get("center"), "size": grid.get("size")},
+            "artifact_hashes_complete": prepared_hash is not None,
+            "warnings": warnings,
+        }
+    )
     return effective_resource
+
+
+def _local_artifact_path(uri: str | None) -> Path | None:
+    if not uri:
+        return None
+    return Path(uri.removeprefix("local://"))
+
+
+def _verified_hash(path: Path | None, expected: Any) -> str | None:
+    if path is None or not path.is_file() or not isinstance(expected, str) or not expected:
+        return None
+    actual = sha256_file(path)
+    return actual if actual == expected else None

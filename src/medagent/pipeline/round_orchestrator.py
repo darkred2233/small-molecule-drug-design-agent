@@ -313,6 +313,11 @@ class RoundOrchestrator:
             from medagent.services.scientific_workflow import stage_permissions
 
             assessment_kwargs["stage_permissions"] = stage_permissions(scientific_preflight)
+            target_resource = (
+                (scientific_preflight.get("snapshot") or {}).get("target_resource") or {}
+            )
+            if target_resource.get("binding_site_id"):
+                assessment_kwargs["binding_site_id"] = target_resource["binding_site_id"]
         if assessment_config:
             mode = assessment_config.get("assessment_mode", assessment_config.get("mode"))
             if mode:

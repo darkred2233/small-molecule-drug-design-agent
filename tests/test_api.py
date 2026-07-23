@@ -8,8 +8,10 @@ from medagent.core.config import Settings
 from medagent.db.models import (
     ADMETResult,
     AgentRun,
+    ApprovalEvent,
     AdvisorSuggestion,
     BindingSite,
+    CapabilitySnapshotRecord,
     CampaignRun,
     ConformerResult,
     ConversationMessage,
@@ -17,21 +19,28 @@ from medagent.db.models import (
     DecisionCard,
     DockingResult,
     EvidenceLink,
+    ExecutionManifest,
+    ExecutionPlanRecord,
     Molecule,
     MoleculeProperty,
     OptimizationConstraint,
     ProjectResource,
     ProjectRound,
+    ProjectStructure,
     RagChunk,
     RagDocument,
     Ranking,
     ReasoningTrace,
     RuleFilterResult,
     RoundReport,
+    ScientificArtifact,
+    ScientificJob,
     SeedLigand,
     SynthesisRoute,
     Target,
+    TargetResourceLink,
     UploadedFile,
+    WorkflowPacket,
 )
 
 
@@ -528,6 +537,14 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
                         file_type="text/plain",
                         storage_path=f"local://{upload_file}",
                     ),
+                    ProjectStructure(
+                        structure_id="STR-DELETE",
+                        project_id=project_id,
+                        target_id="TGT-EGFR",
+                        source="upload",
+                        source_identifier="FILE-DELETE",
+                        source_file_id="FILE-DELETE",
+                    ),
                     ConversationMessage(
                         message_id="MSG-DELETE",
                         project_id=project_id,
@@ -661,6 +678,62 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
                         name="delete ligand",
                         smiles="CCO",
                     ),
+                    CapabilitySnapshotRecord(
+                        snapshot_id="SNAPSHOT-DELETE",
+                        snapshot_hash="a" * 64,
+                        project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        snapshot_json={},
+                    ),
+                    ExecutionPlanRecord(
+                        plan_id="PLAN-DELETE",
+                        plan_hash="b" * 64,
+                        project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        capability_snapshot_id="SNAPSHOT-DELETE",
+                        plan_json={},
+                    ),
+                    ExecutionManifest(
+                        manifest_id="MANIFEST-DELETE",
+                        manifest_hash="c" * 64,
+                        project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        stage="receptor_preparation",
+                        status="succeeded",
+                        request_hash="d" * 64,
+                    ),
+                    ScientificJob(
+                        job_id="JOB-DELETE",
+                        project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        stage="pocket_prediction",
+                    ),
+                    WorkflowPacket(
+                        packet_id="PACKET-DELETE",
+                        packet_type="structure_workflow",
+                        project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        input_hash="e" * 64,
+                    ),
+                    ApprovalEvent(
+                        approval_id="APPROVAL-DELETE",
+                        project_id=project_id,
+                        round_id="ROUND-DELETE-1",
+                        event_type="binding_site_selection",
+                    ),
+                    ScientificArtifact(
+                        artifact_id="ARTIFACT-DELETE",
+                        artifact_type="pocket_pdb",
+                        uri="local://delete/pocket.pdb",
+                        sha256="f" * 64,
+                        size_bytes=1,
+                    ),
+                    TargetResourceLink(
+                        target_id="TGT-EGFR",
+                        artifact_id="ARTIFACT-DELETE",
+                        role="p2rank_pocket_SITE-DELETE",
+                        binding_site_id="SITE-DELETE",
+                    ),
                 ]
             )
             db.commit()
@@ -692,8 +765,15 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
                 CampaignRun,
                 ProjectResource,
                 ProjectRound,
+                ProjectStructure,
                 BindingSite,
                 SeedLigand,
+                CapabilitySnapshotRecord,
+                ExecutionPlanRecord,
+                ExecutionManifest,
+                ScientificJob,
+                WorkflowPacket,
+                ApprovalEvent,
             ]:
                 assert db.query(model).filter_by(project_id=project_id).count() == 0
             for model in [
@@ -707,6 +787,7 @@ def test_delete_project_removes_project_scoped_records_and_artifacts(tmp_path, m
                 assert db.query(model).filter_by(molecule_id="MOL-DELETE").count() == 0
             assert db.query(RagChunk).filter_by(document_id="DOC-DELETE").count() == 0
             assert db.query(EvidenceLink).filter_by(evidence_id="EVD-DELETE").count() == 0
+            assert db.query(TargetResourceLink).filter_by(binding_site_id="SITE-DELETE").count() == 0
 
 
 def test_create_round_endpoint_creates_draft(tmp_path):

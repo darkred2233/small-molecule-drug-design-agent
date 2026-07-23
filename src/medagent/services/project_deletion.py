@@ -9,14 +9,18 @@ from medagent.core.config import Settings
 from medagent.db.models import (
     ADMETResult,
     AgentRun,
+    ApprovalEvent,
     AdvisorSuggestion,
     BindingSite,
+    CapabilitySnapshotRecord,
     ConformerResult,
     ConversationMessage,
     Critique,
     DecisionCard,
     DockingResult,
     EvidenceLink,
+    ExecutionManifest,
+    ExecutionPlanRecord,
     Molecule,
     MoleculeProperty,
     OptimizationConstraint,
@@ -28,11 +32,15 @@ from medagent.db.models import (
     CampaignRun,
     ProjectResource,
     ProjectRound,
+    ProjectStructure,
     RoundReport,
     RuleFilterResult,
+    ScientificJob,
     SeedLigand,
     SynthesisRoute,
+    TargetResourceLink,
     UploadedFile,
+    WorkflowPacket,
 )
 
 
@@ -50,6 +58,9 @@ def delete_project_data(db: Session, project: Project) -> dict[str, int]:
         _scalar_list(db.query(RagChunk.chunk_id).filter(RagChunk.document_id.in_(document_ids)))
         if document_ids
         else []
+    )
+    binding_site_ids = _scalar_list(
+        db.query(BindingSite.binding_site_id).filter(BindingSite.project_id == project_id)
     )
 
     evidence_filters = []
@@ -130,6 +141,38 @@ def delete_project_data(db: Session, project: Project) -> dict[str, int]:
             db.query(RagDocument).filter(RagDocument.document_id.in_(document_ids))
         )
 
+    counts["approval_events"] = _delete(
+        db.query(ApprovalEvent).filter(ApprovalEvent.project_id == project_id)
+    )
+    counts["workflow_packets"] = _delete(
+        db.query(WorkflowPacket).filter(WorkflowPacket.project_id == project_id)
+    )
+    counts["execution_manifests"] = _delete(
+        db.query(ExecutionManifest).filter(ExecutionManifest.project_id == project_id)
+    )
+    counts["scientific_jobs"] = _delete(
+        db.query(ScientificJob).filter(ScientificJob.project_id == project_id)
+    )
+    counts["execution_plans"] = _delete(
+        db.query(ExecutionPlanRecord).filter(ExecutionPlanRecord.project_id == project_id)
+    )
+    counts["capability_snapshots"] = _delete(
+        db.query(CapabilitySnapshotRecord).filter(
+            CapabilitySnapshotRecord.project_id == project_id
+        )
+    )
+    if binding_site_ids:
+        counts["target_resource_links"] = _delete(
+            db.query(TargetResourceLink).filter(
+                TargetResourceLink.binding_site_id.in_(binding_site_ids)
+            )
+        )
+    else:
+        counts["target_resource_links"] = 0
+
+    counts["project_structures"] = _delete(
+        db.query(ProjectStructure).filter(ProjectStructure.project_id == project_id)
+    )
     counts["uploaded_files"] = _delete(
         db.query(UploadedFile).filter(UploadedFile.project_id == project_id)
     )

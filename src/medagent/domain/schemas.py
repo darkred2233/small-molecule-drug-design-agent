@@ -27,6 +27,8 @@ class ProjectCreate(BaseModel):
 
 
 class ProjectRead(BaseModel):
+    active_structure_id: str | None = Field(default=None, title="Active project structure")
+    active_binding_site_id: str | None = Field(default=None, title="Selected binding site")
     project_id: str = Field(title="项目编号")
     name: str = Field(title="项目名称")
     target_id: str | None = Field(title="靶点编号")
@@ -148,6 +150,51 @@ class UploadedFileRead(BaseModel):
     filename: str = Field(title="文件名")
     file_type: str = Field(title="文件类型")
     parse_status: str = Field(title="解析状态")
+
+
+class RcsbStructureImportRequest(BaseModel):
+    pdb_id: str = Field(min_length=4, max_length=4, title="RCSB PDB identifier")
+    assembly_id: str | None = Field(default=None, max_length=80, title="Biological assembly id")
+
+
+class UploadedStructureRegisterRequest(BaseModel):
+    source_file_id: str = Field(min_length=1, title="Project-owned uploaded PDB file id")
+
+
+class ProjectStructureRead(BaseModel):
+    structure_id: str
+    project_id: str
+    target_id: str
+    source: Literal["rcsb_pdb", "upload"]
+    source_identifier: str
+    source_url: str | None = None
+    assembly_id: str | None = None
+    source_file_id: str
+    status: str
+    sha256: str
+    size_bytes: int
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    is_active: bool = False
+
+
+class StructurePreparationRead(BaseModel):
+    structure_id: str
+    status: str
+    prepared_receptor_file: str | None = None
+    prepared_receptor_sha256: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class StructureReadinessRead(BaseModel):
+    ready: bool
+    structure_id: str | None = None
+    binding_site_id: str | None = None
+    source_receptor: dict[str, Any] | None = None
+    prepared_receptor_pdbqt: dict[str, Any] | None = None
+    pocket_pdb: dict[str, Any] | None = None
+    grid: dict[str, Any] | None = None
+    tools: dict[str, Any] = Field(default_factory=dict)
+    reason_codes: list[str] = Field(default_factory=list)
 
 
 class FileParseResult(BaseModel):
@@ -277,7 +324,8 @@ class ReceptorPrepareRequest(BaseModel):
 
 
 class P2RankPredictRequest(BaseModel):
-    source_file_id: str = Field(min_length=1, title="Project-owned PDB receptor file id")
+    source_file_id: str | None = Field(default=None, title="Project-owned PDB receptor file id")
+    structure_id: str | None = Field(default=None, title="Project receptor structure id")
 
 
 class P2RankPredictResponse(BaseModel):
@@ -291,6 +339,7 @@ class P2RankPredictResponse(BaseModel):
 
 class BindingSiteRead(BaseModel):
     binding_site_id: str = Field(title="Binding site id")
+    structure_id: str | None = Field(default=None, title="Project structure id")
     project_id: str | None = Field(title="Project id")
     target_id: str = Field(title="Target id")
     pdb_id: str | None = Field(title="PDB id")

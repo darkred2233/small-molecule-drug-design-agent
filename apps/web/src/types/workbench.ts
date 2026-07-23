@@ -5,8 +5,66 @@ export interface Project {
   target_name?: string | null;
   objective: string | null;
   status: string;
+  active_structure_id?: string | null;
+  active_binding_site_id?: string | null;
   created_at: string;
   updated_at?: string | null;
+}
+
+export interface ProjectStructure {
+  structure_id: string;
+  project_id: string;
+  target_id: string;
+  source: 'rcsb_pdb' | 'upload';
+  source_identifier: string;
+  source_url: string | null;
+  assembly_id: string | null;
+  source_file_id: string;
+  status: string;
+  sha256: string;
+  size_bytes: number;
+  metadata: {
+    pdb_summary?: { atom_count?: number; residue_count?: number; chain_ids?: string[] };
+    experimental_method?: string | null;
+    resolution?: number | null;
+    title?: string | null;
+  };
+  is_active: boolean;
+}
+
+export interface BindingSite {
+  binding_site_id: string;
+  structure_id: string | null;
+  project_id: string | null;
+  target_id: string;
+  pdb_id: string | null;
+  source_file_id: string | null;
+  receptor_file: string | null;
+  prepared_receptor_file: string | null;
+  preparation_status: string;
+  key_residues: string[];
+  grid_box: {
+    center?: number[];
+    size?: number[];
+    p2rank_rank?: number;
+    p2rank_score?: number;
+    p2rank_probability?: number | null;
+    pocket_file?: string;
+  };
+  labels: string[];
+  warnings: string[];
+}
+
+export interface StructureReadiness {
+  ready: boolean;
+  structure_id: string | null;
+  binding_site_id: string | null;
+  source_receptor: Record<string, unknown> | null;
+  prepared_receptor_pdbqt: Record<string, unknown> | null;
+  pocket_pdb: Record<string, unknown> | null;
+  grid: { center: number[]; size: number[] } | null;
+  tools: Record<string, { ready: boolean; reason_codes?: string[] }>;
+  reason_codes: string[];
 }
 
 export interface BuiltinTarget {

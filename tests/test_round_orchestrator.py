@@ -102,6 +102,9 @@ def test_round_assessment_passes_preflight_stage_permissions(monkeypatch):
         round_number=3,
         execution_config_snapshot_json={
             "scientific_preflight": {
+                "snapshot": {
+                    "target_resource": {"binding_site_id": "SITE-FROZEN"}
+                },
                 "plan": {
                     "stages": [
                         {"stage": "vina_screen", "allowed": False, "evidence_level": "L0"},
@@ -130,6 +133,7 @@ def test_round_assessment_passes_preflight_stage_permissions(monkeypatch):
         "synthesis": False,
         "ranking": True,
     }
+    assert captured["binding_site_id"] == "SITE-FROZEN"
 
 
 def test_round_ranking_and_self_refutation_are_round_scoped(monkeypatch):

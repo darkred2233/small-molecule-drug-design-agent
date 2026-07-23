@@ -101,6 +101,17 @@ def estimate_docking_jobs(generations: int, population_size: int, max_variants: 
     return generations * population_size * max_variants
 
 
+def eligible_autogrow4_source_count(db: Session, project: Project) -> int:
+    """Count unique compounds available through any supported source-pool policy."""
+    auto_compounds, _ = _build_source_pool(
+        db,
+        project,
+        AutoGrow4CampaignConfig(source_pool_policy="auto"),
+    )
+    previous_compounds = _previous_top_compounds(db, project, 200)
+    return len({smiles for smiles, _ in [*auto_compounds, *previous_compounds]})
+
+
 def _resolve_receptor_and_grid(
     db: Session,
     project: Project,
@@ -115,30 +126,14 @@ def _resolve_receptor_and_grid(
             BindingSite.binding_site_id == binding_site_id,
             BindingSite.project_id == project.project_id,
         ).first()
+        if site and project.active_structure_id and site.structure_id != project.active_structure_id:
+            raise ValueError("AutoGrow4 selected binding site is not from the active project structure")
         if site and _prepared_pdbqt(site):
             grid = _binding_site_grid(site)
             if grid is None:
                 raise ValueError("AutoGrow4 selected binding site has no valid docking grid")
             center, size = grid
             return _prepared_pdbqt(site), center, size, binding_site_id
-
-    # Prefer an actually prepared, grid-defined site. Projects can retain an
-    # earlier uploaded-only site alongside the prepared receptor.
-    sites = (
-        db.query(BindingSite)
-        .filter(BindingSite.project_id == project.project_id)
-        .order_by(BindingSite.created_at.desc(), BindingSite.id.desc())
-        .all()
-    )
-    sites.sort(key=lambda site: site.preparation_status != "prepared")
-    for site in sites:
-        if not _prepared_pdbqt(site):
-            continue
-        grid = _binding_site_grid(site)
-        if grid is None:
-            continue
-        center, size = grid
-        return _prepared_pdbqt(site), center, size, site.binding_site_id
 
     # 尝试使用 ProjectResource 中的 receptor
     if config.receptor_resource_id:
