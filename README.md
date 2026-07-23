@@ -29,7 +29,35 @@ GET  /projects/{project_id}/rounds/{round_id}/campaigns
 POST /projects/{project_id}/candidate-assessment/run
 POST /projects/{project_id}/rankings/generate
 GET  /projects/{project_id}/report
+POST /scientific/projects/{project_id}/preflight
+GET  /scientific/targets/{target_id}/resource-package
+GET  /scientific/projects/{project_id}/execution-manifests
+POST /scientific/projects/{project_id}/approvals
+POST /scientific/approvals/{approval_id}/decision
 ```
+
+## Scientific Execution Preflight
+
+Every formal scientific round starts from an immutable capability snapshot and
+execution plan. The plan captures local tool availability, frozen source
+releases, target-resource completeness, runtime facts, and the exact stages
+that are allowed. The `/scientific/projects/{project_id}/preflight` endpoint
+can be used to inspect that decision before starting a round.
+
+Results are labelled by evidence level: `L0` means not executed, blocked,
+unavailable, or failed; `L1` is a rules/RDKit surrogate; `L2` is a reproducible
+local tool or model computation with materialized artifacts; `L3` is an
+experimental or calibrated external validation. An unavailable tool never
+produces invented numerical results. L1 results remain useful for exploration,
+but cannot satisfy a requested external-evidence ranking gate.
+
+The first ten target packages are deliberately seeded as `metadata_ready`.
+A PDB identifier alone is not considered a dockable receptor: receptor,
+reference-ligand, grid/pocket artifacts and their SHA-256 hashes must be
+collected and validated before Vina, GNINA, TargetDiff, or AutoGrow4 are
+enabled. Each stage creates an immutable packet, durable job record, and
+execution manifest containing inputs, outputs, hashes, tool provenance, and
+the result's evidence level.
 
 旧的 `RunPlan`、`/projects/{id}/run`、`/projects/{id}/run-iterative`、`/projects/{id}/molecules/generate` 已从主代码中移除。
 

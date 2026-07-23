@@ -87,6 +87,51 @@ def test_round_assessment_maps_external_top_n_and_passes_round_id(monkeypatch):
     assert captured["external_top_n"] == 7
 
 
+def test_round_assessment_passes_preflight_stage_permissions(monkeypatch):
+    import medagent.services.candidate_assessment as assessment_service
+
+    captured: dict = {}
+
+    def fake_assessment(db, project, **kwargs):
+        captured.update(kwargs)
+        return {"assessment": "ok"}
+
+    monkeypatch.setattr(assessment_service, "run_project_candidate_assessment", fake_assessment)
+    round_obj = SimpleNamespace(
+        round_id="ROUND-003",
+        round_number=3,
+        execution_config_snapshot_json={
+            "scientific_preflight": {
+                "plan": {
+                    "stages": [
+                        {"stage": "vina_screen", "allowed": False, "evidence_level": "L0"},
+                        {"stage": "gnina_refine", "allowed": False, "evidence_level": "L0"},
+                        {"stage": "admet_batch", "allowed": True, "evidence_level": "L1"},
+                        {
+                            "stage": "retrosynthesis_batch",
+                            "allowed": True,
+                            "evidence_level": "L1",
+                        },
+                    ]
+                }
+            }
+        },
+    )
+
+    RoundOrchestrator(SimpleNamespace()).run_round_assessment(
+        None,
+        SimpleNamespace(project_id="PROJ-ROUND"),
+        round_obj,
+    )
+
+    assert captured["stage_permissions"] == {
+        "docking": False,
+        "admet": False,
+        "synthesis": False,
+        "ranking": True,
+    }
+
+
 def test_round_ranking_and_self_refutation_are_round_scoped(monkeypatch):
     import medagent.services.candidate_ranking as ranking_service
     import medagent.services.self_refutation as refutation_service
@@ -123,3 +168,16 @@ def test_round_ranking_and_self_refutation_are_round_scoped(monkeypatch):
     assert ranking_kwargs["round_id"] == "ROUND-002"
     assert refutation == {"refutation": "ok", "round_id": "ROUND-002"}
     assert refutation_kwargs["round_id"] == "ROUND-002"
+
+
+def test_docking_stage_payload_does_not_promote_vina_to_gnina():
+    payload = {"adapter_mode": "vina_local_docking", "external_success_count": 1}
+
+    assert RoundOrchestrator._docking_stage_payload(payload, "vina_local_docking", "vina") == payload
+    assert RoundOrchestrator._docking_stage_payload(
+        payload, "vina_local_docking", "gnina"
+    ) == {
+        "status": "not_executed",
+        "execution_mode": "not_executed",
+        "warnings": ["gnina_not_selected_by_docking_adapter"],
+    }

@@ -10,6 +10,7 @@ from medagent.core.config import Settings
 from medagent.db.models import Base, Molecule, Project, Target, TargetDrugLibrary
 from medagent.db.session import build_engine, build_session_factory
 from medagent.services.bootstrap import seed_builtin_targets
+from medagent.services.target_resource_packages import seed_golden_target_resource_packages
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ def initialize_database(settings: Settings) -> dict:
     session_factory = build_session_factory(settings)
     with session_factory() as db:
         seed_builtin_targets(db)
+        seed_golden_target_resource_packages(db)
+        db.commit()
         return database_summary(db)
 
 
@@ -156,6 +159,7 @@ def _target_drug_library_columns(dialect_name: str) -> list[tuple[str, str]]:
 
 def _binding_site_columns(dialect_name: str) -> list[tuple[str, str]]:
     json_type = "JSONB DEFAULT '{}'::jsonb" if dialect_name == "postgresql" else "JSON DEFAULT '{}'"
+    json_list = "JSONB DEFAULT '[]'::jsonb" if dialect_name == "postgresql" else "JSON DEFAULT '[]'"
     return [
         ("project_id", "VARCHAR(80)"),
         ("source_file_id", "VARCHAR(80)"),
@@ -163,6 +167,13 @@ def _binding_site_columns(dialect_name: str) -> list[tuple[str, str]]:
         ("prepared_receptor_file", "TEXT"),
         ("preparation_status", "VARCHAR(80) DEFAULT 'uploaded'"),
         ("preparation_json", json_type),
+        ("structure_id", "VARCHAR(80)"),
+        ("reference_ligand_id", "VARCHAR(80)"),
+        ("pocket_residues_json", json_list),
+        ("pocket_method", "VARCHAR(80)"),
+        ("validation_status", "VARCHAR(80) DEFAULT 'unvalidated'"),
+        ("redock_rmsd", "FLOAT"),
+        ("artifact_id", "VARCHAR(80)"),
     ]
 
 

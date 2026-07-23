@@ -305,6 +305,14 @@ class RoundOrchestrator:
             "round_id": round_obj.round_id,
             "skip_ranking": True,
         }
+        execution_snapshot = dict(
+            getattr(round_obj, "execution_config_snapshot_json", None) or {}
+        )
+        scientific_preflight = execution_snapshot.get("scientific_preflight")
+        if scientific_preflight:
+            from medagent.services.scientific_workflow import stage_permissions
+
+            assessment_kwargs["stage_permissions"] = stage_permissions(scientific_preflight)
         if assessment_config:
             mode = assessment_config.get("assessment_mode", assessment_config.get("mode"))
             if mode:
@@ -398,47 +406,194 @@ class RoundOrchestrator:
             "assessment_config": assessment_config or {},
             "seed_molecule_ids": effective_seed_ids,
         }
+        from medagent.services.scientific_workflow import prepare_round_preflight
+
+        scientific_preflight = prepare_round_preflight(
+            db,
+            project,
+            round_obj,
+            formal_round=bool((assessment_config or {}).get("formal_round", False)),
+            require_external_evidence_for_ranking=bool(
+                (assessment_config or {}).get("require_external_evidence_for_ranking", False)
+            ),
+        )
+        if not scientific_preflight["plan"]["formal_round_allowed"]:
+            self.fail_round(db, round_obj)
+            return {
+                "round_id": round_obj.round_id,
+                "round_number": round_obj.round_number,
+                "status": "blocked",
+                "blockers": scientific_preflight["plan"]["blockers"],
+                "scientific_preflight": scientific_preflight,
+            }
+        execution_config["scientific_preflight"] = scientific_preflight
         self.start_round(db, round_obj, execution_config)
+        from medagent.services.scientific_workflow import (
+            queue_round_jobs,
+            record_round_stage_outcome,
+            start_round_stage_job,
+        )
+
+        jobs = queue_round_jobs(db, project, round_obj, scientific_preflight)
+        parent_packet_id = scientific_preflight["strategy_packet_id"]
+        start_round_stage_job(db, jobs["prepare_target_resource"])
+        resource_audit = record_round_stage_outcome(
+            db,
+            project=project,
+            round_obj=round_obj,
+            preflight=scientific_preflight,
+            stage="prepare_target_resource",
+            job=jobs["prepare_target_resource"],
+            parent_packet_id=parent_packet_id,
+            payload=scientific_preflight["snapshot"].get("target_resource") or {},
+        )
+        parent_packet_id = resource_audit["packet_id"] or parent_packet_id
 
         campaigns: dict[str, CampaignRun] = {}
+        target_resource = scientific_preflight["snapshot"].get("target_resource") or {}
+        tools = scientific_preflight["snapshot"].get("tools") or {}
 
         # CReM
+        start_round_stage_job(db, jobs["generate_candidates"])
         if campaign_config.crem.enabled:
-            campaigns["crem"] = self.run_crem_campaign(
-                db,
-                project,
-                round_obj,
-                campaign_config.crem,
-                effective_seeds,
-                effective_seed_ids,
-            )
+            if bool((tools.get("crem") or {}).get("available")):
+                campaigns["crem"] = self.run_crem_campaign(
+                    db,
+                    project,
+                    round_obj,
+                    campaign_config.crem,
+                    effective_seeds,
+                    effective_seed_ids,
+                )
+            else:
+                campaigns["crem"] = self._create_blocked_campaign(
+                    db, project, round_obj, "crem", campaign_config.crem.model_dump(),
+                    effective_seed_ids, "crem_unavailable"
+                )
 
         # TargetDiff
         if campaign_config.targetdiff.enabled:
-            campaigns["targetdiff"] = self.run_targetdiff_campaign(
-                db, project, round_obj, campaign_config.targetdiff,
-                effective_seeds, effective_seed_ids
-            )
+            if (
+                target_resource.get("verified_pocket")
+                and target_resource.get("targetdiff_pocket")
+                and bool((tools.get("targetdiff") or {}).get("available"))
+            ):
+                campaigns["targetdiff"] = self.run_targetdiff_campaign(
+                    db, project, round_obj, campaign_config.targetdiff,
+                    effective_seeds, effective_seed_ids
+                )
+            else:
+                campaigns["targetdiff"] = self._create_blocked_campaign(
+                    db, project, round_obj, "targetdiff", campaign_config.targetdiff.model_dump(),
+                    effective_seed_ids, "targetdiff_blocked_by_execution_plan"
+                )
 
         # AutoGrow4
         if campaign_config.autogrow4.enabled:
-            campaigns["autogrow4"] = self.run_autogrow4_campaign(
-                db,
-                project,
-                round_obj,
-                campaign_config.autogrow4,
-                effective_seeds,
-                effective_seed_ids,
-            )
+            if (
+                target_resource.get("verified_pocket")
+                and target_resource.get("prepared_receptor")
+                and bool((tools.get("autogrow4") or {}).get("available"))
+            ):
+                campaigns["autogrow4"] = self.run_autogrow4_campaign(
+                    db,
+                    project,
+                    round_obj,
+                    campaign_config.autogrow4,
+                    effective_seeds,
+                    effective_seed_ids,
+                )
+            else:
+                campaigns["autogrow4"] = self._create_blocked_campaign(
+                    db, project, round_obj, "autogrow4", campaign_config.autogrow4.model_dump(),
+                    effective_seed_ids, "autogrow4_blocked_by_execution_plan"
+                )
+
+        generation_audit = record_round_stage_outcome(
+            db,
+            project=project,
+            round_obj=round_obj,
+            preflight=scientific_preflight,
+            stage="generate_candidates",
+            job=jobs["generate_candidates"],
+            parent_packet_id=parent_packet_id,
+            payload={
+                "completed_campaign_count": sum(
+                    campaign.status == CAMPAIGN_COMPLETED for campaign in campaigns.values()
+                ),
+                "campaigns": {
+                    name: {
+                        "campaign_run_id": campaign.campaign_run_id,
+                        "status": campaign.status,
+                        "warnings": campaign.warnings_json or [],
+                    }
+                    for name, campaign in campaigns.items()
+                },
+                "execution_mode": "local_generation",
+            },
+        )
+        parent_packet_id = generation_audit["packet_id"] or parent_packet_id
 
         # 收集候选
         candidates = self.collect_round_candidates(db, project, round_obj)
 
         # 评估
+        for stage in ("vina_screen", "gnina_refine", "admet_batch", "retrosynthesis_batch"):
+            start_round_stage_job(db, jobs[stage])
         assessment_result = self.run_round_assessment(db, project, round_obj, assessment_config)
+        docking_payload = assessment_result.get("docking") or {}
+        docking_adapter_mode = str(docking_payload.get("adapter_mode") or "").lower()
+        stage_payloads = {
+            "vina_screen": self._docking_stage_payload(
+                docking_payload, docking_adapter_mode, "vina"
+            ),
+            "gnina_refine": self._docking_stage_payload(
+                docking_payload, docking_adapter_mode, "gnina"
+            ),
+            "admet_batch": assessment_result.get("admet") or {},
+            "retrosynthesis_batch": assessment_result.get("synthesis") or {},
+        }
+        for stage, payload in stage_payloads.items():
+            audit = record_round_stage_outcome(
+                db,
+                project=project,
+                round_obj=round_obj,
+                preflight=scientific_preflight,
+                stage=stage,
+                job=jobs[stage],
+                parent_packet_id=parent_packet_id,
+                payload=payload,
+            )
+            parent_packet_id = audit["packet_id"] or parent_packet_id
 
-        # 排名
-        ranking_result = self.run_round_ranking(db, project, round_obj)
+        # 排名。被执行计划阻断时保留一个 L0 审计结果，绝不把仅有 L1
+        # 近似结果伪装成满足外部证据门槛的正式排序。
+        ranking_stage = next(
+            item
+            for item in scientific_preflight["plan"]["stages"]
+            if item["stage"] == "ranking"
+        )
+        start_round_stage_job(db, jobs["ranking"])
+        if ranking_stage["allowed"]:
+            ranking_result = self.run_round_ranking(db, project, round_obj)
+        else:
+            ranking_result = {
+                "status": "blocked",
+                "reason_codes": ranking_stage.get("reason_codes", []),
+                "warnings": ranking_stage.get("warnings", []),
+                "execution_mode": "evidence_gated_ranking",
+            }
+        ranking_audit = record_round_stage_outcome(
+            db,
+            project=project,
+            round_obj=round_obj,
+            preflight=scientific_preflight,
+            stage="ranking",
+            job=jobs["ranking"],
+            parent_packet_id=parent_packet_id,
+            payload=ranking_result,
+        )
+        parent_packet_id = ranking_audit["packet_id"] or parent_packet_id
 
         # 自我反驳
         refutation_result = self.run_round_self_refutation(db, project, round_obj)
@@ -447,7 +602,18 @@ class RoundOrchestrator:
         self.complete_round(db, round_obj)
 
         # 持久化本轮报告快照，后续即使数据继续变化也能审计当时结果。
+        start_round_stage_job(db, jobs["build_round_report"])
         persisted_report = self._persist_round_report(db, project, round_obj)
+        record_round_stage_outcome(
+            db,
+            project=project,
+            round_obj=round_obj,
+            preflight=scientific_preflight,
+            stage="build_round_report",
+            job=jobs["build_round_report"],
+            parent_packet_id=parent_packet_id,
+            payload={"report_id": persisted_report.report_id, "execution_mode": "reporting"},
+        )
 
         # 创建下一轮 draft 并生成待确认策略，不自动执行。
         next_round = self.create_round_draft(
@@ -498,6 +664,42 @@ class RoundOrchestrator:
         db.add(campaign)
         db.flush()
         return campaign
+
+    def _create_blocked_campaign(
+        self,
+        db: Session,
+        project: Project,
+        round_obj: ProjectRound,
+        method: str,
+        config: dict[str, Any],
+        input_molecule_ids: list[str],
+        warning: str,
+    ) -> CampaignRun:
+        campaign = self._create_campaign_run(
+            db, project, round_obj, method, config, input_molecule_ids
+        )
+        campaign.status = CAMPAIGN_FAILED
+        campaign.warnings_json = [warning]
+        campaign.completed_at = datetime.now(UTC)
+        db.flush()
+        return campaign
+
+    @staticmethod
+    def _docking_stage_payload(
+        payload: dict[str, Any],
+        adapter_mode: str,
+        expected_tool: str,
+    ) -> dict[str, Any]:
+        """Keep Vina and GNINA manifests tied to the tool that actually ran."""
+        if adapter_mode and expected_tool not in adapter_mode and (
+            "vina" in adapter_mode or "gnina" in adapter_mode
+        ):
+            return {
+                "status": "not_executed",
+                "execution_mode": "not_executed",
+                "warnings": [f"{expected_tool}_not_selected_by_docking_adapter"],
+            }
+        return payload
 
     def _store_agent_molecules(
         self,

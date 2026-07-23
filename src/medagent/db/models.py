@@ -95,6 +95,14 @@ class BindingSite(TimestampMixin, Base):
     key_residues: Mapped[list[str]] = mapped_column(JSON, default=list)
     grid_box: Mapped[dict] = mapped_column(JSON, default=dict)
     preparation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Reproducible structure/pocket fields. Existing user-created sites remain valid.
+    structure_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    reference_ligand_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    pocket_residues_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    pocket_method: Mapped[str | None] = mapped_column(String(80))
+    validation_status: Mapped[str] = mapped_column(String(80), default="unvalidated")
+    redock_rmsd: Mapped[float | None] = mapped_column(Float)
+    artifact_id: Mapped[str | None] = mapped_column(String(80), index=True)
 
 
 class SeedLigand(TimestampMixin, Base):
@@ -523,3 +531,313 @@ class RoundReport(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(40), default="completed")
     report_json: Mapped[dict] = mapped_column(JSON, default=dict)
     generated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+
+# ---------------------------------------------------------------------------
+# Scientific execution and data provenance
+# ---------------------------------------------------------------------------
+
+
+class SourceRelease(TimestampMixin, Base):
+    """An immutable imported source release; imports must never overwrite it."""
+
+    __tablename__ = "source_releases"
+    __table_args__ = (UniqueConstraint("source_name", "release_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_release_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    source_name: Mapped[str] = mapped_column(String(120), index=True)
+    release_name: Mapped[str] = mapped_column(String(160))
+    release_date: Mapped[datetime | None] = mapped_column(DateTime)
+    source_url: Mapped[str | None] = mapped_column(Text)
+    license_name: Mapped[str | None] = mapped_column(String(240))
+    license_url: Mapped[str | None] = mapped_column(Text)
+    downloaded_at: Mapped[datetime | None] = mapped_column(DateTime)
+    file_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    record_count: Mapped[int | None] = mapped_column(Integer)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class TargetExternalId(TimestampMixin, Base):
+    __tablename__ = "target_external_ids"
+    __table_args__ = (
+        UniqueConstraint("target_id", "namespace", "external_id", "source_release_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    namespace: Mapped[str] = mapped_column(String(80))
+    external_id: Mapped[str] = mapped_column(String(160))
+    taxon_id: Mapped[int | None] = mapped_column(Integer)
+    isoform: Mapped[str | None] = mapped_column(String(80))
+    source_release_id: Mapped[str] = mapped_column(
+        ForeignKey("source_releases.source_release_id"), index=True
+    )
+
+
+class TargetStructure(TimestampMixin, Base):
+    __tablename__ = "target_structures"
+    __table_args__ = (
+        UniqueConstraint("source", "source_structure_id", "source_release_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    structure_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    source: Mapped[str] = mapped_column(String(80))
+    source_structure_id: Mapped[str] = mapped_column(String(80), index=True)
+    assembly_id: Mapped[str | None] = mapped_column(String(80))
+    experimental_method: Mapped[str | None] = mapped_column(String(120))
+    resolution: Mapped[float | None] = mapped_column(Float)
+    is_experimental: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_preferred: Mapped[bool] = mapped_column(Boolean, default=False)
+    quality_status: Mapped[str] = mapped_column(String(80), default="metadata_only")
+    source_release_id: Mapped[str] = mapped_column(
+        ForeignKey("source_releases.source_release_id"), index=True
+    )
+
+
+class StructureChain(TimestampMixin, Base):
+    __tablename__ = "structure_chains"
+    __table_args__ = (UniqueConstraint("structure_id", "chain_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    structure_id: Mapped[str] = mapped_column(ForeignKey("target_structures.structure_id"), index=True)
+    chain_id: Mapped[str] = mapped_column(String(16))
+    uniprot_accession: Mapped[str | None] = mapped_column(String(80), index=True)
+    uniprot_start: Mapped[int | None] = mapped_column(Integer)
+    uniprot_end: Mapped[int | None] = mapped_column(Integer)
+    sequence_identity: Mapped[float | None] = mapped_column(Float)
+    is_target_chain: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Compound(TimestampMixin, Base):
+    __tablename__ = "compounds"
+    __table_args__ = (UniqueConstraint("inchi_key", "source_release_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    compound_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    canonical_smiles: Mapped[str] = mapped_column(Text)
+    isomeric_smiles: Mapped[str | None] = mapped_column(Text)
+    inchi_key: Mapped[str | None] = mapped_column(String(120), index=True)
+    parent_inchi_key: Mapped[str | None] = mapped_column(String(120), index=True)
+    standardization_version: Mapped[str | None] = mapped_column(String(80))
+    molecular_weight: Mapped[float | None] = mapped_column(Float)
+    source_release_id: Mapped[str] = mapped_column(
+        ForeignKey("source_releases.source_release_id"), index=True
+    )
+
+
+class Assay(TimestampMixin, Base):
+    __tablename__ = "assays"
+    __table_args__ = (UniqueConstraint("source", "source_assay_id", "source_release_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assay_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(80))
+    source_assay_id: Mapped[str] = mapped_column(String(160))
+    target_id: Mapped[str | None] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    assay_type: Mapped[str | None] = mapped_column(String(80))
+    target_confidence: Mapped[float | None] = mapped_column(Float)
+    organism: Mapped[str | None] = mapped_column(String(120))
+    description: Mapped[str | None] = mapped_column(Text)
+    document_ref: Mapped[str | None] = mapped_column(String(240))
+    source_release_id: Mapped[str] = mapped_column(
+        ForeignKey("source_releases.source_release_id"), index=True
+    )
+
+
+class Bioactivity(TimestampMixin, Base):
+    """A raw activity measurement, never deduplicated only by target and compound."""
+
+    __tablename__ = "bioactivities"
+    __table_args__ = (UniqueConstraint("source", "source_record_id", "source_release_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    activity_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(80))
+    source_record_id: Mapped[str] = mapped_column(String(160))
+    compound_id: Mapped[str] = mapped_column(ForeignKey("compounds.compound_id"), index=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    assay_id: Mapped[str] = mapped_column(ForeignKey("assays.assay_id"), index=True)
+    activity_type: Mapped[str] = mapped_column(String(40))
+    relation: Mapped[str | None] = mapped_column(String(8))
+    value: Mapped[float | None] = mapped_column(Float)
+    unit: Mapped[str | None] = mapped_column(String(40))
+    p_activity: Mapped[float | None] = mapped_column(Float)
+    is_direct_binding: Mapped[bool] = mapped_column(Boolean, default=False)
+    quality_tier: Mapped[str] = mapped_column(String(8), default="D")
+    source_release_id: Mapped[str] = mapped_column(
+        ForeignKey("source_releases.source_release_id"), index=True
+    )
+
+
+class ScientificArtifact(TimestampMixin, Base):
+    __tablename__ = "scientific_artifacts"
+    __table_args__ = (UniqueConstraint("sha256", "uri"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    artifact_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    artifact_type: Mapped[str] = mapped_column(String(80))
+    uri: Mapped[str] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    producer_tool: Mapped[str | None] = mapped_column(String(120))
+    producer_version: Mapped[str | None] = mapped_column(String(120))
+    source_release_id: Mapped[str | None] = mapped_column(
+        ForeignKey("source_releases.source_release_id"), index=True
+    )
+
+
+class TargetResourceLink(TimestampMixin, Base):
+    __tablename__ = "target_resource_links"
+    __table_args__ = (UniqueConstraint("target_id", "artifact_id", "role"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("scientific_artifacts.artifact_id"), index=True)
+    role: Mapped[str] = mapped_column(String(80))
+    structure_id: Mapped[str | None] = mapped_column(ForeignKey("target_structures.structure_id"), index=True)
+    binding_site_id: Mapped[str | None] = mapped_column(ForeignKey("binding_sites.binding_site_id"), index=True)
+    is_preferred: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class TargetResourcePackage(TimestampMixin, Base):
+    """A compact readiness record for a target's executable resource package."""
+
+    __tablename__ = "target_resource_packages"
+    __table_args__ = (UniqueConstraint("target_id", "package_version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("targets.target_id"), index=True)
+    package_version: Mapped[str] = mapped_column(String(80), default="v1")
+    uniprot_accession: Mapped[str | None] = mapped_column(String(80))
+    primary_structure_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    binding_site_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    reference_ligand_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(80), default="metadata_ready")
+    completeness_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_release_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    warnings: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+
+class CapabilitySnapshotRecord(TimestampMixin, Base):
+    __tablename__ = "capability_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionPlanRecord(TimestampMixin, Base):
+    __tablename__ = "execution_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    plan_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    capability_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("capability_snapshots.snapshot_id"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(40), default="planned")
+    plan_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionManifest(TimestampMixin, Base):
+    __tablename__ = "execution_manifests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    manifest_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    manifest_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    job_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    stage: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(40))
+    request_hash: Mapped[str] = mapped_column(String(64), index=True)
+    policy_name: Mapped[str] = mapped_column(String(120), default="scientific_execution")
+    policy_version: Mapped[str] = mapped_column(String(80), default="1.0")
+    capability_snapshot_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    source_release_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    command: Mapped[list[str]] = mapped_column(JSON, default=list)
+    environment_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    input_artifacts: Mapped[dict] = mapped_column(JSON, default=dict)
+    output_artifacts: Mapped[dict] = mapped_column(JSON, default=dict)
+    stdout: Mapped[str | None] = mapped_column(Text)
+    stderr: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ScientificJob(TimestampMixin, Base):
+    __tablename__ = "scientific_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    stage: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="queued", index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    input_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    claimed_by: Mapped[str | None] = mapped_column(String(160))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class WorkflowPacket(TimestampMixin, Base):
+    __tablename__ = "workflow_packets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    packet_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    packet_type: Mapped[str] = mapped_column(String(80), index=True)
+    packet_version: Mapped[int] = mapped_column(Integer, default=1)
+    parent_packet_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    input_hash: Mapped[str] = mapped_column(String(64), index=True)
+    parameter_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ScientificPolicy(TimestampMixin, Base):
+    __tablename__ = "scientific_policies"
+    __table_args__ = (UniqueConstraint("policy_name", "policy_version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    policy_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    policy_name: Mapped[str] = mapped_column(String(120))
+    policy_version: Mapped[str] = mapped_column(String(80))
+    ranking_weights: Mapped[dict] = mapped_column(JSON, default=dict)
+    hard_constraints: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_requirements: Mapped[dict] = mapped_column(JSON, default=dict)
+    allowed_fallbacks: Mapped[dict] = mapped_column(JSON, default=dict)
+    budget_limits: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ApprovalEvent(TimestampMixin, Base):
+    __tablename__ = "approval_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    approval_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id"), index=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("project_rounds.round_id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(120), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    requested_by: Mapped[str | None] = mapped_column(String(120))
+    decided_by: Mapped[str | None] = mapped_column(String(120))
+    rationale: Mapped[str | None] = mapped_column(Text)
+    request_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    decision_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime)

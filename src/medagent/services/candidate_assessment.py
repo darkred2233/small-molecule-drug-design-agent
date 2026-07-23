@@ -238,10 +238,15 @@ def run_project_candidate_assessment(
     skip_synthesis: bool = False,
     skip_ranking: bool = False,
     round_id: str | None = None,
+    stage_permissions: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     assessment_mode = _normalize_assessment_mode(assessment_mode)
     molecules = _select_assessment_molecules(db, project, molecule_ids, max_molecules, round_id)
     tool_status = candidate_assessment_tool_status()
+    permissions = dict(stage_permissions or {})
+    allow_external_docking = permissions.get("docking", True)
+    allow_external_admet = permissions.get("admet", True)
+    allow_external_synthesis = permissions.get("synthesis", True)
     ranking_top_n = top_n or max_molecules
     conformer = generate_project_conformers(db, project, molecules, tool_status, round_id=round_id)
     docking = (
@@ -319,7 +324,7 @@ def run_project_candidate_assessment(
             _mark_coarse_screen_summary(synthesis, coarse_screen, assessment_mode, len(refinement_molecules))
         if refinement_molecules:
             docking_refinement = None
-            if not skip_docking:
+            if not skip_docking and allow_external_docking:
                 docking_refinement = run_project_docking(
                     db,
                     project,
@@ -335,7 +340,7 @@ def run_project_candidate_assessment(
                     round_id=round_id,
                 )
             admet_refinement = None
-            if not skip_admet:
+            if not skip_admet and allow_external_admet:
                 admet_refinement = run_project_admet(
                     db,
                     project,
@@ -346,7 +351,11 @@ def run_project_candidate_assessment(
                     round_id=round_id,
                 )
             synthesis_refinement = None
-            if not skip_synthesis and enable_external_synthesis_routes:
+            if (
+                not skip_synthesis
+                and enable_external_synthesis_routes
+                and allow_external_synthesis
+            ):
                 synthesis_refinement = run_project_synthesis(
                     db,
                     project,
@@ -360,9 +369,24 @@ def run_project_candidate_assessment(
             elif not skip_synthesis:
                 synthesis.warnings = _dedupe(
                     synthesis.warnings
-                    + ["external_retrosynthesis_skipped_by_synthesis_route_scope"]
+                    + [
+                        "external_retrosynthesis_skipped_by_execution_plan"
+                        if not allow_external_synthesis
+                        else "external_retrosynthesis_skipped_by_synthesis_route_scope"
+                    ]
                 )
-            _apply_external_refinement_labels(db, coarse_passed_molecules, refinement_molecules, round_id=round_id)
+            if not skip_docking and not allow_external_docking:
+                docking.warnings = _dedupe(
+                    docking.warnings + ["external_docking_blocked_by_execution_plan"]
+                )
+            if not skip_admet and not allow_external_admet:
+                admet.warnings = _dedupe(
+                    admet.warnings + ["external_admet_blocked_by_execution_plan"]
+                )
+            if docking_refinement or admet_refinement or synthesis_refinement:
+                _apply_external_refinement_labels(
+                    db, coarse_passed_molecules, refinement_molecules, round_id=round_id
+                )
             refinement_scope = "top_n" if assessment_mode == "external" else "full"
             if docking_refinement is not None:
                 _mark_external_refinement_summary(docking, docking_refinement, refinement_scope=refinement_scope)
@@ -392,6 +416,7 @@ def run_project_candidate_assessment(
         "assessment_mode": assessment_mode,
         "external_top_n": external_top_n,
         "external_synthesis_routes_enabled": enable_external_synthesis_routes,
+        "execution_plan_permissions": permissions,
         "skipped_stages": [
             stage
             for stage, skipped in (

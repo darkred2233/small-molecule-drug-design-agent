@@ -90,6 +90,8 @@ from medagent.services.bootstrap import (
     seed_builtin_targets,
     seed_project_target_ligands,
 )
+from medagent.services.target_resource_packages import seed_golden_target_resource_packages
+from medagent.api.scientific_router import router as scientific_router
 from medagent.services.candidate_assessment import (
     list_project_admet_results,
     list_project_conformer_results,
@@ -147,6 +149,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ensure_relational_schema(engine)
         with session_factory() as db:
             seed_builtin_targets(db)
+            seed_golden_target_resource_packages(db)
+            db.commit()
         yield
 
     app = FastAPI(
@@ -1708,6 +1712,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(tools_router)
     app.include_router(rounds_router)
     app.include_router(resources_router)
+    app.include_router(scientific_router)
 
     return app
 
