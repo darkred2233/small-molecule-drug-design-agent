@@ -2,6 +2,15 @@
 # Environment variables named MEDAGENT_<TOOL>_COMMAND / _PYTHON / _WORKDIR override
 # these values for a workstation without modifying this file.
 tools:
+  p2rank:
+    command: .local/tools/p2rank_2.5.1/prank.bat
+    python_executable: .local/tools/temurin-17-jre/bin/java.exe
+    working_directory: .local/tools/p2rank_2.5.1
+    timeout_seconds: 600
+    required_paths:
+      - .local/tools/p2rank_2.5.1/prank.bat
+      - .local/tools/p2rank_2.5.1/bin/p2rank.jar
+      - .local/tools/temurin-17-jre/bin/java.exe
   gnina:
     runtime: wsl
     wsl_distribution: Ubuntu

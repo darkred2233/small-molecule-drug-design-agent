@@ -80,5 +80,5 @@ def test_preflight_freezes_capabilities_and_blocks_unprepared_structural_stages(
     stages = {item["stage"]: item for item in preflight["plan"]["stages"]}
     assert preflight["plan"]["formal_round_allowed"] is True
     assert stages["vina_screen"]["allowed"] is False
-    assert "verified_pocket_required" in stages["vina_screen"]["reason_codes"]
+    assert "pocket_predicted_required" in stages["vina_screen"]["reason_codes"]
     assert preflight["target_resource_packet_id"].startswith("PACKET-")

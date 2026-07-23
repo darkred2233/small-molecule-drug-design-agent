@@ -60,6 +60,8 @@ from medagent.domain.schemas import (
     ProjectCreate,
     ProjectRead,
     ProjectStatus,
+    P2RankPredictRequest,
+    P2RankPredictResponse,
     EvidenceLinkRead,
     RagBuildRequest,
     RagBuildResponse,
@@ -131,6 +133,7 @@ from medagent.services.receptor_preparation import (
     list_project_binding_sites,
     prepare_project_receptor,
 )
+from medagent.services.p2rank_adapter import run_project_p2rank
 from medagent.services.rule_filtering import filter_project_molecules
 
 SessionLocal: sessionmaker[Session]
@@ -1242,6 +1245,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return binding_site_to_payload(result.binding_site)
+
+    @app.post(
+        "/projects/{project_id}/p2rank/predict",
+        response_model=P2RankPredictResponse,
+        tags=["pocket-prediction"],
+        summary="Predict binding pockets from a project receptor",
+    )
+    def predict_pockets(
+        project_id: str,
+        payload: P2RankPredictRequest,
+        db: Session = Depends(get_db),
+    ):
+        project = _get_project(db, project_id)
+        try:
+            result = run_project_p2rank(db, app_settings, project, payload.source_file_id)
+            db.commit()
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            **result.as_dict(),
+            "binding_sites": [binding_site_to_payload(site) for site in result.binding_sites],
+        }
 
     @app.get(
         "/projects/{project_id}/binding-sites",

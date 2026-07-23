@@ -276,6 +276,19 @@ class ReceptorPrepareRequest(BaseModel):
     prepare_for_vina: bool = Field(default=True, title="Prepare receptor for Vina PDBQT")
 
 
+class P2RankPredictRequest(BaseModel):
+    source_file_id: str = Field(min_length=1, title="Project-owned PDB receptor file id")
+
+
+class P2RankPredictResponse(BaseModel):
+    status: str = Field(title="P2Rank execution status")
+    warnings: list[str] = Field(default_factory=list, title="Prediction warnings")
+    binding_sites: list["BindingSiteRead"] = Field(default_factory=list, title="Predicted binding sites")
+    manifest_id: str | None = Field(default=None, title="Execution manifest id")
+    output_directory: str | None = Field(default=None, title="Controlled output directory")
+    input_status: str = Field(title="Scientific input status")
+
+
 class BindingSiteRead(BaseModel):
     binding_site_id: str = Field(title="Binding site id")
     project_id: str | None = Field(title="Project id")

@@ -28,6 +28,7 @@ from medagent.services.docking_adapters import (
     run_external_docking,
 )
 from medagent.services.rdkit_enhanced import validate_and_calculate_enhanced
+from medagent.services.p2rank_adapter import p2rank_tool_status
 from medagent.services.targetdiff_adapter import targetdiff_tool_status
 
 
@@ -45,6 +46,7 @@ class ToolStatusResponse(BaseModel):
     gnina: dict[str, Any] = Field(description="GNINA状态")
     vina: dict[str, Any] = Field(description="Vina状态")
     targetdiff: dict[str, Any] = Field(description="TargetDiff状态")
+    p2rank: dict[str, Any] = Field(description="P2Rank状态")
     autogrow4: dict[str, Any] = Field(description="AutoGrow4状态")
     aizynthfinder: dict[str, Any] = Field(description="AiZynthFinder状态")
     summary: dict[str, Any] = Field(description="汇总信息")
@@ -146,6 +148,7 @@ async def get_tools_status():
 
     # 检查生成工具
     targetdiff_status = targetdiff_tool_status()
+    p2rank_status = p2rank_tool_status()
     autogrow4_status = autogrow4_tool_status()
     aizynthfinder_status = aizynthfinder_tool_status()
 
@@ -156,6 +159,7 @@ async def get_tools_status():
         gnina_status.get("available", False),
         vina_status.get("available", False),
         targetdiff_status.get("available", False),
+        p2rank_status.get("available", False),
         autogrow4_status.get("available", False),
         aizynthfinder_status.get("available", False),
     ])
@@ -166,10 +170,11 @@ async def get_tools_status():
         gnina=gnina_status,
         vina=vina_status,
         targetdiff=targetdiff_status,
+        p2rank=p2rank_status,
         autogrow4=autogrow4_status,
         aizynthfinder=aizynthfinder_status,
         summary={
-            "total_tools": 7,
+            "total_tools": 8,
             "available_tools": available_count,
             "critical_missing": [] if rdkit_status.get("available") else ["RDKit"],
         }

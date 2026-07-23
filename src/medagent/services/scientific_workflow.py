@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from medagent.db.models import Project, ProjectRound
+from medagent.db.models import BindingSite, Project, ProjectRound, ScientificArtifact
 from medagent.services.scientific_execution import CapabilitySnapshot, build_execution_plan
 from medagent.services.scientific_persistence import (
     create_job,
@@ -30,6 +31,7 @@ def collect_tool_capabilities() -> dict[str, dict[str, Any]]:
     from medagent.services.autogrow4_adapter import autogrow4_tool_status
     from medagent.services.docking_adapters import check_gnina_available, check_vina_available
     from medagent.services.molecule_generation import generation_tool_status
+    from medagent.services.p2rank_adapter import p2rank_tool_status
     from medagent.services.targetdiff_adapter import targetdiff_tool_status
 
     generation = generation_tool_status()
@@ -37,6 +39,7 @@ def collect_tool_capabilities() -> dict[str, dict[str, Any]]:
     return {
         "crem": dict(generation.get("crem") or {}),
         "targetdiff": dict(targetdiff_tool_status() or {}),
+        "p2rank": dict(p2rank_tool_status() or {}),
         "autogrow4": dict(autogrow4_tool_status() or {}),
         "vina": dict(check_vina_available() or {}),
         "gnina": dict(check_gnina_available() or {}),
@@ -59,6 +62,7 @@ def prepare_round_preflight(
     """Freeze capability/resource state and create immutable hand-off packets."""
     seed_golden_target_resource_packages(db)
     resource, release_ids = target_resource_readiness(db, project.target_id)
+    resource = _overlay_project_predicted_pocket(db, project, resource)
     tools = collect_tool_capabilities() if tool_capabilities is None else tool_capabilities
     runtime = {
         "wsl_available": any(
@@ -294,3 +298,54 @@ def _rdkit_capability() -> dict[str, Any]:
         return {"available": True, "version": getattr(rdkit, "__version__", None)}
     except ImportError:
         return {"available": False, "warning": "rdkit_not_installed"}
+
+
+def _overlay_project_predicted_pocket(
+    db: Session,
+    project: Project,
+    resource: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose the latest auditable project-local P2Rank pocket to its preflight.
+
+    Predicted pockets are deliberately project-scoped: an uploaded receptor is
+    not promoted into the target's shared resource package merely by running a
+    computational predictor.
+    """
+    effective_resource = dict(resource)
+    sites = (
+        db.query(BindingSite)
+        .filter_by(
+            project_id=project.project_id,
+            target_id=project.target_id,
+            preparation_status="pocket_predicted",
+        )
+        .order_by(BindingSite.created_at.desc(), BindingSite.id.desc())
+        .all()
+    )
+    for site in sites:
+        pocket_file = str((site.grid_box or {}).get("pocket_file") or "")
+        pocket_path = Path(pocket_file.removeprefix("local://"))
+        artifact = (
+            db.query(ScientificArtifact).filter_by(artifact_id=site.artifact_id).one_or_none()
+            if site.artifact_id
+            else None
+        )
+        if not pocket_file or not pocket_path.is_file() or artifact is None or not artifact.sha256:
+            continue
+
+        warnings = list(effective_resource.get("warnings") or [])
+        if "predicted_not_experimentally_validated" not in warnings:
+            warnings.append("predicted_not_experimentally_validated")
+        effective_resource.update(
+            {
+                "package_status": "pocket_predicted",
+                "binding_site_id": site.binding_site_id,
+                "pocket_predicted": True,
+                "targetdiff_pocket": True,
+                "pocket_file": pocket_file,
+                "artifact_hashes_complete": True,
+                "warnings": warnings,
+            }
+        )
+        return effective_resource
+    return effective_resource
