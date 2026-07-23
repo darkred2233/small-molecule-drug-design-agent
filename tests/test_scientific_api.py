@@ -65,3 +65,19 @@ def test_scientific_approval_can_be_decided_once(tmp_path):
             json={"approved": False, "decided_by": "reviewer"},
         )
         assert duplicate.status_code == 409
+
+
+def test_app_shutdown_releases_sqlite_database_for_end_to_end_cleanup(tmp_path):
+    database_path = tmp_path / "closed-loop.db"
+    settings = Settings(
+        database_url=f"sqlite:///{database_path}",
+        dashscope_api_key=None,
+        self_refutation_use_llm=False,
+    )
+
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/health").status_code == 200
+
+    # This unlink fails on Windows when a pooled SQLite connection survives shutdown.
+    database_path.unlink()
+    assert not database_path.exists()

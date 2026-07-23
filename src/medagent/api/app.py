@@ -151,7 +151,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             seed_builtin_targets(db)
             seed_golden_target_resource_packages(db)
             db.commit()
-        yield
+        try:
+            yield
+        finally:
+            # SQLite keeps pooled file handles open on Windows until the engine is disposed.
+            engine.dispose()
 
     app = FastAPI(
         title="小分子药物设计 Agent",
