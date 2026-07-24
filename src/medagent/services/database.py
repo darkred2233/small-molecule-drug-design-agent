@@ -120,6 +120,8 @@ def ensure_relational_schema(engine: Engine) -> None:
 
     if "projects" in table_names:
         _ensure_missing_columns(engine, "projects", [("target_name", "VARCHAR(120)")])
+        if "targets" in table_names:
+            _backfill_project_target_names(engine)
 
 
 def _ensure_missing_columns(
@@ -178,6 +180,30 @@ def _binding_site_columns(dialect_name: str) -> list[tuple[str, str]]:
         ("redock_rmsd", "FLOAT"),
         ("artifact_id", "VARCHAR(80)"),
     ]
+
+
+def _backfill_project_target_names(engine: Engine) -> None:
+    """Keep legacy project records readable after adding ``target_name``."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE projects
+                SET target_name = (
+                    SELECT name
+                    FROM targets
+                    WHERE targets.target_id = projects.target_id
+                )
+                WHERE target_name IS NULL
+                  AND target_id IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1
+                    FROM targets
+                    WHERE targets.target_id = projects.target_id
+                  )
+                """
+            )
+        )
 
 
 def _ranking_columns() -> list[tuple[str, str]]:

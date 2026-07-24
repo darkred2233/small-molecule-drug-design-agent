@@ -348,6 +348,7 @@ class RoundOrchestrator:
         db: Session,
         project: Project,
         round_obj: ProjectRound,
+        ranking_phase: str | None = None,
     ) -> dict:
         """按 round_id 生成排名。"""
         from medagent.services.candidate_ranking import generate_project_rankings
@@ -360,6 +361,7 @@ class RoundOrchestrator:
             max_molecules=len(molecules),
             top_n=len(molecules) or 1,
             round_id=round_obj.round_id,
+            ranking_phase=ranking_phase,
         )
         return summary.as_dict()
 
@@ -580,7 +582,9 @@ class RoundOrchestrator:
         )
         start_round_stage_job(db, jobs["ranking"])
         if ranking_stage["allowed"]:
-            self.run_round_ranking(db, project, round_obj)
+            self.run_round_ranking(
+                db, project, round_obj, ranking_phase="pre_refutation"
+            )
         else:
             ranking_result = {
                 "status": "blocked",
@@ -591,7 +595,9 @@ class RoundOrchestrator:
         # 本轮 critique 持久化后再次排名，最终结果和报告才能吸收最新反证。
         refutation_result = self.run_round_self_refutation(db, project, round_obj)
         if ranking_stage["allowed"]:
-            ranking_result = self.run_round_ranking(db, project, round_obj)
+            ranking_result = self.run_round_ranking(
+                db, project, round_obj, ranking_phase="post_refutation"
+            )
 
         ranking_audit = record_round_stage_outcome(
             db,

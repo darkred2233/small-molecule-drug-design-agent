@@ -164,12 +164,15 @@ def test_round_ranking_and_self_refutation_are_round_scoped(monkeypatch):
     project = SimpleNamespace(project_id="PROJ-ROUND")
     round_obj = SimpleNamespace(round_id="ROUND-002", round_number=2)
 
-    ranking = orch.run_round_ranking(None, project, round_obj)
+    ranking = orch.run_round_ranking(
+        None, project, round_obj, ranking_phase="post_refutation"
+    )
     refutation = orch.run_round_self_refutation(None, project, round_obj)
 
     assert ranking == {"ranking": "ok", "round_id": "ROUND-002"}
     assert ranking_kwargs["molecules"] == molecules
     assert ranking_kwargs["round_id"] == "ROUND-002"
+    assert ranking_kwargs["ranking_phase"] == "post_refutation"
     assert refutation == {"refutation": "ok", "round_id": "ROUND-002"}
     assert refutation_kwargs["round_id"] == "ROUND-002"
 
@@ -223,8 +226,8 @@ def test_run_round_reranks_after_current_self_refutation(monkeypatch):
     def fake_ranking(*args, **kwargs):
         nonlocal ranking_runs
         ranking_runs += 1
-        events.append("ranking")
-        return {"ranking_run": ranking_runs}
+        events.append(f"ranking:{kwargs['ranking_phase']}")
+        return {"ranking_run": ranking_runs, "ranking_phase": kwargs["ranking_phase"]}
 
     def fake_refutation(*args, **kwargs):
         events.append("self_refutation")
@@ -257,8 +260,12 @@ def test_run_round_reranks_after_current_self_refutation(monkeypatch):
         ),
     )
 
-    assert events == ["ranking", "self_refutation", "ranking"]
-    assert result["ranking"] == {"ranking_run": 2}
+    assert events == [
+        "ranking:pre_refutation",
+        "self_refutation",
+        "ranking:post_refutation",
+    ]
+    assert result["ranking"] == {"ranking_run": 2, "ranking_phase": "post_refutation"}
 
 
 def test_docking_stage_payload_does_not_promote_vina_to_gnina():

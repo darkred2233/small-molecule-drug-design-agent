@@ -2,6 +2,7 @@ import json
 import sqlite3
 
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
 
 import medagent.api.app as api_app
 from medagent.api.app import create_app
@@ -44,6 +45,7 @@ from medagent.db.models import (
     UploadedFile,
     WorkflowPacket,
 )
+from medagent.services.database import ensure_relational_schema
 
 
 def make_client(tmp_path):
@@ -129,6 +131,12 @@ def test_create_project_and_parse_constraints(tmp_path):
 
 def test_create_project_persists_a_custom_target_name_and_generated_id(tmp_path):
     with make_client(tmp_path) as client:
+        too_long = client.post(
+            "/projects",
+            json={"name": "Invalid custom target", "target_name": "X" * 121},
+        )
+        assert too_long.status_code == 422
+
         response = client.post(
             "/projects",
             json={
@@ -190,6 +198,53 @@ def test_app_adds_target_name_to_a_legacy_projects_table(tmp_path):
         }
 
     assert "target_name" in columns
+
+
+def test_legacy_project_target_name_is_backfilled_from_target(tmp_path):
+    db_path = tmp_path / "legacy-project-targets.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            create table projects (
+                id integer primary key,
+                project_id varchar(40) unique,
+                name varchar(200),
+                target_id varchar(80),
+                objective text,
+                status varchar(40),
+                constraints_json json,
+                created_at datetime,
+                updated_at datetime
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table targets (
+                id integer primary key,
+                target_id varchar(80) unique,
+                name varchar(120)
+            )
+            """
+        )
+        connection.execute(
+            "insert into targets (target_id, name) values (?, ?)",
+            ("TGT-LEGACY", "Legacy target"),
+        )
+        connection.execute(
+            "insert into projects (project_id, name, target_id) values (?, ?, ?)",
+            ("PROJ-LEGACY", "Legacy project", "TGT-LEGACY"),
+        )
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    ensure_relational_schema(engine)
+
+    with sqlite3.connect(db_path) as connection:
+        target_name = connection.execute(
+            "select target_name from projects where project_id = ?", ("PROJ-LEGACY",)
+        ).fetchone()[0]
+
+    assert target_name == "Legacy target"
 
 
 def test_project_router_uses_current_project_schema(tmp_path):

@@ -16,7 +16,7 @@ class SeedLigandInput(BaseModel):
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200, title="项目名称")
     target_id: str | None = Field(default=None, title="靶点编号")
-    target_name: str | None = Field(default=None, title="自定义靶点名称")
+    target_name: str | None = Field(default=None, max_length=120, title="自定义靶点名称")
     objective: str | None = Field(default=None, title="项目目标")
     constraints: dict[str, Any] = Field(default_factory=dict, title="初始约束")
     seed_ligands: list[SeedLigandInput] = Field(default_factory=list, title="项目样例/种子分子")

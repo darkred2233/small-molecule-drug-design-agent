@@ -46,6 +46,7 @@ class RankingSummary:
     failed_molecule_ids: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     round_id: str | None = None
+    ranking_phase: str | None = None
     execution_mode: str = "internal_heuristic"
     external_tools_requested: bool = False
     external_tools_enabled: bool = False
@@ -69,6 +70,7 @@ class RankingSummary:
             "failed_molecule_ids": self.failed_molecule_ids,
             "warnings": self.warnings,
             "round_id": self.round_id,
+            "ranking_phase": self.ranking_phase,
             "execution_mode": self.execution_mode,
             "external_tools_requested": self.external_tools_requested,
             "external_tools_enabled": self.external_tools_enabled,
@@ -120,6 +122,7 @@ def generate_project_rankings(
     top_n: int | None = None,
     tool_status: dict[str, Any] | None = None,
     round_id: str | None = None,
+    ranking_phase: str | None = None,
 ) -> RankingSummary:
     selected_molecules = molecules or _select_ranking_molecules(
         db,
@@ -141,6 +144,7 @@ def generate_project_rankings(
             "max_molecules": max_molecules,
             "top_n": top_n,
             "round_id": round_id,
+            "ranking_phase": ranking_phase,
             "source": "candidate_assessment",
             "tool_status": tool_status or {},
         },
@@ -151,6 +155,7 @@ def generate_project_rankings(
         adapter_mode=RANKING_ADAPTER_MODE,
         requested_count=len(selected_molecules),
         round_id=round_id,
+        ranking_phase=ranking_phase,
     )
 
     try:
