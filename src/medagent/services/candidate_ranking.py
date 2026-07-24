@@ -231,6 +231,12 @@ def _load_evidence_bundle(
     molecule: Molecule,
     round_id: str | None = None,
 ) -> EvidenceBundle:
+    critique_query = db.query(Critique).filter_by(molecule_id=molecule.molecule_id)
+    if round_id is None:
+        critique_query = critique_query.filter(Critique.round_id.is_(None))
+    else:
+        critique_query = critique_query.filter_by(round_id=round_id)
+
     return EvidenceBundle(
         properties=db.query(MoleculeProperty).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
         rule_filter=db.query(RuleFilterResult).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
@@ -249,7 +255,7 @@ def _load_evidence_bundle(
             .filter_by(molecule_id=molecule.molecule_id, round_id=round_id)
             .one_or_none()
         ),
-        critique=db.query(Critique).filter_by(molecule_id=molecule.molecule_id).one_or_none(),
+        critique=critique_query.one_or_none(),
         rag_evidence=(
             db.query(EvidenceLink)
             .filter_by(molecule_id=molecule.molecule_id)

@@ -582,16 +582,27 @@ class RoundOrchestrator:
         )
         start_round_stage_job(db, jobs["ranking"])
         if ranking_stage["allowed"]:
-            self.run_round_ranking(
+            pre_ranking_result = self.run_round_ranking(
                 db, project, round_obj, ranking_phase="pre_refutation"
             )
         else:
-            ranking_result = {
+            pre_ranking_result = {
                 "status": "blocked",
                 "reason_codes": ranking_stage.get("reason_codes", []),
                 "warnings": ranking_stage.get("warnings", []),
                 "execution_mode": "evidence_gated_ranking",
             }
+        pre_ranking_audit = record_round_stage_outcome(
+            db,
+            project=project,
+            round_obj=round_obj,
+            preflight=scientific_preflight,
+            stage="ranking",
+            parent_packet_id=parent_packet_id,
+            payload=pre_ranking_result,
+        )
+        parent_packet_id = pre_ranking_audit["packet_id"] or parent_packet_id
+
         # 本轮 critique 持久化后再次排名，最终结果和报告才能吸收最新反证。
         refutation_result = self.run_round_self_refutation(db, project, round_obj)
         if ranking_stage["allowed"]:

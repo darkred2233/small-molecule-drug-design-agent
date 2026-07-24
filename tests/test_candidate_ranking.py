@@ -7,6 +7,7 @@ from medagent.db.models import (
     ADMETResult,
     AgentRun,
     Base,
+    Critique,
     DockingResult,
     Molecule,
     MoleculeProperty,
@@ -172,6 +173,62 @@ def test_repeated_ranking_refresh_replaces_tracked_rows_without_identity_conflic
         rankings = db.query(Ranking).all()
         assert len(rankings) == 1
         assert rankings[0].molecule_id == molecule.molecule_id
+
+
+def test_ranking_uses_only_the_critique_from_its_round(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}")
+    engine = build_engine(settings)
+    Base.metadata.create_all(bind=engine)
+    session_factory = build_session_factory(settings)
+
+    with session_factory() as db:
+        project = Project(project_id="PROJ-RANKING-ROUND", name="Round ranking")
+        molecule = Molecule(
+            molecule_id="MOL-RANKING-ROUND",
+            project_id=project.project_id,
+            smiles="CCO",
+            status="candidate_assessed",
+            labels=[],
+        )
+        db.add_all(
+            [
+                project,
+                molecule,
+                Critique(
+                    critique_id="CRT-OLD",
+                    molecule_id=molecule.molecule_id,
+                    round_id="ROUND-OLD",
+                    con_score=95.0,
+                    risk_level="high",
+                    reason="Old-round rejection",
+                    evidence_ids=[],
+                    refutation_decision="reject",
+                ),
+                Critique(
+                    critique_id="CRT-CURRENT",
+                    molecule_id=molecule.molecule_id,
+                    round_id="ROUND-CURRENT",
+                    con_score=10.0,
+                    risk_level="low",
+                    reason="Current-round critique",
+                    evidence_ids=[],
+                    refutation_decision="accept",
+                ),
+            ]
+        )
+        db.commit()
+
+        generate_project_rankings(
+            db,
+            project,
+            molecules=[molecule],
+            top_n=1,
+            round_id="ROUND-CURRENT",
+        )
+
+        ranking = db.query(Ranking).one()
+        assert ranking.score_breakdown["critique"]["reason"] == "Current-round critique"
+        assert ranking.score_breakdown["critique"]["refutation_decision"] == "accept"
 
 
 def _add_supporting_evidence(

@@ -205,11 +205,14 @@ def test_run_round_reranks_after_current_self_refutation(monkeypatch):
     monkeypatch.setattr(workflow, "prepare_round_preflight", lambda *args, **kwargs: preflight)
     monkeypatch.setattr(workflow, "queue_round_jobs", lambda *args, **kwargs: jobs)
     monkeypatch.setattr(workflow, "start_round_stage_job", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        workflow,
-        "record_round_stage_outcome",
-        lambda *args, **kwargs: {"packet_id": f"PACKET-{kwargs['stage']}", "manifest_id": None},
-    )
+    ranking_audit_payloads: list[dict] = []
+
+    def fake_record(*args, **kwargs):
+        if kwargs["stage"] == "ranking":
+            ranking_audit_payloads.append(kwargs["payload"])
+        return {"packet_id": f"PACKET-{kwargs['stage']}", "manifest_id": None}
+
+    monkeypatch.setattr(workflow, "record_round_stage_outcome", fake_record)
 
     events: list[str] = []
     ranking_runs = 0
@@ -264,6 +267,10 @@ def test_run_round_reranks_after_current_self_refutation(monkeypatch):
         "ranking:pre_refutation",
         "self_refutation",
         "ranking:post_refutation",
+    ]
+    assert ranking_audit_payloads == [
+        {"ranking_run": 1, "ranking_phase": "pre_refutation"},
+        {"ranking_run": 2, "ranking_phase": "post_refutation"},
     ]
     assert result["ranking"] == {"ranking_run": 2, "ranking_phase": "post_refutation"}
 
