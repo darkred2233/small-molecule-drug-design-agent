@@ -118,6 +118,9 @@ def ensure_relational_schema(engine: Engine) -> None:
         if engine.dialect.name == "postgresql":
             _ensure_pgvector_columns(engine)
 
+    if "projects" in table_names:
+        _ensure_missing_columns(engine, "projects", [("target_name", "VARCHAR(120)")])
+
 
 def _ensure_missing_columns(
     engine: Engine,

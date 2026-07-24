@@ -1,7 +1,7 @@
 """Round + Campaign 编排器。
 
 负责单轮运行的完整生命周期：
-  create_round_draft → start_round → run campaigns → assessment → ranking → self-refutation → complete_round → create_next_round_draft
+  create_round_draft → start_round → campaigns → assessment → initial ranking → self-refutation → final ranking → report
 """
 
 from __future__ import annotations
@@ -571,8 +571,8 @@ class RoundOrchestrator:
             )
             parent_packet_id = audit["packet_id"] or parent_packet_id
 
-        # 排名。被执行计划阻断时保留一个 L0 审计结果，绝不把仅有 L1
-        # 近似结果伪装成满足外部证据门槛的正式排序。
+        # 初排为自我反驳提供候选顺序和评分上下文。被执行计划阻断时
+        # 保留一个 L0 审计结果，绝不把近似结果伪装成正式排序。
         ranking_stage = next(
             item
             for item in scientific_preflight["plan"]["stages"]
@@ -580,7 +580,7 @@ class RoundOrchestrator:
         )
         start_round_stage_job(db, jobs["ranking"])
         if ranking_stage["allowed"]:
-            ranking_result = self.run_round_ranking(db, project, round_obj)
+            self.run_round_ranking(db, project, round_obj)
         else:
             ranking_result = {
                 "status": "blocked",
@@ -588,6 +588,11 @@ class RoundOrchestrator:
                 "warnings": ranking_stage.get("warnings", []),
                 "execution_mode": "evidence_gated_ranking",
             }
+        # 本轮 critique 持久化后再次排名，最终结果和报告才能吸收最新反证。
+        refutation_result = self.run_round_self_refutation(db, project, round_obj)
+        if ranking_stage["allowed"]:
+            ranking_result = self.run_round_ranking(db, project, round_obj)
+
         ranking_audit = record_round_stage_outcome(
             db,
             project=project,
@@ -599,9 +604,6 @@ class RoundOrchestrator:
             payload=ranking_result,
         )
         parent_packet_id = ranking_audit["packet_id"] or parent_packet_id
-
-        # 自我反驳
-        refutation_result = self.run_round_self_refutation(db, project, round_obj)
 
         # 完成
         self.complete_round(db, round_obj)

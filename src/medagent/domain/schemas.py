@@ -32,6 +32,7 @@ class ProjectRead(BaseModel):
     project_id: str = Field(title="项目编号")
     name: str = Field(title="项目名称")
     target_id: str | None = Field(title="靶点编号")
+    target_name: str | None = Field(default=None, title="靶点名称")
     objective: str | None = Field(title="项目目标")
     status: str = Field(title="项目状态")
     created_at: datetime = Field(title="创建时间")

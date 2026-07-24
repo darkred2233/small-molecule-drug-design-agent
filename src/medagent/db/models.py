@@ -34,6 +34,7 @@ class Project(TimestampMixin, Base):
     project_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(200))
     target_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    target_name: Mapped[str | None] = mapped_column(String(120))
     objective: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="created")
     constraints_json: Mapped[dict] = mapped_column(JSON, default=dict)

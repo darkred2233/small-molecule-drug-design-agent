@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from medagent.core.config import Settings
 from medagent.db.models import Base, Project, ProjectResource
 from medagent.db.session import build_engine, build_session_factory
-from medagent.domain.schemas import TargetDiffCampaignConfig
+from medagent.domain.schemas import CampaignConfig, TargetDiffCampaignConfig
 
 from medagent.pipeline.round_orchestrator import RoundOrchestrator
 
@@ -172,6 +172,93 @@ def test_round_ranking_and_self_refutation_are_round_scoped(monkeypatch):
     assert ranking_kwargs["round_id"] == "ROUND-002"
     assert refutation == {"refutation": "ok", "round_id": "ROUND-002"}
     assert refutation_kwargs["round_id"] == "ROUND-002"
+
+
+def test_run_round_reranks_after_current_self_refutation(monkeypatch):
+    import medagent.services.scientific_workflow as workflow
+
+    stage_names = [
+        "prepare_target_resource",
+        "generate_candidates",
+        "vina_screen",
+        "gnina_refine",
+        "admet_batch",
+        "retrosynthesis_batch",
+        "ranking",
+        "build_round_report",
+    ]
+    preflight = {
+        "strategy_packet_id": "PACKET-STRATEGY",
+        "snapshot": {"target_resource": {}, "tools": {}},
+        "plan": {
+            "formal_round_allowed": True,
+            "stages": [
+                {"stage": stage, "allowed": True, "reason_codes": [], "warnings": []}
+                for stage in stage_names
+            ],
+        },
+    }
+    jobs = {stage: SimpleNamespace(status="queued") for stage in stage_names}
+    monkeypatch.setattr(workflow, "prepare_round_preflight", lambda *args, **kwargs: preflight)
+    monkeypatch.setattr(workflow, "queue_round_jobs", lambda *args, **kwargs: jobs)
+    monkeypatch.setattr(workflow, "start_round_stage_job", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        workflow,
+        "record_round_stage_outcome",
+        lambda *args, **kwargs: {"packet_id": f"PACKET-{kwargs['stage']}", "manifest_id": None},
+    )
+
+    events: list[str] = []
+    ranking_runs = 0
+    orchestrator = RoundOrchestrator(SimpleNamespace())
+    monkeypatch.setattr(orchestrator, "start_round", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "complete_round", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "collect_round_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        orchestrator,
+        "run_round_assessment",
+        lambda *args, **kwargs: {"docking": {}, "admet": {}, "synthesis": {}},
+    )
+
+    def fake_ranking(*args, **kwargs):
+        nonlocal ranking_runs
+        ranking_runs += 1
+        events.append("ranking")
+        return {"ranking_run": ranking_runs}
+
+    def fake_refutation(*args, **kwargs):
+        events.append("self_refutation")
+        return {"critique_count": 1}
+
+    monkeypatch.setattr(orchestrator, "run_round_ranking", fake_ranking)
+    monkeypatch.setattr(orchestrator, "run_round_self_refutation", fake_refutation)
+    monkeypatch.setattr(
+        orchestrator,
+        "_persist_round_report",
+        lambda *args, **kwargs: SimpleNamespace(report_id="REPORT-1"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "create_round_draft",
+        lambda *args, **kwargs: SimpleNamespace(
+            round_id="ROUND-2",
+            user_conditions_json={"strategy_draft": {"status": "ready"}},
+        ),
+    )
+
+    result = orchestrator.run_round(
+        None,
+        SimpleNamespace(project_id="PROJ-1"),
+        SimpleNamespace(round_id="ROUND-1", round_number=1),
+        CampaignConfig(
+            crem={"enabled": False},
+            targetdiff={"enabled": False},
+            autogrow4={"enabled": False},
+        ),
+    )
+
+    assert events == ["ranking", "self_refutation", "ranking"]
+    assert result["ranking"] == {"ranking_run": 2}
 
 
 def test_docking_stage_payload_does_not_promote_vina_to_gnina():

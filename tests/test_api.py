@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 from fastapi.testclient import TestClient
 
@@ -24,6 +25,7 @@ from medagent.db.models import (
     Molecule,
     MoleculeProperty,
     OptimizationConstraint,
+    Project,
     ProjectResource,
     ProjectRound,
     ProjectStructure,
@@ -123,6 +125,71 @@ def test_create_project_and_parse_constraints(tmp_path):
             "protected_motif",
             "editable_region",
         }
+
+
+def test_create_project_persists_a_custom_target_name_and_generated_id(tmp_path):
+    with make_client(tmp_path) as client:
+        response = client.post(
+            "/projects",
+            json={
+                "name": "Custom kinase project",
+                "target_name": "Novel kinase X",
+                "objective": "prepare the uploaded receptor for pocket prediction",
+            },
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["target_id"].startswith("TGT-")
+        assert body["target_name"] == "Novel kinase X"
+
+        detail = client.get(f"/projects/{body['project_id']}")
+        assert detail.status_code == 200
+        assert detail.json()["target_id"] == body["target_id"]
+        assert detail.json()["target_name"] == "Novel kinase X"
+
+        with api_app.SessionLocal() as db:
+            project = db.query(Project).filter_by(project_id=body["project_id"]).one()
+            target = db.query(Target).filter_by(target_id=body["target_id"]).one()
+
+        assert project.target_id == target.target_id
+        assert project.target_name == "Novel kinase X"
+        assert target.name == "Novel kinase X"
+
+
+def test_app_adds_target_name_to_a_legacy_projects_table(tmp_path):
+    db_path = tmp_path / "legacy-projects.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            create table projects (
+                id integer primary key,
+                project_id varchar(40) unique,
+                name varchar(200),
+                target_id varchar(80),
+                active_structure_id varchar(80),
+                active_binding_site_id varchar(80),
+                objective text,
+                status varchar(40),
+                constraints_json json,
+                created_at datetime,
+                updated_at datetime
+            )
+            """
+        )
+
+    with TestClient(
+        create_app(Settings(database_url=f"sqlite:///{db_path}", dashscope_api_key=None))
+    ) as client:
+        assert client.get("/projects").status_code == 200
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("pragma table_info(projects)").fetchall()
+        }
+
+    assert "target_name" in columns
 
 
 def test_project_router_uses_current_project_schema(tmp_path):

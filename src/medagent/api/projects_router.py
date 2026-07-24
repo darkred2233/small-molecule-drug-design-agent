@@ -29,14 +29,15 @@ def create_project(
     payload: ProjectCreate,
     db: Session = Depends(get_db),
 ):
-    ensure_project_target(db, payload.target_id, payload.target_name)
+    target = ensure_project_target(db, payload.target_id, payload.target_name)
     constraints_json = dict(payload.constraints or {})
     if payload.generation_config:
         constraints_json["pipeline_config"] = payload.generation_config
     new_project = Project(
         project_id=new_id("PROJ"),
         name=payload.name,
-        target_id=payload.target_id,
+        target_id=target.target_id if target else None,
+        target_name=target.name if target else None,
         objective=payload.objective,
         constraints_json=constraints_json,
         status="created",
@@ -158,6 +159,7 @@ def _project_to_read(project: Project) -> ProjectRead:
         project_id=project.project_id,
         name=project.name,
         target_id=project.target_id,
+        target_name=project.target_name,
         objective=project.objective,
         status=project.status,
         active_structure_id=project.active_structure_id,

@@ -678,12 +678,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/projects", response_model=ProjectRead, status_code=201, tags=["项目管理"], summary="创建项目")
     def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
-        ensure_project_target(db, payload.target_id, payload.target_name)
+        target = ensure_project_target(db, payload.target_id, payload.target_name)
         constraints_json = _merge_project_config(payload.constraints, payload.generation_config)
         project = Project(
             project_id=new_id("PROJ"),
             name=payload.name,
-            target_id=payload.target_id,
+            target_id=target.target_id if target else None,
+            target_name=target.name if target else None,
             objective=payload.objective,
             constraints_json=constraints_json,
         )
@@ -2483,6 +2484,7 @@ def _project_to_read(project: Project) -> ProjectRead:
         project_id=project.project_id,
         name=project.name,
         target_id=project.target_id,
+        target_name=project.target_name,
         objective=project.objective,
         status=project.status,
         active_structure_id=project.active_structure_id,

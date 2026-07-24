@@ -157,16 +157,19 @@ def ensure_project_target(
     target_id: str | None,
     target_name: str | None = None,
 ) -> Target | None:
-    if not target_id:
+    normalized_target_id = (target_id or "").strip() or None
+    normalized_target_name = (target_name or "").strip() or None
+    if not normalized_target_id and not normalized_target_name:
         return None
 
-    target = db.query(Target).filter_by(target_id=target_id).one_or_none()
+    effective_target_id = normalized_target_id or new_id("TGT")
+    target = db.query(Target).filter_by(target_id=effective_target_id).one_or_none()
     if target is not None:
         return target
 
-    display_name = (target_name or target_id).strip() or target_id
+    display_name = normalized_target_name or effective_target_id
     target = Target(
-        target_id=target_id,
+        target_id=effective_target_id,
         name=display_name,
         aliases=[],
         uniprot_id=None,
