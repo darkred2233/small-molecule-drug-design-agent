@@ -58,7 +58,45 @@ def test_targetdiff_agent_skips_without_a_real_pocket_file():
     assert result.failure_reason == "targetdiff_requires_pocket_file"
 
 
-def test_autogrow_agent_consumes_local_source_pool_and_grid(monkeypatch, tmp_path):
+def test_autogrow_agent_preserves_batch_failure_diagnostics(monkeypatch, tmp_path):
+    import medagent.agents.autogrow4_agent as autogrow4_agent
+
+    receptor = tmp_path / "receptor.pdb"
+    source_pool = tmp_path / "source.smi"
+    receptor.write_text("HEADER RECEPTOR\n", encoding="utf-8")
+    source_pool.write_text("CCO\tethanol\n", encoding="utf-8")
+
+    class FailedAdapter:
+        def generate(self, **_kwargs):
+            return GenerationBatch(
+                candidates=[],
+                adapter_mode="autogrow4_local_generation",
+                tool_status={"autogrow4": {"available": True}},
+                warnings=["autogrow4_execution_failed"],
+                provenance={"exit_code": 2, "stderr": "AutoGrow failed"},
+            )
+
+    monkeypatch.setitem(autogrow4_agent.STRATEGY_ADAPTERS, "autogrow4", FailedAdapter())
+    result = AutoGrow4Agent().run(
+        AgentTask(
+            agent="autogrow4",
+            round=1,
+            seed_molecules=["CCO"],
+            constraints={"requested_count": 1},
+            resource_bundle={
+                "receptor_file": str(receptor),
+                "source_compounds_file": str(source_pool),
+                "grid_center": [1, 2, 3],
+                "grid_size": [18, 18, 18],
+            },
+        )
+    )
+
+    assert result.success is False
+    assert result.execution_details == {"exit_code": 2, "stderr": "AutoGrow failed"}
+
+
+def test_autogrow_agent_consumes_resource_seed_snapshot_and_local_grid(monkeypatch, tmp_path):
     import medagent.agents.autogrow4_agent as autogrow4_agent
 
     receptor = tmp_path / "receptor.pdb"
@@ -83,6 +121,7 @@ def test_autogrow_agent_consumes_local_source_pool_and_grid(monkeypatch, tmp_pat
         AgentTask(
             agent="autogrow4",
             round=1,
+            seed_molecules=["CCN", "CCC"],
             constraints={"requested_count": 1},
             campaign_config={"search_intensity": "quick"},
             resource_bundle={
@@ -98,6 +137,10 @@ def test_autogrow_agent_consumes_local_source_pool_and_grid(monkeypatch, tmp_pat
     assert captured["seeds"] == ["CCO", "CCN"]
     assert captured["constraints"]["num_generations"] == 3
     assert captured["constraints"]["grid_size"] == [18, 18, 18]
+    assert captured["constraints"]["docking_backend"] == "vina_gpu_2_1_batch"
+    assert captured["constraints"]["gpu_required"] is True
+    assert captured["constraints"]["gpu_id"] == 0
+    assert captured["constraints"]["cpu_fallback"] is False
 
 
 def test_crem_requires_seed_molecules_before_generation():

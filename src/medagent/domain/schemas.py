@@ -76,6 +76,7 @@ class AgentTask(BaseModel):
     # Round + Campaign 扩展字段
     round_id: str | None = Field(default=None, title="轮次 ID")
     campaign_run_id: str | None = Field(default=None, title="Campaign 运行 ID")
+    project_id: str | None = Field(default=None, title="Campaign 所属项目 ID")
     campaign_config: dict[str, Any] | None = Field(default=None, title="Campaign 配置")
     resource_bundle: dict[str, Any] | None = Field(default=None, title="资源包（如 AutoGrow4ResourceBundle）")
 
@@ -95,6 +96,9 @@ class AgentResult(BaseModel):
     molecules: list[AgentMoleculeCandidate] = Field(default_factory=list, title="候选分子")
     warnings: list[str] = Field(default_factory=list, title="警告")
     failure_reason: str | None = Field(default=None, title="失败或跳过原因")
+    execution_details: dict[str, Any] = Field(
+        default_factory=dict, title="外部工具命令、退出码与日志摘要"
+    )
 
 
 class EvidenceRef(BaseModel):

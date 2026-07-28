@@ -133,6 +133,8 @@ Invoke-InstallStep "AiZynthFinder isolated runtime" {
 Invoke-InstallStep "AutoGrow4 source" {
     $autogrowRoot = Join-Path $tools "AutoGrow4"
     Ensure-SourceArchive "https://github.com/durrantlab/autogrow4.git" $autogrowRoot "RunAutogrow.py" "v4.0.3"
+    & $python (Join-Path $root "scripts\patch_autogrow4.py") --root $autogrowRoot
+    if ($LASTEXITCODE -ne 0) { throw "unable to apply MedAgent AutoGrow4 extensions" }
 }
 
 Invoke-InstallStep "TargetDiff source checkout" {

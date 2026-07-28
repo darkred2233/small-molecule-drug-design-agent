@@ -17,11 +17,11 @@ from sqlalchemy.orm import Session
 
 from medagent.db.models import (
     BindingSite,
-    DockingResult,
     Molecule,
     Project,
     ProjectResource,
     ProjectRound,
+    Ranking,
     SeedLigand,
     TargetDrugLibrary,
 )
@@ -29,48 +29,37 @@ from medagent.domain.schemas import AutoGrow4CampaignConfig, AutoGrow4ResourceBu
 from medagent.services.pdbqt_validation import is_valid_vina_receptor_pdbqt
 
 
-# search_intensity 映射
-INTENSITY_PROFILES: dict[str, dict[str, int]] = {
-    "quick": {
-        "generations": 3,
-        "population_size": 30,
-        "mutants": 15,
-        "crossovers": 15,
-        "top_mols": 15,
-        "max_variants": 2,
-    },
-    "normal": {
-        "generations": 5,
-        "population_size": 50,
-        "mutants": 25,
-        "crossovers": 25,
-        "top_mols": 30,
-        "max_variants": 3,
-    },
-    "heavy": {
-        "generations": 10,
-        "population_size": 100,
-        "mutants": 50,
-        "crossovers": 50,
-        "top_mols": 50,
-        "max_variants": 5,
-    },
-}
-
-
 def resolve_autogrow4_resources(
     db: Session,
     project: Project,
     config: AutoGrow4CampaignConfig,
+    *,
+    source_compounds: list[tuple[str, str]] | None = None,
+    parent_round_id: str | None = None,
 ) -> AutoGrow4ResourceBundle:
     """解析 AutoGrow4 运行所需的所有资源。"""
     # 1. 解析 receptor / binding site
-    receptor_file, grid_center, grid_size, binding_site_id = _resolve_receptor_and_grid(
-        db, project, config
-    )
+    (
+        receptor_file,
+        prepared_receptor_file,
+        grid_center,
+        grid_size,
+        binding_site_id,
+    ) = _resolve_receptor_and_grid(db, project, config)
 
     # 2. 构建 source pool
-    source_compounds, provenance = _build_source_pool(db, project, config)
+    if source_compounds is None:
+        source_compounds, provenance = _build_source_pool(
+            db, project, config, parent_round_id=parent_round_id
+        )
+    else:
+        source_compounds = _dedupe_compounds(source_compounds)
+        provenance = {
+            "policy": config.source_pool_policy,
+            "sources": [{"type": "confirmed_execution_snapshot", "count": len(source_compounds)}],
+            "total_unique": len(source_compounds),
+            "parent_round_id": parent_round_id,
+        }
 
     # 3. 写 source_compounds.smi
     source_file = _write_source_compounds(project, source_compounds)
@@ -80,7 +69,7 @@ def resolve_autogrow4_resources(
 
     return AutoGrow4ResourceBundle(
         receptor_file=receptor_file,
-        prepared_receptor_file=receptor_file,
+        prepared_receptor_file=prepared_receptor_file,
         binding_site_id=binding_site_id,
         grid_center=grid_center,
         grid_size=grid_size,
@@ -89,16 +78,6 @@ def resolve_autogrow4_resources(
         docking_config=docking_config,
         provenance=provenance,
     )
-
-
-def intensity_profile(search_intensity: str) -> dict[str, int]:
-    """获取搜索强度对应的参数 profile。"""
-    return INTENSITY_PROFILES.get(search_intensity, INTENSITY_PROFILES["normal"])
-
-
-def estimate_docking_jobs(generations: int, population_size: int, max_variants: int = 3) -> int:
-    """估算 docking 计算量。"""
-    return generations * population_size * max_variants
 
 
 def eligible_autogrow4_source_count(db: Session, project: Project) -> int:
@@ -112,11 +91,32 @@ def eligible_autogrow4_source_count(db: Session, project: Project) -> int:
     return len({smiles for smiles, _ in [*auto_compounds, *previous_compounds]})
 
 
+def resolve_autogrow4_seed_plan(
+    db: Session,
+    project: Project,
+    config: AutoGrow4CampaignConfig,
+    *,
+    parent_round_id: str | None,
+) -> dict[str, Any]:
+    """Resolve AutoGrow inputs once, before the execution snapshot is sealed."""
+    compounds, provenance = _build_source_pool(
+        db,
+        project,
+        config,
+        parent_round_id=parent_round_id,
+    )
+    return {
+        "smiles": [smiles for smiles, _ in compounds],
+        "molecule_ids": [molecule_id for _, molecule_id in compounds],
+        "provenance": provenance,
+    }
+
+
 def _resolve_receptor_and_grid(
     db: Session,
     project: Project,
     config: AutoGrow4CampaignConfig,
-) -> tuple[str, list[float], list[float], str | None]:
+) -> tuple[str, str | None, list[float], list[float], str | None]:
     """解析 receptor 文件和 grid 配置。"""
     # 优先使用 config 指定的 binding_site_id
     binding_site_id = config.binding_site_id
@@ -128,12 +128,12 @@ def _resolve_receptor_and_grid(
         ).first()
         if site and project.active_structure_id and site.structure_id != project.active_structure_id:
             raise ValueError("AutoGrow4 selected binding site is not from the active project structure")
-        if site and _prepared_pdbqt(site):
+        if site and _source_pdb(site) and _prepared_pdbqt(site):
             grid = _binding_site_grid(site)
             if grid is None:
                 raise ValueError("AutoGrow4 selected binding site has no valid docking grid")
             center, size = grid
-            return _prepared_pdbqt(site), center, size, binding_site_id
+            return _source_pdb(site), _prepared_pdbqt(site), center, size, binding_site_id
 
     # 尝试使用 ProjectResource 中的 receptor
     if config.receptor_resource_id:
@@ -149,13 +149,13 @@ def _resolve_receptor_and_grid(
             if not _valid_grid(center, size):
                 raise ValueError("AutoGrow4 receptor resource has no valid P2Rank-derived docking grid")
             receptor_file = _local_file_path(resource.file_path)
-            if _is_valid_pdbqt_file(receptor_file):
-                return receptor_file, center, size, None
+            if _is_valid_pdb_file(receptor_file):
+                return receptor_file, None, center, size, None
 
     raise ValueError(
         "AutoGrow4 requires receptor + binding pocket. "
         "Provide binding_site_id or receptor_resource_id in config, "
-        "or ensure the project has a binding site with a valid prepared PDBQT receptor."
+        "or ensure the project has a binding site with a source PDB and prepared PDBQT receptor."
     )
 
 
@@ -200,6 +200,18 @@ def _prepared_pdbqt(site: BindingSite) -> str | None:
     return path if _is_valid_pdbqt_file(path) else None
 
 
+def _source_pdb(site: BindingSite) -> str | None:
+    if not site.receptor_file:
+        return None
+    path = _local_file_path(site.receptor_file)
+    return path if _is_valid_pdb_file(path) else None
+
+
+def _is_valid_pdb_file(path: str) -> bool:
+    candidate = Path(path)
+    return candidate.suffix.lower() == ".pdb" and candidate.is_file()
+
+
 def _is_valid_pdbqt_file(path: str) -> bool:
     candidate = Path(path)
     return candidate.suffix.lower() == ".pdbqt" and is_valid_vina_receptor_pdbqt(candidate)
@@ -209,6 +221,8 @@ def _build_source_pool(
     db: Session,
     project: Project,
     config: AutoGrow4CampaignConfig,
+    *,
+    parent_round_id: str | None = None,
 ) -> tuple[list[tuple[str, str]], dict[str, Any]]:
     """构建 source pool，返回 ([(smiles, compound_id), ...], provenance)。"""
     compounds: list[tuple[str, str]] = []
@@ -217,7 +231,12 @@ def _build_source_pool(
     policy = config.source_pool_policy
 
     if policy == "previous_top":
-        compounds = _previous_top_compounds(db, project, config.previous_top_n)
+        compounds = _previous_top_compounds(
+            db,
+            project,
+            config.previous_top_n,
+            parent_round_id=parent_round_id,
+        )
         provenance["sources"].append({"type": "previous_top", "count": len(compounds)})
     elif policy in ("auto", "user_uploaded"):
         # 用户上传的 seed ligands
@@ -246,13 +265,7 @@ def _build_source_pool(
             "count": len(drugs),
         })
 
-    # 去重（按 SMILES）
-    seen_smiles: set[str] = set()
-    unique_compounds: list[tuple[str, str]] = []
-    for smiles, compound_id in compounds:
-        if smiles not in seen_smiles:
-            seen_smiles.add(smiles)
-            unique_compounds.append((smiles, compound_id))
+    unique_compounds = _dedupe_compounds(compounds)
 
     provenance["total_unique"] = len(unique_compounds)
     provenance["policy"] = policy
@@ -261,30 +274,51 @@ def _build_source_pool(
 
 
 def _previous_top_compounds(
-    db: Session, project: Project, limit: int
+    db: Session,
+    project: Project,
+    limit: int,
+    *,
+    parent_round_id: str | None = None,
 ) -> list[tuple[str, str]]:
-    previous_round = (
-        db.query(ProjectRound)
-        .filter(ProjectRound.project_id == project.project_id, ProjectRound.status == "completed")
-        .order_by(ProjectRound.round_number.desc(), ProjectRound.id.desc())
-        .first()
-    )
+    previous_round = None
+    if parent_round_id:
+        previous_round = db.query(ProjectRound).filter_by(
+            project_id=project.project_id,
+            round_id=parent_round_id,
+        ).one_or_none()
+    else:
+        previous_round = (
+            db.query(ProjectRound)
+            .filter(ProjectRound.project_id == project.project_id, ProjectRound.status == "completed")
+            .order_by(ProjectRound.round_number.desc(), ProjectRound.id.desc())
+            .first()
+        )
     if previous_round is None:
         return []
     rows = (
-        db.query(Molecule, DockingResult)
+        db.query(Molecule, Ranking)
         .join(
-            DockingResult,
-            (DockingResult.molecule_id == Molecule.molecule_id)
-            & (DockingResult.round_id == previous_round.round_id),
+            Ranking,
+            (Ranking.molecule_id == Molecule.molecule_id)
+            & (Ranking.round_id == previous_round.round_id),
         )
         .filter(Molecule.project_id == project.project_id, Molecule.round_id == previous_round.round_id)
-        .filter(DockingResult.vina_score.is_not(None))
-        .order_by(DockingResult.vina_score.asc(), Molecule.molecule_id.asc())
+        .order_by(Ranking.rank.asc(), Molecule.molecule_id.asc())
         .limit(limit)
         .all()
     )
     return [(molecule.smiles, molecule.molecule_id) for molecule, _ in rows if molecule.smiles]
+
+
+def _dedupe_compounds(compounds: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen_smiles: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for smiles, compound_id in compounds:
+        if smiles in seen_smiles:
+            continue
+        seen_smiles.add(smiles)
+        unique.append((smiles, compound_id))
+    return unique
 
 
 def _write_source_compounds(

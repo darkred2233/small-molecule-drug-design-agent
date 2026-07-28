@@ -37,12 +37,26 @@ tools:
     python_executable: /opt/medagent/envs/autogrow4-v403/bin/python
     working_directory: .local/tools/AutoGrow4
     command: RunAutogrow.py
-    timeout_seconds: 1200
+    timeout_seconds: 3600
+    environment:
+      MEDAGENT_VINA_GPU_EXECUTABLE: .local/tools/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1/vina_gpu_2_1_windows.exe
+      MEDAGENT_VINA_GPU_OPENCL_BINARY_PATH: .local/tools/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1
+      MEDAGENT_VINA_GPU_VERSION: vina_gpu_2_1_windows_msvc
+      MEDAGENT_VINA_GPU_ID: "0"
+      MEDAGENT_VINA_GPU_THREAD: "1000"
+      MEDAGENT_VINA_GPU_MAX_BATCH_SIZE: "128"
+      MEDAGENT_VINA_GPU_BATCH_TIMEOUT_SECONDS: "1800"
+      MEDAGENT_VINA_GPU_WAIT_TIMEOUT_SECONDS: "300"
+      MEDAGENT_VINA_GPU_MAX_UTILIZATION_PERCENT: "80"
+      MEDAGENT_VINA_GPU_RETRY_COUNT: "1"
     required_paths:
       - .local/tools/AutoGrow4/RunAutogrow.py
       - .local/tools/AutoGrow4/autogrow/docking/scoring/nn_score_exe/nnscore1/NNScore.py
       - .local/tools/AutoGrow4/autogrow/docking/scoring/nn_score_exe/nnscore2/NNScore2.py
       - .local/tools/AutoGrow4/autogrow/docking/docking_executables/vina/autodock_vina_1_1_2_linux_x86/bin/vina
+      - .local/tools/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1/vina_gpu_2_1_windows.exe
+      - .local/tools/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1/Kernel1_Opt.bin
+      - .local/tools/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1/Kernel2_Opt.bin
   aizynthfinder:
     python_executable: .local/envs/aizynthfinder/Scripts/python.exe
     command: .local/envs/aizynthfinder/Scripts/aizynthcli.exe

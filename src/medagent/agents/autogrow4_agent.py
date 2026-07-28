@@ -13,13 +13,10 @@ from medagent.agents.generation_base import (
     _skipped_result,
     grid_values,
 )
+from medagent.core.config import get_settings
 from medagent.domain.schemas import AgentName, AgentResult, AgentTask
+from medagent.services.autogrow4_adapter import autogrow_profile
 from medagent.services.molecule_generation import STRATEGY_ADAPTERS
-
-
-# search_intensity 映射
-_INTENSITY_GENERATIONS = {"quick": 3, "normal": 5, "heavy": 10}
-_INTENSITY_POPULATION = {"quick": 30, "normal": 50, "heavy": 100}
 
 
 class AutoGrow4Agent(GenerationAgent):
@@ -92,27 +89,61 @@ class AutoGrow4Agent(GenerationAgent):
             enhanced_constraints["grid_center"] = bundle["grid_center"]
             enhanced_constraints["grid_size"] = bundle["grid_size"]
 
+        # This agent has a single supported docking contract. Persist it in the
+        # task constraints as well as enforcing it in the adapter so that a
+        # future default change cannot silently re-enable CPU docking.
+        enhanced_constraints.update(
+            {
+                "docking_backend": "vina_gpu_2_1_batch",
+                "gpu_required": True,
+                "gpu_id": 0,
+                "cpu_fallback": False,
+            }
+        )
+
+        configured_output = enhanced_constraints.get("output_dir")
+        if configured_output:
+            output_dir = Path(str(configured_output))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            enhanced_constraints["output_dir"] = str(output_dir)
+        elif task.project_id and task.campaign_run_id:
+            output_dir = (
+                Path(get_settings().storage_local_root)
+                / task.project_id
+                / "campaigns"
+                / task.campaign_run_id
+                / "autogrow4"
+            )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            enhanced_constraints["output_dir"] = str(output_dir)
+
         # search_intensity 映射到 generations / population_size
         intensity = campaign_config.get("search_intensity", "normal")
+        profile = autogrow_profile(intensity)
         generations = campaign_config.get("generations")
         if not generations:
-            generations = _INTENSITY_GENERATIONS.get(intensity, 5)
-        population_size = _INTENSITY_POPULATION.get(intensity, 50)
+            generations = profile["generations"]
+        population_size = min(
+            profile["population_size"], max(requested_count, 1)
+        )
 
+        enhanced_constraints["search_intensity"] = intensity
         enhanced_constraints["num_generations"] = generations
         enhanced_constraints["population_size"] = population_size
         enhanced_constraints["crossover_fraction"] = campaign_config.get(
             "crossover_fraction", 0.5
         )
 
-        # source pool 作为 seed
+        # The resource bundle is the execution-time source pool. Newer strategy
+        # snapshots write the confirmed method seeds to this same artifact;
+        # older callers also rely on it to apply source_pool_policy correctly.
         seeds = list(task.seed_molecules)
         if bundle and bundle.get("source_compounds_file"):
             source_path = Path(bundle["source_compounds_file"])
             if source_path.is_file():
-                source_seeds = _read_source_compounds(source_path)
-                if source_seeds:
-                    seeds = source_seeds
+                resource_seeds = _read_source_compounds(source_path)
+                if resource_seeds:
+                    seeds = resource_seeds
 
         if not seeds:
             return _failed_result(
@@ -141,6 +172,7 @@ class AutoGrow4Agent(GenerationAgent):
                 molecules=[],
                 warnings=batch.warnings,
                 failure_reason="generation_returned_no_candidates",
+                execution_details=batch.provenance,
             )
 
         return AgentResult(
@@ -151,6 +183,7 @@ class AutoGrow4Agent(GenerationAgent):
             molecules=molecules,
             warnings=batch.warnings,
             failure_reason=None,
+            execution_details=batch.provenance,
         )
 
 

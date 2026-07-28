@@ -69,6 +69,7 @@ class GenerationAgent:
                 molecules=[],
                 warnings=batch.warnings,
                 failure_reason="generation_returned_no_candidates",
+                execution_details=batch.provenance,
             )
 
         return AgentResult(
@@ -79,6 +80,7 @@ class GenerationAgent:
             molecules=molecules,
             warnings=batch.warnings,
             failure_reason=None,
+            execution_details=batch.provenance,
         )
 
     def _skip_reason(self, task: AgentTask) -> str | None:
@@ -149,6 +151,7 @@ def _failed_result(
     agent_name: AgentName,
     reason: str,
     warnings: list[str] | None = None,
+    execution_details: dict[str, Any] | None = None,
 ) -> AgentResult:
     return AgentResult(
         agent=agent_name,
@@ -158,6 +161,7 @@ def _failed_result(
         molecules=[],
         warnings=warnings or [],
         failure_reason=reason,
+        execution_details=execution_details or {},
     )
 
 

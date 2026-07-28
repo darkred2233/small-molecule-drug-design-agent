@@ -1,8 +1,10 @@
 import os
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from importlib import metadata, util
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -116,17 +118,22 @@ class RdkitGrowLinkAutoGrow4Strategy:
         tool_status = generation_tool_status()
         autogrow4_status = tool_status["autogrow4"]
         fallback_warnings: list[str] = []
+        execution_details: dict[str, Any] = {}
 
         # Try real AutoGrow4 if available
         if autogrow4_status.get("available"):
             try:
-                import tempfile
-                from pathlib import Path
-
                 # Find a receptor file for docking-guided generation
                 receptor_file = constraints.get("receptor_file")
                 if receptor_file and Path(receptor_file).exists():
-                    with tempfile.TemporaryDirectory(prefix="autogrow4_gen_") as tmp_dir:
+                    configured_output = constraints.get("output_dir")
+                    output_context = (
+                        nullcontext(str(configured_output))
+                        if configured_output
+                        else tempfile.TemporaryDirectory(prefix="autogrow4_gen_")
+                    )
+                    with output_context as tmp_dir:
+                        Path(tmp_dir).mkdir(parents=True, exist_ok=True)
                         request = AutoGrow4Request(
                             # AutoGrow4 evolves its complete source pool. This is
                             # separate from requested_count, the candidate count
@@ -143,11 +150,20 @@ class RdkitGrowLinkAutoGrow4Strategy:
                             ),
                             constraints=constraints,
                             timeout_seconds=int(
-                                autogrow4_status.get("configured_timeout_seconds") or 1200
+                                autogrow4_status.get("configured_timeout_seconds") or 3600
                             ),
                         )
                         result = run_autogrow4_generation(request, autogrow4_status)
                         fallback_warnings.extend(result.warnings)
+                        execution_details = {
+                            **result.provenance,
+                            "tool_name": result.tool_name,
+                            "adapter_mode": result.adapter_mode,
+                            "exit_code": result.exit_code,
+                            "runtime_seconds": result.runtime_seconds,
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                        }
 
                         if result.success and result.generated_smiles:
                             candidates = _external_generation_candidates(
@@ -160,7 +176,7 @@ class RdkitGrowLinkAutoGrow4Strategy:
                                 rationale="AutoGrow4 docking-guided genetic optimization",
                                 labels=result.labels,
                                 adapter_mode=result.adapter_mode,
-                                provenance=result.provenance,
+                                provenance=execution_details,
                             )
                             if candidates:
                                 return GenerationBatch(
@@ -171,7 +187,7 @@ class RdkitGrowLinkAutoGrow4Strategy:
                                     ),
                                 warnings=list(dict.fromkeys(result.warnings)),
                                 candidate_source_counts=_candidate_source_counts(candidates),
-                                provenance=result.provenance,
+                                provenance=execution_details,
                                 execution_mode="external_tool",
                                 external_tools_requested=True,
                                 external_tool_used=True,
@@ -193,6 +209,11 @@ class RdkitGrowLinkAutoGrow4Strategy:
                 fallback_warnings.append(
                     f"autogrow4_external_adapter_exception:{type(exc).__name__}"
                 )
+                execution_details = {
+                    "adapter_mode": "autogrow4_external_adapter_exception",
+                    "exception_type": type(exc).__name__,
+                    "stderr": str(exc),
+                }
         else:
             fallback_warnings.append(
                 str(autogrow4_status.get("warning") or "autogrow4_external_adapter_not_installed")
@@ -204,7 +225,8 @@ class RdkitGrowLinkAutoGrow4Strategy:
             tool_status=_strategy_tool_status(tool_status, ["rdkit", "datamol", "autogrow4"]),
             warnings=list(dict.fromkeys(fallback_warnings)),
             candidate_source_counts={},
-            provenance={
+            provenance=execution_details
+            or {
                 "execution_mode": "not_run",
                 "external_tool_status": autogrow4_status,
             },
@@ -692,14 +714,18 @@ def _external_generation_candidates(
     provenance: dict[str, Any],
 ) -> list[GenerationCandidate]:
     candidates: list[GenerationCandidate] = []
+    seen_smiles: set[str] = set()
     for index, smiles in enumerate(generated_smiles):
         normalized = _standardize_or_normalize_smiles(smiles)
         rdkit_validated = _canonicalize_with_rdkit(normalized)
         if not rdkit_validated:
             continue
         normalized = rdkit_validated
+        if normalized in seen_smiles:
+            continue
         if not _satisfies_generation_constraints(normalized, seeds, constraints):
             continue
+        seen_smiles.add(normalized)
         candidates.append(
             GenerationCandidate(
                 smiles=normalized,

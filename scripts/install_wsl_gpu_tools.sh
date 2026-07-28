@@ -102,6 +102,7 @@ if [[ ! -x "$AUTOGROW_ENV/bin/python" ]]; then
 fi
 AUTOGROW_PY="$AUTOGROW_ENV/bin/python"
 AUTOGROW_VINA="$AUTOGROW4/autogrow/docking/docking_executables/vina/autodock_vina_1_1_2_linux_x86/bin/vina"
+"$AUTOGROW_PY" "$ROOT/scripts/patch_autogrow4.py" --root "$AUTOGROW4"
 chmod +x "$AUTOGROW_VINA"
 (
   cd "$AUTOGROW4"
