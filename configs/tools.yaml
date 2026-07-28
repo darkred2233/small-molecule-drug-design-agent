@@ -70,7 +70,7 @@ tools:
     python_executable: /opt/medagent/envs/targetdiff/bin/python
     working_directory: .local/tools/TargetDiff
     command: scripts/sample_for_pocket.py
-    timeout_seconds: 1800
+    timeout_seconds: 2700
     required_paths:
       - .local/tools/TargetDiff/scripts/sample_for_pocket.py
       - .local/tools/TargetDiff/configs/sampling.yml

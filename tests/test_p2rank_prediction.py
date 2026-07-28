@@ -123,6 +123,56 @@ def test_p2rank_prediction_persists_all_predicted_pockets_and_audit_artifacts(tm
         assert audited_site["pocket_artifact"]["sha256"]
 
 
+def test_p2rank_uses_absolute_command_paths_with_relative_storage_root(tmp_path, monkeypatch):
+    settings, session_factory = _setup_project(tmp_path)
+    application_directory = tmp_path / "application"
+    working_directory = tmp_path / "p2rank-tool"
+    application_directory.mkdir()
+    working_directory.mkdir()
+    monkeypatch.chdir(application_directory)
+    settings.storage_local_root = "relative-storage"
+
+    monkeypatch.setattr(
+        "medagent.services.p2rank_adapter.p2rank_tool_status",
+        lambda: {
+            "available": True,
+            "runtime_available": True,
+            "java_executable": "java.exe",
+            "launcher": "prank.bat",
+            "working_directory": str(working_directory),
+            "version": "2.5.1",
+        },
+    )
+
+    def fake_run(command, **kwargs):
+        input_path = Path(command[command.index("-f") + 1])
+        output_path = Path(command[command.index("-o") + 1])
+        assert input_path.is_absolute()
+        assert output_path.is_absolute()
+        assert kwargs["cwd"] == working_directory
+        output_path.mkdir(parents=True)
+        (output_path / "input.pdb_predictions.csv").write_text(
+            "name,rank,score,probability,sas_points,surf_atoms,center_x,center_y,center_z,residue_ids,surf_atom_ids\n"
+            "pocket1,1,9.77,0.525,70,40,1.5,2.5,3.5,A_10,1 2\n",
+            encoding="utf-8",
+        )
+
+        class Completed:
+            returncode = 0
+            stdout = "P2Rank completed"
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr("medagent.services.p2rank_adapter.subprocess.run", fake_run)
+
+    with session_factory() as db:
+        project = db.query(Project).filter_by(project_id="PROJ-P2RANK").one()
+        result = run_project_p2rank(db, settings, project, "FILE-P2RANK")
+
+    assert result.status == "succeeded"
+
+
 def test_p2rank_reports_runtime_blocked_without_creating_sites(tmp_path, monkeypatch):
     settings, session_factory = _setup_project(tmp_path)
     monkeypatch.setattr(

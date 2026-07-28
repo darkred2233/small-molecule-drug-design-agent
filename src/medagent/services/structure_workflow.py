@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from sqlalchemy.orm import Session
 
@@ -20,6 +20,8 @@ from medagent.services.ids import new_id
 
 PDB_ID_PATTERN = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
 MAX_STRUCTURE_BYTES = 100 * 1024 * 1024
+# RCSB is reached directly so a stale process-level proxy cannot block structure import.
+_DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
 
 
 def import_rcsb_structure(
@@ -297,7 +299,7 @@ def _download_json(url: str) -> dict[str, Any]:
 def _download_bytes(url: str, accept: str = "chemical/x-pdb") -> tuple[bytes, dict[str, Any]]:
     request = Request(url, headers={"Accept": accept, "User-Agent": "medagent/0.1"})
     try:
-        with urlopen(request, timeout=30) as response:
+        with _DIRECT_URL_OPENER.open(request, timeout=30) as response:
             headers = response.headers
             chunks: list[bytes] = []
             total_size = 0

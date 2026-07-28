@@ -287,11 +287,14 @@ def _llm_critique(
         molecule, ranking, admet, docking, risk_factors, blockers, warnings
     )
 
+    target_context = project.target_name or project.target_id or project.name or "unknown"
+    project_objective = project.objective or "unknown"
+
     prompt = f"""你是药物开发风险评估专家。请对以下候选分子进行严格的自我反驳质询。
 
 ## 项目背景
-靶点: {project.target_protein or 'unknown'}
-疾病领域: {project.disease_area or 'unknown'}
+靶点: {target_context}
+项目目标: {project_objective}
 
 ## 候选分子信息
 {summary}

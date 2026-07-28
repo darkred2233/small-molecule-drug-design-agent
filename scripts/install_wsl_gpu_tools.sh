@@ -62,10 +62,13 @@ fi
 if [[ ! -x "$ENVS/targetdiff/bin/python" ]]; then
   "$CONDA" create -y -p "$ENVS/targetdiff" -c conda-forge \
     --strict-channel-priority \
-    python=3.8 pip setuptools wheel numpy=1.24 scipy=1.10 rdkit=2022.03 \
+    python=3.8 pip setuptools wheel numpy=1.23.5 scipy=1.10 rdkit=2022.03 \
     openbabel=3.1.1 pyyaml easydict tqdm python-lmdb scikit-learn matplotlib
 fi
 TARGET_PY="$ENVS/targetdiff/bin/python"
+if ! "$TARGET_PY" -c 'import numpy; assert numpy.__version__ == "1.23.5"' 2>/dev/null; then
+  "$TARGET_PY" -m pip install --no-cache-dir 'numpy==1.23.5'
+fi
 if ! "$TARGET_PY" -c 'import torch; assert torch.__version__.startswith("1.13.1")' 2>/dev/null; then
   "$TARGET_PY" -m pip install --no-cache-dir 'torch==1.13.1+cu116' \
     --extra-index-url https://download.pytorch.org/whl/cu116

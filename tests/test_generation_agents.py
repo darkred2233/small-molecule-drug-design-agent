@@ -58,6 +58,46 @@ def test_targetdiff_agent_skips_without_a_real_pocket_file():
     assert result.failure_reason == "targetdiff_requires_pocket_file"
 
 
+def test_targetdiff_agent_preserves_external_failure_diagnostics(monkeypatch, tmp_path):
+    import medagent.agents.targetdiff_agent as targetdiff_agent
+
+    pocket = tmp_path / "pocket.pdb"
+    pocket.write_text("HEADER POCKET\n", encoding="utf-8")
+    monkeypatch.setattr(
+        targetdiff_agent,
+        "generation_tool_status",
+        lambda: {"targetdiff": {"available": True, "configured_timeout_seconds": 90}},
+    )
+    monkeypatch.setattr(
+        targetdiff_agent,
+        "run_targetdiff_generation",
+        lambda *_args: TargetDiffResult(
+            "targetdiff_local_generation",
+            "targetdiff",
+            False,
+            warnings=["targetdiff_execution_failed"],
+            stderr="AttributeError: module 'numpy' has no attribute 'long'",
+            exit_code=1,
+            runtime_seconds=6.2,
+            provenance={"command": ["python", "sample_for_pocket.py"]},
+        ),
+    )
+
+    result = TargetDiffAgent().run(
+        AgentTask(
+            agent="targetdiff",
+            round=1,
+            constraints={"requested_count": 1},
+            resource_bundle={"pocket_file": str(pocket)},
+        )
+    )
+
+    assert result.success is False
+    assert result.execution_details["exit_code"] == 1
+    assert "numpy" in result.execution_details["stderr"]
+    assert result.execution_details["command"] == ["python", "sample_for_pocket.py"]
+
+
 def test_autogrow_agent_preserves_batch_failure_diagnostics(monkeypatch, tmp_path):
     import medagent.agents.autogrow4_agent as autogrow4_agent
 

@@ -39,6 +39,19 @@ def canonical_json_hash(payload: Any) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _json_compatible(value: Any) -> Any:
+    """Convert runtime metadata to values accepted by JSON database columns."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_compatible(item) for item in value]
+    return value
+
+
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -91,18 +104,18 @@ class CapabilitySnapshot:
         budget: dict[str, Any] | None = None,
         estimated_runtime: dict[str, Any] | None = None,
     ) -> "CapabilitySnapshot":
-        normalized_tools = {
+        normalized_tools = _json_compatible({
             name: dict(value or {})
             for name, value in sorted(tools.items())
-        }
+        })
         payload = {
             "tools": normalized_tools,
             "source_release_ids": sorted(source_release_ids or []),
-            "target_resource": dict(target_resource or {}),
-            "runtime": dict(runtime or {}),
-            "licenses": dict(licenses or {}),
-            "budget": dict(budget or {}),
-            "estimated_runtime": dict(estimated_runtime or {}),
+            "target_resource": _json_compatible(dict(target_resource or {})),
+            "runtime": _json_compatible(dict(runtime or {})),
+            "licenses": _json_compatible(dict(licenses or {})),
+            "budget": _json_compatible(dict(budget or {})),
+            "estimated_runtime": _json_compatible(dict(estimated_runtime or {})),
         }
         snapshot_hash = canonical_json_hash(payload)
         return cls(

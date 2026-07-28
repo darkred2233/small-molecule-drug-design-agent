@@ -2,6 +2,7 @@ import { api } from '@/api/client';
 import type { AdmetResult, CampaignRun, DockingResult, Molecule, ProjectRound, Ranking, RoundSummary, StrategyDraft, SynthesisRoute } from '@/types/workbench';
 
 const base = (projectId: string, roundId?: string) => `/projects/${projectId}/rounds${roundId ? `/${roundId}` : ''}`;
+const strategyRequestTimeoutMs = 300_000;
 
 export const roundsApi = {
   list: (projectId: string) => api.get<ProjectRound[]>(base(projectId)),
@@ -17,9 +18,9 @@ export const roundsApi = {
   synthesis: (projectId: string, roundId: string) => api.get<SynthesisRoute[]>(`${base(projectId, roundId)}/synthesis-routes`),
   summary: (projectId: string, roundId: string) => api.get<RoundSummary>(`${base(projectId, roundId)}/summary`),
   report: (projectId: string, roundId: string) => api.get<Record<string, unknown>>(`${base(projectId, roundId)}/report`),
-  draftStrategy: (projectId: string, roundId: string, body: { user_message?: string; user_overrides?: Record<string, unknown> }) => api.post<StrategyDraft>(`${base(projectId, roundId)}/strategy/draft`, body),
+  draftStrategy: (projectId: string, roundId: string, body: { user_message?: string; user_overrides?: Record<string, unknown> }) => api.post<StrategyDraft>(`${base(projectId, roundId)}/strategy/draft`, body, { timeoutMs: strategyRequestTimeoutMs }),
   strategy: (projectId: string, roundId: string) => api.get<StrategyDraft>(`${base(projectId, roundId)}/strategy`),
-  reviseStrategy: (projectId: string, roundId: string, body: { user_message: string; user_overrides?: Record<string, unknown> }) => api.post<StrategyDraft>(`${base(projectId, roundId)}/strategy/revise`, body),
+  reviseStrategy: (projectId: string, roundId: string, body: { user_message: string; user_overrides?: Record<string, unknown> }) => api.post<StrategyDraft>(`${base(projectId, roundId)}/strategy/revise`, body, { timeoutMs: strategyRequestTimeoutMs }),
   confirmStrategy: (projectId: string, roundId: string, body: { confirmed: boolean; user_modifications?: Record<string, unknown> }) => api.post<{ round_id: string; status: string; message: string }>(`${base(projectId, roundId)}/strategy/confirm`, body),
   critique: (projectId: string, roundId: string, moleculeId: string) => api.post<Record<string, unknown>>(`${base(projectId, roundId)}/molecules/${moleculeId}/critique`, {}),
 };

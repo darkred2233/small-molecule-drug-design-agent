@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from medagent.services.tool_config import configured_paths_exist, get_tool_runtime_config, resolve_configured_path
 
 
@@ -55,13 +57,22 @@ def check_aizynthfinder_available() -> dict[str, Any]:
         "path": str(cli) if cli and cli.is_file() else None,
         "python_executable": str(python) if python and python.is_file() else None,
         "model_configured": False,
+        "model_artifact_paths": [],
+        "missing_model_paths": [],
         "runtime_available": False,
         "missing_paths": missing_paths,
         "warning": None,
         **config.as_status(),
     }
     config_file = _default_config_path()
-    result["model_configured"] = bool(config_file and _config_file_ready(config_file))
+    if config_file and _config_file_ready(config_file):
+        artifact_paths = _configured_model_artifact_paths(config_file, config_file.parent)
+        missing_model_paths = [
+            str(path) for path in artifact_paths if not _nonempty_file(path)
+        ]
+        result["model_artifact_paths"] = [str(path) for path in artifact_paths]
+        result["missing_model_paths"] = missing_model_paths
+        result["model_configured"] = bool(artifact_paths) and not missing_model_paths
     if not required_ready:
         result["warning"] = "aizynthfinder_required_files_missing"
         return result
@@ -72,7 +83,11 @@ def check_aizynthfinder_available() -> dict[str, Any]:
         result["warning"] = "aizynthfinder_local_cli_not_found"
         return result
     if not result["model_configured"]:
-        result["warning"] = "aizynthfinder_config_not_configured"
+        result["warning"] = (
+            "aizynthfinder_model_artifacts_missing"
+            if result["missing_model_paths"]
+            else "aizynthfinder_config_not_configured"
+        )
         return result
     try:
         probe = subprocess.run(
@@ -97,6 +112,7 @@ def aizynthfinder_tool_status() -> dict[str, Any]:
         "version": status.get("version"),
         "path": status.get("path"),
         "model_configured": status.get("model_configured", False),
+        "missing_model_paths": status.get("missing_model_paths", []),
         "runtime_available": status.get("runtime_available", status["available"]),
         "warning": status.get("warning"),
     }
@@ -143,6 +159,19 @@ def run_aizynthfinder_retrosynthesis(
             warnings=["aizynthfinder_config_empty"],
             runtime_seconds=time.monotonic() - start_time,
         )
+    missing_model_paths = [
+        str(path)
+        for path in _configured_model_artifact_paths(config_file, config_file.parent)
+        if not _nonempty_file(path)
+    ]
+    if missing_model_paths:
+        return AiZynthFinderResult(
+            adapter_mode="aizynthfinder_model_artifacts_missing",
+            tool_name="aizynthfinder",
+            success=False,
+            warnings=["aizynthfinder_model_artifacts_missing"],
+            runtime_seconds=time.monotonic() - start_time,
+        )
     return _run_aizynthfinder_local(request, status, config_file, start_time)
 
 def _default_config_path() -> Path | None:
@@ -164,6 +193,53 @@ def _default_config_available() -> bool:
 
 
 def _config_file_ready(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _configured_model_artifact_paths(config_file: Path, working_directory: Path) -> list[Path]:
+    """Resolve model, template, and stock resources declared in a config file.
+
+    AiZynthFinder resolves relative config paths from its process working directory.
+    The adapter deliberately uses the config directory as that directory, so status
+    checks and actual executions share exactly the same path semantics.
+    """
+    try:
+        document = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(document, dict):
+        return []
+
+    raw_paths: list[str] = []
+    for section_name in ("expansion", "filter", "stock"):
+        _collect_config_resource_paths(document.get(section_name), raw_paths)
+
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for raw_path in raw_paths:
+        path = Path(raw_path).expanduser()
+        resolved = path.resolve() if path.is_absolute() else (working_directory / path).resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            paths.append(resolved)
+    return paths
+
+
+def _collect_config_resource_paths(value: Any, paths: list[str]) -> None:
+    if isinstance(value, str) and value.strip():
+        paths.append(value.strip())
+    elif isinstance(value, list):
+        for item in value:
+            _collect_config_resource_paths(item, paths)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_config_resource_paths(item, paths)
+
+
+def _nonempty_file(path: Path) -> bool:
     try:
         return path.is_file() and path.stat().st_size > 0
     except OSError:

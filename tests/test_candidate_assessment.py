@@ -225,6 +225,54 @@ def test_assessment_backfills_missing_molecule_properties(tmp_path):
         assert properties.tpsa is not None
 
 
+def test_property_constraints_reject_out_of_range_molecule(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'constraints.db'}")
+    engine = build_engine(settings)
+    Base.metadata.create_all(bind=engine)
+    session_factory = build_session_factory(settings)
+
+    with session_factory() as db:
+        project = Project(project_id="PROJ-CONSTRAINTS", name="Constraints")
+        molecule = Molecule(
+            molecule_id="MOL-CONSTRAINTS",
+            project_id=project.project_id,
+            smiles="CCO",
+            status="generated",
+            labels=[],
+        )
+        db.add_all([project, molecule])
+        db.flush()
+        db.add(
+            MoleculeProperty(
+                molecule_id=molecule.molecule_id,
+                mw=46.07,
+                logp=-0.001,
+                tpsa=20.23,
+                hbd=1,
+                hba=1,
+            )
+        )
+        db.flush()
+
+        result = candidate_assessment._apply_coarse_screen_labels(
+            db,
+            [molecule],
+            property_constraints={
+                "mw_range": [100.0, 500.0],
+                "logp_range": [1.0, 4.0],
+                "tpsa_range": [0.0, 100.0],
+                "hbd_range": [0, 5],
+                "hba_range": [0, 10],
+            },
+        )
+
+        reasons = result["failure_reasons_by_id"][molecule.molecule_id]
+        assert "property_mw_below_min" in reasons
+        assert "property_logp_below_min" in reasons
+        assert molecule.molecule_id in result["failed_molecule_ids"]
+        assert "rejected_by_coarse_screen" in molecule.labels
+
+
 def _successful_retrosynthesis_result() -> AiZynthFinderResult:
     return AiZynthFinderResult(
         adapter_mode="aizynthfinder_local",
@@ -1143,7 +1191,13 @@ def test_external_refinement_skips_coarse_screen_failures(tmp_path, monkeypatch)
 
     original_failure_reasons = candidate_assessment._assessment_failure_reasons
 
-    def fake_failure_reasons(db, molecule, synthesis_route=None, round_id=None):
+    def fake_failure_reasons(
+        db,
+        molecule,
+        synthesis_route=None,
+        round_id=None,
+        property_constraints=None,
+    ):
         if molecule.smiles == "CCO":
             return ["assessment_bad_pose"]
         return original_failure_reasons(
@@ -1151,6 +1205,7 @@ def test_external_refinement_skips_coarse_screen_failures(tmp_path, monkeypatch)
             molecule,
             synthesis_route=synthesis_route,
             round_id=round_id,
+            property_constraints=property_constraints,
         )
 
     def fake_external_docking(request, tool_status):

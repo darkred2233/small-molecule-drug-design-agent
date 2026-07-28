@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -75,7 +76,10 @@ def test_rcsb_import_creates_an_active_hashed_project_structure(tmp_path, monkey
             return FakeResponse(PDB_PAYLOAD, "chemical/x-pdb")
         raise AssertionError(url)
 
-    monkeypatch.setattr("medagent.services.structure_workflow.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "medagent.services.structure_workflow._DIRECT_URL_OPENER",
+        SimpleNamespace(open=fake_urlopen),
+    )
 
     with make_client(tmp_path) as client:
         project_id = create_project(client)

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 from sqlalchemy.orm import Session
 
@@ -32,6 +32,10 @@ from medagent.services.scientific_execution import (
 )
 from medagent.services.scientific_persistence import persist_scientific_result
 from medagent.services.structure_workflow import get_project_structure, structure_source_file
+
+
+# RCSB is reached directly so a stale process-level proxy cannot block receptor preparation.
+_DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
 
 
 @dataclass
@@ -482,7 +486,7 @@ def _resolve_remote_receptor_path(receptor_reference: str) -> Path | None:
 
     download_url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
     try:
-        with urlopen(download_url, timeout=30) as response:
+        with _DIRECT_URL_OPENER.open(download_url, timeout=30) as response:
             payload = response.read()
     except (HTTPError, URLError, TimeoutError, OSError):
         return None

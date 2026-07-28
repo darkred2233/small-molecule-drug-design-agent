@@ -98,6 +98,7 @@ class StrategyValidator:
         crem["num_molecules"] = self._bounded_count(
             crem.get("num_molecules", 100), self.MAX_CREM_MOLECULES, 50, warnings, "CReM"
         )
+        self._disable_zero_count(crem, "CReM", warnings)
         crem["edit_depth"] = self._bounded_int(crem.get("edit_depth", 2), 1, 5, 2)
         self._disable_if_unavailable(crem, "crem", tool_availability, warnings)
         has_seed_source = bool(
@@ -117,6 +118,7 @@ class StrategyValidator:
             warnings,
             "TargetDiff",
         )
+        self._disable_zero_count(targetdiff, "TargetDiff", warnings)
         targetdiff.setdefault("sampling_mode", "balanced")
         if targetdiff["sampling_mode"] not in {"fast", "balanced", "thorough"}:
             targetdiff["sampling_mode"] = "balanced"
@@ -137,6 +139,7 @@ class StrategyValidator:
         autogrow4["num_molecules"] = self._bounded_count(
             autogrow4.get("num_molecules", 100), self.MAX_AUTOGROW4_MOLECULES, 50, warnings, "AutoGrow4"
         )
+        self._disable_zero_count(autogrow4, "AutoGrow4", warnings)
         autogrow4["generations"] = self._bounded_int(
             autogrow4.get("generations", 5), 1, self.MAX_AUTOGROW4_GENERATIONS, 5
         )
@@ -314,6 +317,15 @@ class StrategyValidator:
         if config.get("enabled") and not StrategyValidator._is_available(tool_availability.get(method, False)):
             config["enabled"] = False
             warnings.append(f"{method} 工具不可用，已自动禁用")
+
+    @staticmethod
+    def _disable_zero_count(
+        config: dict[str, Any], method: str, warnings: list[str]
+    ) -> None:
+        """Treat an explicit zero budget as a disabled campaign."""
+        if config.get("enabled") and config.get("num_molecules") == 0:
+            config["enabled"] = False
+            warnings.append(f"{method} 生成数量为 0，已禁用")
 
     @staticmethod
     def _is_available(value: Any) -> bool:

@@ -20,6 +20,7 @@ database/*
 *.log
 *.pid
 *.zip
+*.pdbqt
 coverage/
 test-results/
 playwright-report/

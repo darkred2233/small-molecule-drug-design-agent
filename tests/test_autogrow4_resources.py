@@ -2,7 +2,10 @@ from medagent.core.config import Settings
 from medagent.db.models import Base, BindingSite, Molecule, Project, ProjectRound, Ranking
 from medagent.db.session import build_engine, build_session_factory
 from medagent.domain.schemas import AutoGrow4CampaignConfig
-from medagent.services.autogrow4_resources import resolve_autogrow4_resources
+from medagent.services.autogrow4_resources import (
+    _write_source_compounds,
+    resolve_autogrow4_resources,
+)
 
 
 def test_autogrow4_uses_source_pdb_and_keeps_prepared_pdbqt_for_docking(tmp_path, monkeypatch):
@@ -113,3 +116,23 @@ def test_autogrow4_uses_source_pdb_and_keeps_prepared_pdbqt_for_docking(tmp_path
     assert bundle.grid_center == [2.6, -2.3, -19.4]
     assert bundle.grid_size == [28.3, 18.0, 18.4]
     assert (tmp_path / bundle.source_compounds_file).read_text(encoding="utf-8") == "CCO\tMOL-TOP\n"
+
+
+def test_autogrow4_campaign_source_files_use_distinct_artifact_ids(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    project = Project(project_id="PROJ-ARTIFACTS", name="Artifact paths")
+
+    first = _write_source_compounds(
+        project,
+        [("CCO", "MOL-ONE")],
+        artifact_id="CAMPAIGN-ONE",
+    )
+    second = _write_source_compounds(
+        project,
+        [("CCN", "MOL-TWO")],
+        artifact_id="CAMPAIGN-TWO",
+    )
+
+    assert first != second
+    assert first.read_text(encoding="utf-8") == "CCO\tMOL-ONE\n"
+    assert second.read_text(encoding="utf-8") == "CCN\tMOL-TWO\n"

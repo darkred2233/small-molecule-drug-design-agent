@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from medagent.db.models import (
+    AgentRun,
     CampaignRun,
     Molecule,
     Project,
@@ -36,6 +38,23 @@ from medagent.pipeline.state import (
     ROUND_RUNNING,
 )
 from medagent.services.ids import new_id
+
+
+def _campaign_metrics(result: Any) -> dict[str, Any]:
+    return {
+        "failure_reason": result.failure_reason,
+        "execution": dict(result.execution_details or {}),
+    }
+
+
+def _exception_metrics(failure_reason: str, exc: Exception) -> dict[str, Any]:
+    return {
+        "failure_reason": failure_reason,
+        "execution": {
+            "exception_type": type(exc).__name__,
+            "stderr": str(exc)[:4000],
+        },
+    }
 
 
 class RoundOrchestrator:
@@ -89,13 +108,10 @@ class RoundOrchestrator:
         self,
         db: Session,
         round_obj: ProjectRound,
-        execution_config: dict[str, Any] | None = None,
     ) -> None:
         """设置 round 为 running。"""
         round_obj.status = ROUND_RUNNING
         round_obj.started_at = datetime.now(UTC)
-        if execution_config:
-            round_obj.execution_config_snapshot_json = execution_config
         db.flush()
 
     def complete_round(
@@ -146,6 +162,7 @@ class RoundOrchestrator:
             task = AgentTask(
                 round=round_obj.round_number,
                 agent="crem",
+                project_id=project.project_id,
                 seed_molecules=seeds,
                 constraints={"requested_count": config.num_molecules},
                 round_id=round_obj.round_id,
@@ -153,6 +170,7 @@ class RoundOrchestrator:
                 campaign_config=config.model_dump(),
             )
             result = agent.run(task)
+            campaign.metrics_json = _campaign_metrics(result)
 
             if result.success:
                 molecule_ids = self._store_agent_molecules(
@@ -165,8 +183,10 @@ class RoundOrchestrator:
                 campaign.warnings_json = result.warnings
 
         except Exception as exc:
+            warning = f"crem_campaign_exception:{type(exc).__name__}:{exc}"
             campaign.status = CAMPAIGN_FAILED
-            campaign.warnings_json = [f"crem_campaign_exception:{type(exc).__name__}:{exc}"]
+            campaign.warnings_json = [warning]
+            campaign.metrics_json = _exception_metrics(warning, exc)
 
         campaign.completed_at = datetime.now(UTC)
         db.flush()
@@ -203,14 +223,21 @@ class RoundOrchestrator:
             task = AgentTask(
                 round=round_obj.round_number,
                 agent="targetdiff",
+                project_id=project.project_id,
                 seed_molecules=seeds,
-                constraints={"requested_count": config.num_molecules},
+                constraints={
+                    "requested_count": config.num_molecules,
+                    "output_dir": self._campaign_output_dir(
+                        project, campaign, "targetdiff"
+                    ),
+                },
                 round_id=round_obj.round_id,
                 campaign_run_id=campaign.campaign_run_id,
                 campaign_config=campaign_config,
                 resource_bundle=bundle.model_dump(),
             )
             result = agent.run(task)
+            campaign.metrics_json = _campaign_metrics(result)
 
             if result.success:
                 molecule_ids = self._store_agent_molecules(
@@ -224,8 +251,10 @@ class RoundOrchestrator:
                 campaign.warnings_json = result.warnings
 
         except Exception as exc:
+            warning = f"targetdiff_campaign_exception:{type(exc).__name__}:{exc}"
             campaign.status = CAMPAIGN_FAILED
-            campaign.warnings_json = [f"targetdiff_campaign_exception:{type(exc).__name__}:{exc}"]
+            campaign.warnings_json = [warning]
+            campaign.metrics_json = _exception_metrics(warning, exc)
 
         campaign.completed_at = datetime.now(UTC)
         db.flush()
@@ -239,6 +268,7 @@ class RoundOrchestrator:
         config: AutoGrow4CampaignConfig,
         seeds: list[str],
         seed_molecule_ids: list[str] | None = None,
+        seed_plan: dict[str, Any] | None = None,
     ) -> CampaignRun:
         """运行 AutoGrow4 campaign。"""
         campaign = self._create_campaign_run(
@@ -251,7 +281,24 @@ class RoundOrchestrator:
         try:
             from medagent.services.autogrow4_resources import resolve_autogrow4_resources
 
-            bundle = resolve_autogrow4_resources(db, project, config)
+            effective_seed_plan = seed_plan or {
+                "smiles": seeds,
+                "molecule_ids": seed_molecule_ids or [],
+            }
+            source_smiles = list(effective_seed_plan.get("smiles") or [])
+            source_ids = list(effective_seed_plan.get("molecule_ids") or [])
+            source_compounds = [
+                (smiles, source_ids[index] if index < len(source_ids) else f"seed_{index}")
+                for index, smiles in enumerate(source_smiles)
+            ]
+            bundle = resolve_autogrow4_resources(
+                db,
+                project,
+                config,
+                source_compounds=source_compounds,
+                parent_round_id=round_obj.parent_round_id,
+                artifact_id=campaign.campaign_run_id,
+            )
             campaign.resource_bundle_json = bundle.model_dump()
 
             from medagent.agents.autogrow4_agent import AutoGrow4Agent
@@ -260,14 +307,21 @@ class RoundOrchestrator:
             task = AgentTask(
                 round=round_obj.round_number,
                 agent="autogrow4",
-                seed_molecules=seeds,
-                constraints={"requested_count": config.num_molecules},
+                project_id=project.project_id,
+                seed_molecules=list(effective_seed_plan.get("smiles") or []),
+                constraints={
+                    "requested_count": config.num_molecules,
+                    "output_dir": self._campaign_output_dir(
+                        project, campaign, "autogrow4"
+                    ),
+                },
                 round_id=round_obj.round_id,
                 campaign_run_id=campaign.campaign_run_id,
                 campaign_config=config.model_dump(),
                 resource_bundle=bundle.model_dump(),
             )
             result = agent.run(task)
+            campaign.metrics_json = _campaign_metrics(result)
 
             if result.success:
                 molecule_ids = self._store_agent_molecules(
@@ -280,8 +334,10 @@ class RoundOrchestrator:
                 campaign.warnings_json = result.warnings
 
         except Exception as exc:
+            warning = f"autogrow4_campaign_exception:{type(exc).__name__}:{exc}"
             campaign.status = CAMPAIGN_FAILED
-            campaign.warnings_json = [f"autogrow4_campaign_exception:{type(exc).__name__}:{exc}"]
+            campaign.warnings_json = [warning]
+            campaign.metrics_json = _exception_metrics(warning, exc)
 
         campaign.completed_at = datetime.now(UTC)
         db.flush()
@@ -297,6 +353,8 @@ class RoundOrchestrator:
         project: Project,
         round_obj: ProjectRound,
         assessment_config: dict[str, Any] | None = None,
+        property_constraints: dict[str, Any] | None = None,
+        scientific_preflight: dict[str, Any] | None = None,
     ) -> dict:
         """评估当前 round 的分子。"""
         from medagent.services.candidate_assessment import run_project_candidate_assessment
@@ -305,10 +363,6 @@ class RoundOrchestrator:
             "round_id": round_obj.round_id,
             "skip_ranking": True,
         }
-        execution_snapshot = dict(
-            getattr(round_obj, "execution_config_snapshot_json", None) or {}
-        )
-        scientific_preflight = execution_snapshot.get("scientific_preflight")
         if scientific_preflight:
             from medagent.services.scientific_workflow import stage_permissions
 
@@ -340,6 +394,7 @@ class RoundOrchestrator:
             assessment_kwargs["skip_synthesis"] = bool(
                 assessment_config.get("skip_synthesis", False)
             )
+        assessment_kwargs["property_constraints"] = dict(property_constraints or {})
 
         return run_project_candidate_assessment(db, project, **assessment_kwargs)
 
@@ -399,20 +454,20 @@ class RoundOrchestrator:
         db: Session,
         project: Project,
         round_obj: ProjectRound,
-        campaign_config: CampaignConfig,
-        assessment_config: dict[str, Any] | None = None,
-        seeds: list[str] | None = None,
-        seed_molecule_ids: list[str] | None = None,
-        reference_ligands: list[str] | None = None,
+        execution_snapshot: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """运行单轮完整流程。"""
-        effective_seeds = seeds or []
-        effective_seed_ids = seed_molecule_ids or []
-        execution_config = {
-            "campaign_config": campaign_config.model_dump(),
-            "assessment_config": assessment_config or {},
-            "seed_molecule_ids": effective_seed_ids,
-        }
+        """Run a round exclusively from its confirmed immutable snapshot."""
+        from medagent.services.round_strategy_snapshot import validate_execution_snapshot
+
+        snapshot = validate_execution_snapshot(execution_snapshot)
+        strategy = snapshot["strategy"]
+        campaign_config = CampaignConfig.model_validate(strategy.get("campaign_config") or {})
+        assessment_config = dict(strategy.get("assessment_config") or {})
+        property_constraints = dict(strategy.get("property_constraints") or {})
+        seed_plan = snapshot["resolved_seed_plan"]
+        effective_seeds = list(seed_plan.get("smiles") or [])
+        effective_seed_ids = list(seed_plan.get("molecule_ids") or [])
+        method_seed_plans = dict(seed_plan.get("methods") or {})
         from medagent.services.scientific_workflow import prepare_round_preflight
 
         scientific_preflight = prepare_round_preflight(
@@ -433,8 +488,7 @@ class RoundOrchestrator:
                 "blockers": scientific_preflight["plan"]["blockers"],
                 "scientific_preflight": scientific_preflight,
             }
-        execution_config["scientific_preflight"] = scientific_preflight
-        self.start_round(db, round_obj, execution_config)
+        self.start_round(db, round_obj)
         from medagent.services.scientific_workflow import (
             queue_round_jobs,
             record_round_stage_outcome,
@@ -462,7 +516,7 @@ class RoundOrchestrator:
 
         # CReM
         start_round_stage_job(db, jobs["generate_candidates"])
-        if campaign_config.crem.enabled:
+        if campaign_config.crem.enabled and campaign_config.crem.num_molecules > 0:
             if bool((tools.get("crem") or {}).get("available")):
                 campaigns["crem"] = self.run_crem_campaign(
                     db,
@@ -479,7 +533,7 @@ class RoundOrchestrator:
                 )
 
         # TargetDiff
-        if campaign_config.targetdiff.enabled:
+        if campaign_config.targetdiff.enabled and campaign_config.targetdiff.num_molecules > 0:
             if (
                 target_resource.get("pocket_predicted")
                 and target_resource.get("targetdiff_pocket")
@@ -496,7 +550,7 @@ class RoundOrchestrator:
                 )
 
         # AutoGrow4
-        if campaign_config.autogrow4.enabled:
+        if campaign_config.autogrow4.enabled and campaign_config.autogrow4.num_molecules > 0:
             if (
                 target_resource.get("pocket_predicted")
                 and target_resource.get("prepared_receptor")
@@ -509,6 +563,7 @@ class RoundOrchestrator:
                     campaign_config.autogrow4,
                     effective_seeds,
                     effective_seed_ids,
+                    method_seed_plans.get("autogrow4"),
                 )
             else:
                 campaigns["autogrow4"] = self._create_blocked_campaign(
@@ -547,7 +602,14 @@ class RoundOrchestrator:
         # 评估
         for stage in ("vina_screen", "gnina_refine", "admet_batch", "retrosynthesis_batch"):
             start_round_stage_job(db, jobs[stage])
-        assessment_result = self.run_round_assessment(db, project, round_obj, assessment_config)
+        assessment_result = self.run_round_assessment(
+            db,
+            project,
+            round_obj,
+            assessment_config,
+            property_constraints,
+            scientific_preflight,
+        )
         docking_payload = assessment_result.get("docking") or {}
         docking_adapter_mode = str(docking_payload.get("adapter_mode") or "").lower()
         stage_payloads = {
@@ -605,6 +667,7 @@ class RoundOrchestrator:
 
         # 本轮 critique 持久化后再次排名，最终结果和报告才能吸收最新反证。
         refutation_result = self.run_round_self_refutation(db, project, round_obj)
+        ranking_result = pre_ranking_result
         if ranking_stage["allowed"]:
             ranking_result = self.run_round_ranking(
                 db, project, round_obj, ranking_phase="post_refutation"
@@ -665,6 +728,19 @@ class RoundOrchestrator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _campaign_output_dir(
+        self, project: Project, campaign: CampaignRun, method: str
+    ) -> str:
+        output_dir = (
+            Path(self.settings.storage_local_root)
+            / project.project_id
+            / "campaigns"
+            / campaign.campaign_run_id
+            / method
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return str(output_dir)
 
     def _create_campaign_run(
         self,
@@ -864,11 +940,40 @@ class RoundOrchestrator:
             )
 
             # 保存到 user_conditions_json
+            from medagent.services.round_strategy_snapshot import persist_strategy_document
+
             round_obj.user_conditions_json = {
-                "strategy_draft": validated_strategy,
+                **dict(round_obj.user_conditions_json or {}),
                 "tool_availability": tool_availability,
                 "auto_generated": True,
             }
+            persist_strategy_document(round_obj, validated_strategy, source="llm_auto")
+            planner_metadata = validated_strategy.get("planner_metadata") or {}
+            db.add(
+                AgentRun(
+                    agent_run_id=new_id("RUN"),
+                    project_id=project.project_id,
+                    round_id=round_obj.round_id,
+                    agent_name="round_strategy_agent",
+                    model_name=planner_metadata.get("provider")
+                    or "deterministic_fallback",
+                    status=(
+                        "completed"
+                        if planner_metadata.get("mode") == "llm"
+                        else "completed_with_fallback"
+                    ),
+                    input_json={
+                        "round_number": round_obj.round_number,
+                        "parent_round_id": round_obj.parent_round_id,
+                        "tool_availability": tool_availability,
+                        "auto_generated": True,
+                    },
+                    output_json={
+                        "strategy_draft": validated_strategy,
+                        "planning_mode": planner_metadata.get("mode"),
+                    },
+                )
+            )
             round_obj.status = "ready"
             db.flush()
 

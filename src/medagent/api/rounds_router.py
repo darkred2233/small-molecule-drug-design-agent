@@ -66,10 +66,13 @@ def update_round(project_id: str, round_id: str, body: dict[str, Any], db: Sessi
     pr = _get_round(db, project_id, round_id)
     if pr.status != "draft":
         raise HTTPException(400, f"Cannot modify round in status '{pr.status}'")
+    if "execution_config_snapshot_json" in body:
+        raise HTTPException(
+            409,
+            "执行快照只能由策略确认接口生成，不能通过草稿更新写入",
+        )
     if "user_conditions_json" in body:
         pr.user_conditions_json = body["user_conditions_json"]
-    if "execution_config_snapshot_json" in body:
-        pr.execution_config_snapshot_json = body["execution_config_snapshot_json"]
     db.commit()
     return _round_to_read(pr)
 
@@ -79,31 +82,36 @@ def start_round(project_id: str, round_id: str, body: RoundStartRequest | None =
     """启动 round 运行。"""
     project = _ensure_project(db, project_id)
     pr = _get_round(db, project_id, round_id)
-    if pr.status not in ("draft", "ready"):
+    if pr.status != "queued":
         raise HTTPException(400, f"Cannot start round in status '{pr.status}'")
+    if body and (body.campaign_config or body.assessment_config):
+        raise HTTPException(409, "执行参数只能来自已确认的策略快照，请在策略页修改并确认")
+    if not pr.execution_config_snapshot_json:
+        raise HTTPException(409, "该轮次没有已确认的执行快照，请先确认策略")
+    from medagent.services.round_strategy_snapshot import (
+        ExecutionSnapshotError,
+        validate_execution_snapshot,
+    )
+
+    try:
+        snapshot = validate_execution_snapshot(pr.execution_config_snapshot_json)
+    except ExecutionSnapshotError as exc:
+        raise HTTPException(409, f"执行快照无效：{exc}") from exc
+    conditions = dict(pr.user_conditions_json or {})
+    if (
+        conditions.get("strategy_status") != "confirmed"
+        or conditions.get("confirmed_strategy_hash") != snapshot["strategy_hash"]
+    ):
+        raise HTTPException(409, "执行快照未通过用户确认，无法启动轮次")
 
     from medagent.pipeline.round_orchestrator import RoundOrchestrator
     from medagent.core.config import get_settings
     orch = RoundOrchestrator(get_settings())
-
-    campaign_config = _campaign_config_from_payload(body.campaign_config if body else None)
-    assessment_config = body.assessment_config if body else None
-
-    from medagent.db.models import SeedLigand
-    seeds_db = db.query(SeedLigand).filter(
-        SeedLigand.project_id == project_id,
-    ).all()
-    seeds = [s.smiles for s in seeds_db if s.smiles]
-    seed_molecule_ids = [s.ligand_id for s in seeds_db if s.smiles]
-
     result = orch.run_round(
         db,
         project,
         pr,
-        campaign_config,
-        assessment_config=assessment_config,
-        seeds=seeds,
-        seed_molecule_ids=seed_molecule_ids,
+        pr.execution_config_snapshot_json,
     )
     db.commit()
     return result
@@ -617,8 +625,12 @@ def generate_strategy_draft(
 
     # 保存策略草稿到 round 的 user_conditions_json
     user_conditions = dict(pr.user_conditions_json or {})
+    from medagent.services.round_strategy_snapshot import persist_strategy_document
+
+    pr.user_conditions_json = user_conditions
+    persist_strategy_document(pr, validated_strategy, source="llm")
+    user_conditions = dict(pr.user_conditions_json or {})
     user_conditions.update({
-        "strategy_draft": validated_strategy,
         "tool_availability": tool_availability,
         "generated_at": datetime.now(UTC).isoformat(),
     })
@@ -639,6 +651,11 @@ def generate_strategy_draft(
             "strategy_draft": validated_strategy,
             "validation_applied": True,
         },
+    )
+    planner_metadata = validated_strategy.get("planner_metadata") or {}
+    audit_run.model_name = planner_metadata.get("provider") or "deterministic_fallback"
+    audit_run.status = (
+        "completed" if planner_metadata.get("mode") == "llm" else "completed_with_fallback"
     )
     db.add(audit_run)
     db.commit()
@@ -667,7 +684,7 @@ def get_strategy_draft(
     """查看当前策略草稿。"""
     pr = _get_round(db, project_id, round_id)
 
-    user_conditions = pr.user_conditions_json or {}
+    user_conditions = dict(pr.user_conditions_json or {})
     strategy_draft = user_conditions.get("strategy_draft")
 
     if not strategy_draft:
@@ -737,15 +754,19 @@ def revise_strategy_draft(
         "user_overrides": body.user_overrides,
         "previous_strategy": existing_strategy,
     })
+    from medagent.services.round_strategy_snapshot import persist_strategy_document
+
+    pr.user_conditions_json = user_conditions
+    persist_strategy_document(pr, validated, source="user_llm_revision", changed_at=revised_at)
+    user_conditions = dict(pr.user_conditions_json or {})
     user_conditions.update({
-        "strategy_draft": validated,
         "tool_availability": tool_availability,
         "strategy_revision_history": history,
         "revised_at": revised_at,
     })
     pr.user_conditions_json = user_conditions
     pr.status = "ready"
-    db.add(AgentRun(
+    revision_run = AgentRun(
         agent_run_id=new_id("RUN"),
         project_id=project_id,
         round_id=round_id,
@@ -758,7 +779,13 @@ def revise_strategy_draft(
             "existing_strategy": existing_strategy,
         },
         output_json={"strategy_draft": validated},
-    ))
+    )
+    planner_metadata = validated.get("planner_metadata") or {}
+    revision_run.model_name = planner_metadata.get("provider") or "deterministic_fallback"
+    revision_run.status = (
+        "completed" if planner_metadata.get("mode") == "llm" else "completed_with_fallback"
+    )
+    db.add(revision_run)
     db.commit()
     return _strategy_to_read(pr, validated)
 
@@ -782,7 +809,9 @@ def confirm_and_execute_strategy(
     if pr.status not in ("draft", "ready"):
         raise HTTPException(400, f"只有 draft 或 ready 状态的 round 可以确认执行，当前状态: {pr.status}")
 
-    user_conditions = pr.user_conditions_json or {}
+    # JSON columns do not reliably detect in-place mutations. Copy before
+    # recording the confirmed strategy so the executable snapshot is persisted.
+    user_conditions = dict(pr.user_conditions_json or {})
     strategy_draft = user_conditions.get("strategy_draft")
 
     if not strategy_draft:
@@ -817,33 +846,65 @@ def confirm_and_execute_strategy(
             message="用户取消执行",
         )
 
-    # 应用用户修改
-    if body.user_modifications:
-        from medagent.services.strategy_validator import StrategyValidator
-        from medagent.core.config import get_settings
+    from medagent.core.config import get_settings
+    from medagent.services.round_strategy_snapshot import (
+        build_execution_snapshot,
+        persist_strategy_document,
+    )
+    from medagent.services.strategy_validator import StrategyValidationError, StrategyValidator
 
-        validator = StrategyValidator(get_settings())
-        tool_availability = user_conditions.get("tool_availability", {})
-        strategy_draft = validator.validate_and_fix(
+    # User changes are merged into the same canonical document. Validation may
+    # reject unsafe or unavailable execution choices, but there is no second
+    # user-only execution path.
+    tool_availability = _detect_tool_availability()
+    try:
+        strategy_draft = StrategyValidator(get_settings()).validate_and_fix(
             strategy_draft,
             tool_availability=tool_availability,
             user_overrides=body.user_modifications,
         )
-
-        # 更新确认审计记录
+    except StrategyValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if body.user_modifications:
         confirmation_audit["modified_strategy"] = strategy_draft
-
-    # 转换策略草稿为执行配置
-    campaign_config = _strategy_to_campaign_config(strategy_draft)
-    assessment_config = strategy_draft.get("assessment_config", {})
 
     # 准备种子分子
     seeds, seed_molecule_ids = _prepare_seed_selection(db, project, pr, strategy_draft)
+    method_seed_plans: dict[str, dict[str, Any]] = {}
+    campaign_config = _strategy_to_campaign_config(strategy_draft)
+    if campaign_config.autogrow4.enabled and campaign_config.autogrow4.num_molecules > 0:
+        from medagent.services.autogrow4_resources import resolve_autogrow4_seed_plan
 
-    user_conditions["strategy_draft"] = strategy_draft
+        method_seed_plans["autogrow4"] = resolve_autogrow4_seed_plan(
+            db,
+            project,
+            campaign_config.autogrow4,
+            parent_round_id=pr.parent_round_id,
+        )
+
+    pr.user_conditions_json = user_conditions
+    version, digest = persist_strategy_document(
+        pr,
+        strategy_draft,
+        source="user_confirmation" if body.user_modifications else "confirmation",
+        changed_at=confirmation_audit["confirmed_at"],
+    )
+    user_conditions = dict(pr.user_conditions_json or {})
+    user_conditions["tool_availability"] = tool_availability
     user_conditions["confirmed_at"] = confirmation_audit["confirmed_at"]
     user_conditions["confirmed_seed_molecule_ids"] = seed_molecule_ids
+    user_conditions["strategy_status"] = "confirmed"
+    user_conditions["confirmed_strategy_hash"] = digest
     pr.user_conditions_json = user_conditions
+    pr.execution_config_snapshot_json = build_execution_snapshot(
+        strategy_draft,
+        strategy_version=version,
+        confirmed_at=confirmation_audit["confirmed_at"],
+        parent_round_id=pr.parent_round_id,
+        seed_smiles=seeds,
+        seed_molecule_ids=seed_molecule_ids,
+        method_seed_plans=method_seed_plans,
+    )
 
     # 记录用户确认审计（成功）
     audit_run = AgentRun(
@@ -870,10 +931,6 @@ def confirm_and_execute_strategy(
         _run_confirmed_round,
         project_id=project.project_id,
         round_id=pr.round_id,
-        campaign_config=campaign_config.model_dump(),
-        assessment_config=assessment_config,
-        seeds=seeds,
-        seed_molecule_ids=seed_molecule_ids,
         settings=request.app.state.settings,
     )
 
@@ -909,10 +966,6 @@ def _run_confirmed_round(
     *,
     project_id: str,
     round_id: str,
-    campaign_config: dict[str, Any],
-    assessment_config: dict[str, Any],
-    seeds: list[str],
-    seed_molecule_ids: list[str],
     settings: Any,
 ) -> None:
     from medagent.pipeline.round_orchestrator import RoundOrchestrator
@@ -927,10 +980,7 @@ def _run_confirmed_round(
                 db,
                 project,
                 round_obj,
-                _campaign_config_from_payload(campaign_config),
-                assessment_config=assessment_config,
-                seeds=seeds,
-                seed_molecule_ids=seed_molecule_ids,
+                round_obj.execution_config_snapshot_json,
             )
             db.commit()
         except Exception as exc:

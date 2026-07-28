@@ -8,8 +8,11 @@ docking evidence.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import time
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,7 +30,7 @@ class TargetDiffRequest:
     pocket_file: str
     output_dir: str
     num_samples: int = 20
-    timeout_seconds: int = 1800
+    timeout_seconds: int = 2700
 
 
 @dataclass
@@ -46,7 +49,7 @@ class TargetDiffResult:
 
 
 def targetdiff_tool_status() -> dict[str, Any]:
-    config = get_tool_runtime_config("targetdiff", default_timeout_seconds=1800)
+    config = get_tool_runtime_config("targetdiff", default_timeout_seconds=2700)
     files_ready, missing_paths = configured_paths_exist(config)
     source_dir = resolve_configured_path(config.working_directory)
     entrypoint = _entrypoint(config.command, source_dir)
@@ -96,6 +99,7 @@ def targetdiff_tool_status() -> dict[str, Any]:
     try:
         probe_command = [str(python), str(entrypoint), "--help"]
         probe_cwd = str(source_dir)
+        probe_environment = _targetdiff_environment(source_dir)
         if is_wsl:
             assert source_dir_wsl is not None and entrypoint_wsl is not None
             probe_command = build_wsl_command(
@@ -106,6 +110,7 @@ def targetdiff_tool_status() -> dict[str, Any]:
                 environment={"PYTHONPATH": source_dir_wsl},
             )
             probe_cwd = None
+            probe_environment = None
         probe = subprocess.run(
             probe_command,
             capture_output=True,
@@ -114,6 +119,7 @@ def targetdiff_tool_status() -> dict[str, Any]:
             errors="replace" if is_wsl else None,
             timeout=45,
             cwd=probe_cwd,
+            env=probe_environment,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -146,8 +152,9 @@ def run_targetdiff_generation(
             False,
             warnings=["targetdiff_pocket_pdb_required"],
         )
-    output_dir = Path(request.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = Path(request.output_dir).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(tempfile.mkdtemp(prefix="attempt-", dir=output_root))
     python, entrypoint = str(status["python_executable"]), str(status["entrypoint"])
     source_dir = str(Path(entrypoint).parents[1])
     sampling_config = str(
@@ -166,6 +173,7 @@ def run_targetdiff_generation(
     ]
     execution_mode = "local_python"
     process_cwd: str | None = source_dir
+    process_environment = _targetdiff_environment(Path(source_dir))
     if status.get("runtime_scope") == "wsl":
         source_dir_wsl = str(status["source_dir_wsl"])
         command = build_wsl_command(
@@ -187,6 +195,7 @@ def run_targetdiff_generation(
         )
         execution_mode = "wsl_python"
         process_cwd = None
+        process_environment = None
     try:
         process = subprocess.run(
             command,
@@ -196,16 +205,18 @@ def run_targetdiff_generation(
             errors="replace" if execution_mode == "wsl_python" else None,
             timeout=request.timeout_seconds,
             cwd=process_cwd,
+            env=process_environment,
             check=False,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         return TargetDiffResult(
             "targetdiff_timeout",
             "targetdiff",
             False,
             warnings=["targetdiff_execution_timeout"],
+            stderr=str(exc)[:4000],
             runtime_seconds=time.monotonic() - started,
-            provenance=_provenance(request, command, execution_mode),
+            provenance=_provenance(request, command, execution_mode, output_dir),
         )
     except OSError as exc:
         return TargetDiffResult(
@@ -213,8 +224,9 @@ def run_targetdiff_generation(
             "targetdiff",
             False,
             warnings=[f"targetdiff_execution_os_error:{type(exc).__name__}"],
+            stderr=str(exc)[:4000],
             runtime_seconds=time.monotonic() - started,
-            provenance=_provenance(request, command, execution_mode),
+            provenance=_provenance(request, command, execution_mode, output_dir),
         )
     smiles = _read_generated_smiles(output_dir)
     success = process.returncode == 0 and bool(smiles)
@@ -238,7 +250,7 @@ def run_targetdiff_generation(
         stderr=process.stderr[:4000],
         exit_code=process.returncode,
         runtime_seconds=time.monotonic() - started,
-        provenance=_provenance(request, command, execution_mode),
+        provenance=_provenance(request, command, execution_mode, output_dir),
     )
 
 
@@ -275,13 +287,64 @@ def _entrypoint(command: str | None, source_dir: Path | None) -> Path | None:
     return candidate if candidate and candidate.is_file() else None
 
 
+def _targetdiff_environment(source_dir: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        f"{source_dir}{os.pathsep}{existing_pythonpath}"
+        if existing_pythonpath
+        else str(source_dir)
+    )
+    # Keep the model away from an already saturated second GPU by default.
+    environment.setdefault(
+        "CUDA_VISIBLE_DEVICES",
+        environment.get("MEDAGENT_TARGETDIFF_CUDA_VISIBLE_DEVICES", "0"),
+    )
+    return environment
+
+
 def _provenance(
-    request: TargetDiffRequest, command: list[str], execution_mode: str = "local_python"
+    request: TargetDiffRequest,
+    command: list[str],
+    execution_mode: str = "local_python",
+    output_dir: Path | None = None,
 ) -> dict[str, Any]:
+    artifact_root = output_dir or Path(request.output_dir)
     return {
         "execution_mode": execution_mode,
         "command": command,
         "pocket_file": request.pocket_file,
-        "raw_output_dir": request.output_dir,
+        "configured_output_root": request.output_dir,
+        "raw_output_dir": str(artifact_root),
+        "input_artifacts": {
+            "pocket_pdb": _artifact_record(Path(request.pocket_file).expanduser())
+        },
+        "output_artifacts": _artifact_inventory(artifact_root),
         "generated_pose_is_docking_evidence": False,
     }
+
+
+def _artifact_record(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": str(path.resolve()),
+        "sha256": digest.hexdigest(),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def _artifact_inventory(root: Path) -> list[dict[str, Any]]:
+    if not root.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        record = _artifact_record(path)
+        if record is not None:
+            record["relative_path"] = path.relative_to(root).as_posix()
+            records.append(record)
+    return records

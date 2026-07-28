@@ -1,13 +1,13 @@
 import { api } from '@/api/client';
 import type { BindingSite, ProjectStructure, StructureReadiness } from '@/types/workbench';
 
-interface P2RankResponse {
+export interface P2RankResponse {
   status: string;
   warnings: string[];
   binding_sites: BindingSite[];
 }
 
-interface StructurePreparation {
+export interface StructurePreparation {
   structure_id: string;
   status: string;
   prepared_receptor_file: string | null;
@@ -20,8 +20,8 @@ export const structuresApi = {
   importRcsb: (projectId: string, pdbId: string) => api.post<ProjectStructure>(`/projects/${projectId}/structures/import-rcsb`, { pdb_id: pdbId }),
   registerUpload: (projectId: string, sourceFileId: string) => api.post<ProjectStructure>(`/projects/${projectId}/structures/register-upload`, { source_file_id: sourceFileId }),
   activate: (projectId: string, structureId: string) => api.post<ProjectStructure>(`/projects/${projectId}/structures/${structureId}/activate`, {}),
-  predictPockets: (projectId: string, structureId: string) => api.post<P2RankResponse>(`/projects/${projectId}/structures/${structureId}/p2rank`, {}),
-  prepare: (projectId: string, structureId: string) => api.post<StructurePreparation>(`/projects/${projectId}/structures/${structureId}/prepare`, {}),
+  predictPockets: (projectId: string, structureId: string) => api.post<P2RankResponse>(`/projects/${projectId}/structures/${structureId}/p2rank`, {}, { timeoutMs: 660_000 }),
+  prepare: (projectId: string, structureId: string) => api.post<StructurePreparation>(`/projects/${projectId}/structures/${structureId}/prepare`, {}, { timeoutMs: 660_000 }),
   bindingSites: (projectId: string) => api.get<BindingSite[]>(`/projects/${projectId}/binding-sites`),
   selectBindingSite: (projectId: string, bindingSiteId: string) => api.post<BindingSite>(`/projects/${projectId}/binding-sites/${bindingSiteId}/select`, {}),
   readiness: (projectId: string) => api.get<StructureReadiness>(`/projects/${projectId}/structure-readiness`),

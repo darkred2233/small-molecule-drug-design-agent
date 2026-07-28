@@ -52,6 +52,9 @@ def ensure_relational_schema(engine: Engine) -> None:
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
 
+    if "projects" in table_names:
+        _ensure_missing_columns(engine, "projects", _project_columns())
+
     if "target_drug_library" in table_names:
         _ensure_missing_columns(
             engine,
@@ -142,6 +145,13 @@ def _ensure_missing_columns(
     with engine.begin() as connection:
         for name, column_type in missing_columns:
             connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {column_type}"))
+
+
+def _project_columns() -> list[tuple[str, str]]:
+    return [
+        ("active_structure_id", "VARCHAR(80)"),
+        ("active_binding_site_id", "VARCHAR(80)"),
+    ]
 
 
 def _target_drug_library_columns(dialect_name: str) -> list[tuple[str, str]]:

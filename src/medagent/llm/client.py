@@ -57,6 +57,10 @@ class LLMStreamChunk:
     finish_reason: str | None = None
 
 
+class StructuredOutputError(ValueError):
+    """Raised when an LLM response violates its requested JSON schema."""
+
+
 class LLMProvider:
     """LLM提供商基类"""
 
@@ -348,6 +352,8 @@ class LLMClient:
         """
         import json
 
+        from jsonschema import SchemaError, ValidationError, validate
+
         # 构建系统提示词
         system_prompt = (
             "你是一个专业的药物设计助手。请根据用户要求生成策略建议。\n"
@@ -388,20 +394,23 @@ class LLMClient:
 
             # 解析 JSON
             result = json.loads(content)
+            if not isinstance(result, dict):
+                raise StructuredOutputError("LLM structured output must be a JSON object")
+            try:
+                validate(instance=result, schema=schema)
+            except SchemaError as exc:
+                raise StructuredOutputError(
+                    f"invalid structured-output schema: {exc.message}"
+                ) from exc
+            except ValidationError as exc:
+                path = ".".join(str(part) for part in exc.absolute_path) or "<root>"
+                raise StructuredOutputError(
+                    f"LLM structured output failed schema validation at {path}: {exc.message}"
+                ) from exc
             return result
 
         except json.JSONDecodeError as e:
-            # JSON 解析失败，返回默认结构
-            return {
-                "objective": "生成策略（JSON 解析失败）",
-                "campaign_config": {
-                    "crem": {"enabled": False},
-                    "targetdiff": {"enabled": False, "num_molecules": 100, "sampling_mode": "balanced"},
-                    "autogrow4": {"enabled": False},
-                },
-                "rationale": f"LLM 输出解析失败: {str(e)}。已使用默认配置。",
-                "warnings": [f"JSON 解析错误: {str(e)}"],
-            }
+            raise StructuredOutputError(f"LLM structured output is not valid JSON: {e}") from e
 
     def stream(
         self,

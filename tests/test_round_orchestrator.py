@@ -97,34 +97,28 @@ def test_round_assessment_passes_preflight_stage_permissions(monkeypatch):
         return {"assessment": "ok"}
 
     monkeypatch.setattr(assessment_service, "run_project_candidate_assessment", fake_assessment)
-    round_obj = SimpleNamespace(
-        round_id="ROUND-003",
-        round_number=3,
-        execution_config_snapshot_json={
-            "scientific_preflight": {
-                "snapshot": {
-                    "target_resource": {"binding_site_id": "SITE-FROZEN"}
+    round_obj = SimpleNamespace(round_id="ROUND-003", round_number=3)
+    scientific_preflight = {
+        "snapshot": {"target_resource": {"binding_site_id": "SITE-FROZEN"}},
+        "plan": {
+            "stages": [
+                {"stage": "vina_screen", "allowed": False, "evidence_level": "L0"},
+                {"stage": "gnina_refine", "allowed": False, "evidence_level": "L0"},
+                {"stage": "admet_batch", "allowed": True, "evidence_level": "L1"},
+                {
+                    "stage": "retrosynthesis_batch",
+                    "allowed": True,
+                    "evidence_level": "L1",
                 },
-                "plan": {
-                    "stages": [
-                        {"stage": "vina_screen", "allowed": False, "evidence_level": "L0"},
-                        {"stage": "gnina_refine", "allowed": False, "evidence_level": "L0"},
-                        {"stage": "admet_batch", "allowed": True, "evidence_level": "L1"},
-                        {
-                            "stage": "retrosynthesis_batch",
-                            "allowed": True,
-                            "evidence_level": "L1",
-                        },
-                    ]
-                }
-            }
+            ]
         },
-    )
+    }
 
     RoundOrchestrator(SimpleNamespace()).run_round_assessment(
         None,
         SimpleNamespace(project_id="PROJ-ROUND"),
         round_obj,
+        scientific_preflight=scientific_preflight,
     )
 
     assert captured["stage_permissions"] == {
@@ -192,7 +186,10 @@ def test_run_round_reranks_after_current_self_refutation(monkeypatch):
     ]
     preflight = {
         "strategy_packet_id": "PACKET-STRATEGY",
-        "snapshot": {"target_resource": {}, "tools": {}},
+        "snapshot": {
+            "target_resource": {"pocket_predicted": True, "prepared_receptor": True},
+            "tools": {"crem": {"available": True}, "autogrow4": {"available": True}},
+        },
         "plan": {
             "formal_round_allowed": True,
             "stages": [
@@ -225,6 +222,26 @@ def test_run_round_reranks_after_current_self_refutation(monkeypatch):
         "run_round_assessment",
         lambda *args, **kwargs: {"docking": {}, "admet": {}, "synthesis": {}},
     )
+    generation_calls: dict[str, tuple] = {}
+
+    def fake_crem(*args):
+        generation_calls["crem"] = args
+        return SimpleNamespace(
+            campaign_run_id="CAM-CREM",
+            status="completed",
+            warnings_json=[],
+        )
+
+    def fake_autogrow(*args):
+        generation_calls["autogrow4"] = args
+        return SimpleNamespace(
+            campaign_run_id="CAM-AUTOGROW",
+            status="completed",
+            warnings_json=[],
+        )
+
+    monkeypatch.setattr(orchestrator, "run_crem_campaign", fake_crem)
+    monkeypatch.setattr(orchestrator, "run_autogrow4_campaign", fake_autogrow)
 
     def fake_ranking(*args, **kwargs):
         nonlocal ranking_runs
@@ -252,15 +269,34 @@ def test_run_round_reranks_after_current_self_refutation(monkeypatch):
         ),
     )
 
+    from medagent.services.round_strategy_snapshot import build_execution_snapshot
+
+    strategy = {
+        "campaign_config": CampaignConfig(
+            crem={"enabled": True, "num_molecules": 1},
+            targetdiff={"enabled": False},
+            autogrow4={"enabled": True, "num_molecules": 1},
+        ).model_dump(),
+        "assessment_config": {},
+        "property_constraints": {},
+        "seed_policy": {"source": "all_seeds"},
+    }
+    snapshot = build_execution_snapshot(
+        strategy,
+        strategy_version=1,
+        confirmed_at="2026-07-28T00:00:00+00:00",
+        parent_round_id=None,
+        seed_smiles=["CCO"],
+        seed_molecule_ids=["MOL-SEED"],
+        method_seed_plans={
+            "autogrow4": {"smiles": ["CCN"], "molecule_ids": ["MOL-AUTOGROW"]}
+        },
+    )
     result = orchestrator.run_round(
         None,
         SimpleNamespace(project_id="PROJ-1"),
-        SimpleNamespace(round_id="ROUND-1", round_number=1),
-        CampaignConfig(
-            crem={"enabled": False},
-            targetdiff={"enabled": False},
-            autogrow4={"enabled": False},
-        ),
+        SimpleNamespace(round_id="ROUND-1", round_number=1, parent_round_id=None),
+        snapshot,
     )
 
     assert events == [
@@ -273,6 +309,12 @@ def test_run_round_reranks_after_current_self_refutation(monkeypatch):
         {"ranking_run": 2, "ranking_phase": "post_refutation"},
     ]
     assert result["ranking"] == {"ranking_run": 2, "ranking_phase": "post_refutation"}
+    assert generation_calls["crem"][4:] == (["CCO"], ["MOL-SEED"])
+    assert generation_calls["autogrow4"][4:] == (
+        ["CCO"],
+        ["MOL-SEED"],
+        {"smiles": ["CCN"], "molecule_ids": ["MOL-AUTOGROW"]},
+    )
 
 
 def test_docking_stage_payload_does_not_promote_vina_to_gnina():

@@ -22,6 +22,7 @@ export function ProjectDataPage() {
   const queryClient = useQueryClient();
   const inputRef = useRef<HTMLInputElement>(null);
   const [progress, setProgress] = useState<number | null>(null);
+  const [seedFeedback, setSeedFeedback] = useState<{ kind: 'success' | 'error'; message: string } | null>(null);
 
   const { data: files = [] } = useQuery<UploadedFile[], Error>({
     queryKey: ['files', projectId],
@@ -69,9 +70,19 @@ export function ProjectDataPage() {
       queryClient.invalidateQueries({ queryKey: ['resources', projectId] });
     },
   });
-  const importSeeds = useMutation<Record<string, unknown>, Error>({
+  const importSeeds = useMutation({
     mutationFn: () => moleculesApi.importSeeds(projectId!),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['project', projectId] }),
+    onMutate: () => setSeedFeedback(null),
+    onSuccess: (result) => {
+      setSeedFeedback({
+        kind: 'success',
+        message: `Seed 导入成功：新增 ${result.imported_count} 个，跳过重复 ${result.duplicate_count} 个，非法 ${result.invalid_count} 个。`,
+      });
+      queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['molecules', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['target-ligands', projectId] });
+    },
+    onError: (error: Error) => setSeedFeedback({ kind: 'error', message: `Seed 导入失败：${error.message}` }),
   });
   const createFirstRound = useMutation<ProjectRound, Error>({
     mutationFn: () => roundsApi.create(projectId!, { round_number: 1, user_conditions_json: {} }),
@@ -187,10 +198,11 @@ export function ProjectDataPage() {
                 onClick={() => importSeeds.mutate()}
                 disabled={importSeeds.isPending}
               >
-                <FlaskConical size={15} />
-                导入 Seed 为分子
+                {importSeeds.isPending ? <LoaderCircle size={15} className="animate-spin" /> : <FlaskConical size={15} />}
+                {importSeeds.isPending ? 'Seed 导入中…' : '导入 Seed 为分子'}
               </button>
             </div>
+            {seedFeedback && <div className={seedFeedback.kind === 'error' ? 'notice notice-danger' : 'notice'} role={seedFeedback.kind === 'error' ? 'alert' : 'status'}>{seedFeedback.message}</div>}
           </div>
         </section>
 

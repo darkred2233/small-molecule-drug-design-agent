@@ -196,14 +196,16 @@ def run_project_p2rank(
     java = Path(str(status["java_executable"]))
     launcher = Path(str(status["launcher"]))
     working_directory = Path(str(status["working_directory"]))
+    command_input_path = input_path.resolve()
+    command_output_directory = output_directory.resolve()
     command = _p2rank_command(
         launcher,
         [
             "predict",
             "-f",
-            str(input_path),
+            str(command_input_path),
             "-o",
-            str(output_directory),
+            str(command_output_directory),
             "-visualizations",
             "0",
             "-threads",

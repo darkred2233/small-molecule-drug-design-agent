@@ -36,6 +36,7 @@ def resolve_autogrow4_resources(
     *,
     source_compounds: list[tuple[str, str]] | None = None,
     parent_round_id: str | None = None,
+    artifact_id: str | None = None,
 ) -> AutoGrow4ResourceBundle:
     """解析 AutoGrow4 运行所需的所有资源。"""
     # 1. 解析 receptor / binding site
@@ -62,7 +63,7 @@ def resolve_autogrow4_resources(
         }
 
     # 3. 写 source_compounds.smi
-    source_file = _write_source_compounds(project, source_compounds)
+    source_file = _write_source_compounds(project, source_compounds, artifact_id=artifact_id)
 
     # 4. 构建 docking config
     docking_config = _build_docking_config(config)
@@ -324,11 +325,14 @@ def _dedupe_compounds(compounds: list[tuple[str, str]]) -> list[tuple[str, str]]
 def _write_source_compounds(
     project: Project,
     compounds: list[tuple[str, str]],
+    *,
+    artifact_id: str | None = None,
 ) -> Path:
     """写 source_compounds.smi 文件。"""
     output_dir = Path(".local/projects") / project.project_id / "autogrow4"
     output_dir.mkdir(parents=True, exist_ok=True)
-    source_file = output_dir / "source_compounds.smi"
+    filename = "source_compounds.smi" if artifact_id is None else f"source_compounds_{artifact_id}.smi"
+    source_file = output_dir / filename
 
     with open(source_file, "w", encoding="utf-8") as f:
         for smiles, compound_id in compounds:

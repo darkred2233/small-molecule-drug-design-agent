@@ -384,7 +384,12 @@ def test_strategy_confirmation_queues_background_round_execution(tmp_path, monke
             "autogrow4": {"enabled": False, "num_molecules": 0},
         },
         "seed_policy": {"source": "all_seeds"},
+        "property_constraints": {
+            "mw_range": [250.0, 520.0],
+            "logp_range": [1.0, 4.5],
+        },
         "assessment_config": {"mode": "external_top_n", "top_n": 3},
+        "context_snapshot": {"data_summary": {"seed_ligand_count": 1}},
         "rationale": "Keep the test campaign intentionally small.",
         "warnings": [],
         "requires_user_confirmation": True,
@@ -400,12 +405,18 @@ def test_strategy_confirmation_queues_background_round_execution(tmp_path, monke
         with api_app.SessionLocal() as db:
             round_obj = db.query(ProjectRound).filter_by(round_id=round_id).one()
             round_obj.status = "ready"
-            round_obj.user_conditions_json = {"strategy_draft": strategy_draft}
+            round_obj.user_conditions_json = {
+                "strategy_draft": strategy_draft,
+                "tool_availability": {"crem": True},
+            }
             db.commit()
 
         response = client.post(
             f"/projects/{project_id}/rounds/{round_id}/strategy/confirm",
-            json={"confirmed": True},
+            json={
+                "confirmed": True,
+                "user_modifications": {"assessment_config": {"top_n": 2}},
+            },
         )
 
         assert response.status_code == 200
@@ -419,7 +430,7 @@ def test_strategy_confirmation_queues_background_round_execution(tmp_path, monke
         assert scheduled_runs[0]["project_id"] == project_id
         assert scheduled_runs[0]["round_id"] == round_id
         assert scheduled_runs[0]["settings"] is client.app.state.settings
-        assert scheduled_runs[0]["campaign_config"]["crem"]["num_molecules"] == 5
+        assert set(scheduled_runs[0]) == {"project_id", "round_id", "settings"}
 
         with api_app.SessionLocal() as db:
             round_obj = db.query(ProjectRound).filter_by(round_id=round_id).one()
@@ -429,6 +440,17 @@ def test_strategy_confirmation_queues_background_round_execution(tmp_path, monke
             ).one()
 
         assert round_obj.status == "queued"
+        assert round_obj.user_conditions_json["strategy_draft"]["assessment_config"]["top_n"] == 2
+        snapshot = round_obj.execution_config_snapshot_json
+        assert snapshot["strategy"] == round_obj.user_conditions_json["strategy_draft"]
+        assert snapshot["strategy"]["property_constraints"] == {
+            "mw_range": [250.0, 520.0],
+            "logp_range": [1.0, 4.5],
+        }
+        assert snapshot["strategy_version"] == round_obj.user_conditions_json["strategy_version"]
+        assert len(snapshot["strategy_hash"]) == 64
+        assert snapshot["resolved_seed_plan"]["molecule_ids"] == []
+        assert snapshot["resolved_seed_plan"]["smiles"] == []
         assert confirmation.status == "confirmed"
 
 
@@ -448,13 +470,29 @@ def test_background_round_failure_marks_the_round_failed(tmp_path, monkeypatch):
             json={"round_number": 1},
         ).json()["round_id"]
 
+        from medagent.services.round_strategy_snapshot import build_execution_snapshot
+
+        strategy = {
+            "campaign_config": {},
+            "assessment_config": {},
+            "property_constraints": {},
+            "seed_policy": {"source": "all_seeds"},
+        }
+        with api_app.SessionLocal() as db:
+            round_obj = db.query(ProjectRound).filter_by(round_id=round_id).one()
+            round_obj.execution_config_snapshot_json = build_execution_snapshot(
+                strategy,
+                strategy_version=1,
+                confirmed_at="2026-07-28T00:00:00+00:00",
+                parent_round_id=None,
+                seed_smiles=[],
+                seed_molecule_ids=[],
+            )
+            db.commit()
+
         rounds_router._run_confirmed_round(
             project_id=project_id,
             round_id=round_id,
-            campaign_config={},
-            assessment_config={},
-            seeds=[],
-            seed_molecule_ids=[],
             settings=client.app.state.settings,
         )
 
@@ -930,6 +968,25 @@ def test_create_round_endpoint_creates_draft(tmp_path):
         assert first_response.json()["execution_config_snapshot_json"] is None
         assert second_response.status_code == 201
         assert second_response.json()["parent_round_id"] == first_response.json()["round_id"]
+
+
+def test_round_update_cannot_write_an_execution_snapshot(tmp_path):
+    with make_client(tmp_path) as client:
+        project_id = client.post("/projects", json={"name": "Protected execution snapshot"}).json()[
+            "project_id"
+        ]
+        round_id = client.post(
+            f"/projects/{project_id}/rounds",
+            json={"round_number": 1},
+        ).json()["round_id"]
+
+        response = client.put(
+            f"/projects/{project_id}/rounds/{round_id}",
+            json={"execution_config_snapshot_json": {"strategy": {}}},
+        )
+
+        assert response.status_code == 409
+        assert "执行快照" in response.json()["detail"]
 
 
 def test_strategy_revision_persists_history_and_agent_audit(tmp_path, monkeypatch):

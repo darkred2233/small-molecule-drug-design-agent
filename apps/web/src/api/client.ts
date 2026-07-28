@@ -4,6 +4,10 @@ export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
 const client = axios.create({ baseURL: API_BASE_URL, timeout: 60_000 });
 
+interface RequestOptions {
+  timeoutMs?: number;
+}
+
 function messageFrom(error: unknown): string {
   if (axios.isAxiosError(error)) {
     const detail = error.response?.data?.detail;
@@ -18,8 +22,8 @@ export const api = {
   async get<T>(url: string, params?: Record<string, unknown>): Promise<T> {
     try { return (await client.get<T>(url, { params })).data; } catch (error) { throw new Error(messageFrom(error)); }
   },
-  async post<T>(url: string, body?: unknown): Promise<T> {
-    try { return (await client.post<T>(url, body)).data; } catch (error) { throw new Error(messageFrom(error)); }
+  async post<T>(url: string, body?: unknown, options?: RequestOptions): Promise<T> {
+    try { return (await client.post<T>(url, body, options?.timeoutMs ? { timeout: options.timeoutMs } : undefined)).data; } catch (error) { throw new Error(messageFrom(error)); }
   },
   async put<T>(url: string, body?: unknown): Promise<T> {
     try { return (await client.put<T>(url, body)).data; } catch (error) { throw new Error(messageFrom(error)); }

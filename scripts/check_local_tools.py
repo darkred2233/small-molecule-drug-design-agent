@@ -18,11 +18,13 @@ def collect_status() -> dict[str, dict[str, Any]]:
     from medagent.services.autogrow4_adapter import autogrow4_tool_status
     from medagent.services.docking_adapters import check_gnina_available, check_vina_available
     from medagent.services.molecule_generation import generation_tool_status
+    from medagent.services.p2rank_adapter import p2rank_tool_status
 
     generation = generation_tool_status()
     return {
         "rdkit": generation["rdkit"],
         "crem": generation["crem"],
+        "p2rank": p2rank_tool_status(),
         "admet_ai": check_chemprop_available(),
         "gnina": check_gnina_available(),
         "vina": check_vina_available(),
@@ -53,6 +55,7 @@ def main() -> int:
         required = (
             "rdkit",
             "crem",
+            "p2rank",
             "admet_ai",
             "gnina",
             "vina",

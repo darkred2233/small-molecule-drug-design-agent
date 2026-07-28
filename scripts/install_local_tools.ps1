@@ -128,6 +128,35 @@ Invoke-InstallStep "AiZynthFinder isolated runtime" {
     & $aizynthPython -m pip install --upgrade pip
     & $aizynthPython -m pip install --prefer-binary "aizynthfinder==4.4.1"
     & $aizynthPython -m aizynthfinder.interfaces.aizynthcli --help
+
+    $aizynthData = Join-Path $root "data\aizynthfinder"
+    $requiredData = @(
+        "config.yml",
+        "uspto_model.onnx",
+        "uspto_templates.csv.gz",
+        "uspto_ringbreaker_model.onnx",
+        "uspto_ringbreaker_templates.csv.gz",
+        "uspto_filter_model.onnx",
+        "zinc_stock.hdf5"
+    )
+    $missingData = $requiredData | Where-Object {
+        $candidate = Join-Path $aizynthData $_
+        -not (Test-Path -LiteralPath $candidate -PathType Leaf) -or
+        (Get-Item -LiteralPath $candidate).Length -eq 0
+    }
+    if ($missingData) {
+        New-Item -ItemType Directory -Force -Path $aizynthData | Out-Null
+        & $aizynthPython -m aizynthfinder.tools.download_public_data $aizynthData
+        if ($LASTEXITCODE -ne 0) { throw "unable to download AiZynthFinder public model data" }
+    }
+    $stillMissing = $requiredData | Where-Object {
+        $candidate = Join-Path $aizynthData $_
+        -not (Test-Path -LiteralPath $candidate -PathType Leaf) -or
+        (Get-Item -LiteralPath $candidate).Length -eq 0
+    }
+    if ($stillMissing) {
+        throw "AiZynthFinder public model data is incomplete: $($stillMissing -join ', ')"
+    }
 }
 
 Invoke-InstallStep "AutoGrow4 source" {

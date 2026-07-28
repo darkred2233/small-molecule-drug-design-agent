@@ -208,3 +208,48 @@ def test_relational_schema_adds_llm_critique_columns_to_existing_sqlite(tmp_path
         }
 
     assert {"con_score", "llm_critique_json", "llm_provider", "analysis_method"} <= columns
+
+
+def test_app_upgrades_legacy_projects_schema_before_listing_projects(tmp_path):
+    db_path = tmp_path / "legacy_projects.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            create table projects (
+                id integer primary key,
+                project_id varchar(40) unique,
+                name varchar(200),
+                target_id varchar(80),
+                objective text,
+                status varchar(40),
+                constraints_json json,
+                created_at datetime,
+                updated_at datetime
+            )
+            """
+        )
+        connection.execute(
+            """
+            insert into projects (
+                project_id, name, target_id, objective, status, constraints_json, created_at
+            ) values (
+                'PROJ-LEGACY', 'Legacy project', 'TGT-BRAF', 'Restore project access',
+                'created', '{}', CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+    app = create_app(Settings(database_url=f"sqlite:///{db_path}"))
+    with TestClient(app) as client:
+        response = client.get("/projects")
+
+    assert response.status_code == 200
+    assert response.json()[0]["project_id"] == "PROJ-LEGACY"
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("pragma table_info(projects)").fetchall()
+        }
+
+    assert {"active_structure_id", "active_binding_site_id"} <= columns

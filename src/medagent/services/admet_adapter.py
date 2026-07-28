@@ -13,6 +13,7 @@ import csv
 import importlib.metadata
 import importlib.util
 import io
+import json
 import math
 import os
 import shutil
@@ -35,6 +36,17 @@ _RISK_THRESHOLDS = {
     "Pgp": {"high": 0.7, "medium": 0.4},
     "BBB": {"high": 0.7, "medium": 0.4},
 }
+
+
+class _AdmetWorkerPredictions:
+    def __init__(self, records: list[dict[str, Any]], index: list[str]) -> None:
+        self._records = records
+        self.index = index
+
+    def to_dict(self, *, orient: str) -> list[dict[str, Any]]:
+        if orient != "records":
+            raise ValueError(f"unsupported orient: {orient}")
+        return self._records
 
 
 @dataclass(frozen=True)
@@ -92,6 +104,29 @@ class ChempropADMETOutput:
 
 
 def _check_admet_ai_available() -> dict[str, Any] | None:
+    worker = _admet_gpu_worker()
+    if worker is not None:
+        try:
+            probe = subprocess.run(
+                [worker[0], str(worker[1]), "--probe"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                env=_admet_gpu_environment(),
+            )
+            probe_data = json.loads(probe.stdout) if probe.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            probe_data = {}
+        if probe_data.get("available"):
+            return {
+                "version": "2.0.1",
+                "models_dir": None,
+                "model_count": 10,
+                "gpu_available": True,
+                "device": "cuda",
+                "worker": worker,
+            }
     spec = importlib.util.find_spec("admet_ai")
     if spec is None or spec.origin is None:
         return None
@@ -198,6 +233,8 @@ def run_chemprop_admet(
 
 
 def _run_admet_ai(request: ChempropADMETRequest, status: dict[str, Any]) -> ChempropADMETOutput:
+    if status.get("worker"):
+        return _run_admet_ai_worker(request, status)
     started = time.monotonic()
     stdout, stderr = io.StringIO(), io.StringIO()
     device = status.get("device")
@@ -232,6 +269,68 @@ def _run_admet_ai(request: ChempropADMETRequest, status: dict[str, Any]) -> Chem
         runtime_seconds=time.monotonic() - started,
         compute_device=device,
     )
+
+
+def _run_admet_ai_worker(
+    request: ChempropADMETRequest, status: dict[str, Any]
+) -> ChempropADMETOutput:
+    started = time.monotonic()
+    worker = status["worker"]
+    with tempfile.TemporaryDirectory(prefix="admet_gpu_") as temporary:
+        root = Path(temporary)
+        input_path, output_path = root / "input.json", root / "output.json"
+        input_path.write_text(json.dumps({"smiles": request.smiles_list}), encoding="utf-8")
+        try:
+            process = subprocess.run(
+                [worker[0], str(worker[1]), str(input_path), str(output_path)],
+                capture_output=True,
+                text=True,
+                timeout=request.timeout_seconds,
+                check=False,
+                env=_admet_gpu_environment(),
+            )
+            payload = json.loads(output_path.read_text(encoding="utf-8")) if process.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            return ChempropADMETOutput(
+                "admet_ai_gpu_worker_failed",
+                "chemprop",
+                False,
+                warnings=[f"admet_ai_gpu_worker_failed:{type(exc).__name__}"],
+                runtime_seconds=time.monotonic() - started,
+            )
+    predictions = _AdmetWorkerPredictions(
+        list(payload.get("records") or []), list(payload.get("index") or [])
+    )
+    results = _parse_admet_ai_predictions(predictions, request.molecule_ids, request.smiles_list)
+    return ChempropADMETOutput(
+        adapter_mode="admet_ai_gpu_prediction",
+        tool_name="chemprop",
+        success=process.returncode == 0 and bool(results),
+        results=results,
+        labels=["chemprop_admet", "admet_ai_gpu"] if results else ["chemprop_no_results"],
+        warnings=[] if results else ["admet_ai_gpu_output_missing"],
+        stdout=process.stdout[:2000],
+        stderr=process.stderr[:2000],
+        exit_code=process.returncode,
+        runtime_seconds=time.monotonic() - started,
+        compute_device=payload.get("device"),
+    )
+
+
+def _admet_gpu_worker() -> tuple[str, Path] | None:
+    python = os.environ.get("MEDAGENT_ADMET_AI_PYTHON")
+    worker = Path(__file__).with_name("admet_gpu_worker.py")
+    if not python or not Path(python).is_file() or not worker.is_file():
+        return None
+    return python, worker
+
+
+def _admet_gpu_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = environment.get(
+        "MEDAGENT_ADMET_AI_CUDA_VISIBLE_DEVICES", "0"
+    )
+    return environment
 
 
 def _get_admet_ai_model(models_dir: str | None) -> Any:

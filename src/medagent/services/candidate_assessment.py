@@ -239,6 +239,7 @@ def run_project_candidate_assessment(
     skip_ranking: bool = False,
     round_id: str | None = None,
     stage_permissions: dict[str, bool] | None = None,
+    property_constraints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     assessment_mode = _normalize_assessment_mode(assessment_mode)
     molecules = _select_assessment_molecules(db, project, molecule_ids, max_molecules, round_id)
@@ -294,7 +295,12 @@ def run_project_candidate_assessment(
             round_id=round_id,
         )
     )
-    coarse_screen = _apply_coarse_screen_labels(db, molecules, round_id=round_id)
+    coarse_screen = _apply_coarse_screen_labels(
+        db,
+        molecules,
+        round_id=round_id,
+        property_constraints=property_constraints,
+    )
     ranking = _skipped_ranking_summary(molecules, ranking_top_n, round_id=round_id) if skip_ranking else generate_project_rankings(
         db,
         project,
@@ -1432,13 +1438,19 @@ def _apply_coarse_screen_labels(
     db: Session,
     molecules: list[Molecule],
     round_id: str | None = None,
+    property_constraints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     passed_ids: list[str] = []
     failed_ids: list[str] = []
     failure_reasons_by_id: dict[str, list[str]] = {}
 
     for molecule in molecules:
-        failure_reasons = _assessment_failure_reasons(db, molecule, round_id=round_id)
+        failure_reasons = _assessment_failure_reasons(
+            db,
+            molecule,
+            round_id=round_id,
+            property_constraints=property_constraints,
+        )
         failure_reasons_by_id[molecule.molecule_id] = failure_reasons
         molecule.labels = [label for label in (molecule.labels or []) if label not in COARSE_SCREEN_LABELS]
         if failure_reasons:
@@ -1593,6 +1605,7 @@ def _assessment_failure_reasons(
     molecule: Molecule,
     synthesis_route: SynthesisRoute | None = None,
     round_id: str | None = None,
+    property_constraints: dict[str, Any] | None = None,
 ) -> list[str]:
     reasons: list[str] = []
     conformer = (
@@ -1632,6 +1645,26 @@ def _assessment_failure_reasons(
     )
     if synthesis is not None and not _is_surrogate_synthesis_result(synthesis) and not synthesis.route_found:
         reasons.append("assessment_route_not_found")
+
+    if property_constraints:
+        descriptor = _descriptor_snapshot(molecule.smiles, db, molecule)
+        if descriptor is not None:
+            fields = {
+                "mw_range": ("mw", descriptor.mw),
+                "logp_range": ("logp", descriptor.logp),
+                "tpsa_range": ("tpsa", descriptor.tpsa),
+                "hbd_range": ("hbd", float(descriptor.hbd)),
+                "hba_range": ("hba", float(descriptor.hba)),
+            }
+            for constraint_name, (label, value) in fields.items():
+                bounds = property_constraints.get(constraint_name)
+                if not isinstance(bounds, list) or len(bounds) != 2:
+                    continue
+                lower, upper = float(bounds[0]), float(bounds[1])
+                if value < lower:
+                    reasons.append(f"property_{label}_below_min")
+                elif value > upper:
+                    reasons.append(f"property_{label}_above_max")
 
     return _dedupe(reasons)
 

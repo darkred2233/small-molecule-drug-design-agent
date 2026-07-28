@@ -34,3 +34,25 @@ export function campaignCount(config: Record<string, unknown> | undefined): numb
   const value = config?.num_molecules ?? config?.sample_count;
   return typeof value === 'number' ? value : 0;
 }
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+export function campaignDiagnosticSummary(metrics: Record<string, unknown> | null | undefined): string | null {
+  const execution = recordValue(metrics?.execution);
+  const parts: string[] = [];
+  const failureReason = metrics?.failure_reason;
+  if (typeof failureReason === 'string' && failureReason) parts.push(failureReason);
+  const exitCode = execution?.exit_code;
+  if (typeof exitCode === 'number') parts.push(`退出码 ${exitCode}`);
+  const stderr = execution?.stderr;
+  if (typeof stderr === 'string' && stderr.trim()) {
+    const lines = stderr.trim().split(/\r?\n/).filter(Boolean);
+    const lastLine = lines[lines.length - 1] || stderr.trim();
+    parts.push(lastLine.length > 280 ? `${lastLine.slice(0, 277)}...` : lastLine);
+  }
+  return parts.length ? parts.join(' · ') : null;
+}

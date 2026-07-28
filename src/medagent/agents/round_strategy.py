@@ -10,15 +10,19 @@ from sqlalchemy.orm import Session
 
 from medagent.db.models import (
     ADMETResult,
+    AdvisorSuggestion,
     BindingSite,
     CampaignRun,
+    Critique,
     DockingResult,
     Molecule,
+    MoleculeProperty,
     Project,
     ProjectResource,
     ProjectRound,
     RagDocument,
     Ranking,
+    RoundReport,
     SeedLigand,
     SynthesisRoute,
     TargetLigand,
@@ -52,6 +56,8 @@ class RoundStrategyAgent:
             tool_availability=tool_availability or {},
             existing_strategy=existing_strategy,
         )
+        planning_mode = "llm"
+        planner_error_type: str | None = None
         try:
             llm_response = self.llm_client.generate_structured(
                 prompt=prompt,
@@ -59,6 +65,8 @@ class RoundStrategyAgent:
                 temperature=0.3,
             )
         except Exception as exc:
+            planning_mode = "deterministic_fallback"
+            planner_error_type = type(exc).__name__
             llm_response = self._fallback_strategy(
                 context=context,
                 round_number=round_number,
@@ -69,6 +77,11 @@ class RoundStrategyAgent:
             )
         strategy = self._parse_llm_response(llm_response, tool_availability or {})
         strategy["context_snapshot"] = context
+        strategy["planner_metadata"] = {
+            "mode": planning_mode,
+            "provider": "qwen" if planning_mode == "llm" else None,
+            "error_type": planner_error_type,
+        }
         return strategy
 
     def _fallback_strategy(
@@ -244,7 +257,10 @@ class RoundStrategyAgent:
         if not parent_round_id:
             return context
 
-        parent_round = db.query(ProjectRound).filter_by(round_id=parent_round_id).first()
+        parent_round = db.query(ProjectRound).filter_by(
+            round_id=parent_round_id,
+            project_id=project.project_id,
+        ).first()
         if not parent_round:
             return context
 
@@ -266,6 +282,7 @@ class RoundStrategyAgent:
                 "input_count": len(item.input_molecule_ids or []),
                 "output_count": len(item.output_molecule_ids or []),
                 "metrics": item.metrics_json or {},
+                "warnings": item.warnings_json or [],
             }
             for item in campaigns
         ]
@@ -285,20 +302,143 @@ class RoundStrategyAgent:
             Ranking.rank.asc()
         ).limit(50).all()
         molecule_by_id = {item.molecule_id: item for item in molecules}
+        ranked_ids = [item.molecule_id for item in rankings]
+        properties_by_id = {
+            item.molecule_id: item
+            for item in db.query(MoleculeProperty)
+            .filter(MoleculeProperty.molecule_id.in_(ranked_ids))
+            .all()
+        } if ranked_ids else {}
+        docking_by_id = {
+            item.molecule_id: item
+            for item in db.query(DockingResult).filter(
+                DockingResult.round_id == parent_round_id,
+                DockingResult.molecule_id.in_(ranked_ids),
+            ).all()
+        } if ranked_ids else {}
+        admet_by_id = {
+            item.molecule_id: item
+            for item in db.query(ADMETResult).filter(
+                ADMETResult.round_id == parent_round_id,
+                ADMETResult.molecule_id.in_(ranked_ids),
+            ).all()
+        } if ranked_ids else {}
+        synthesis_by_id = {
+            item.molecule_id: item
+            for item in db.query(SynthesisRoute).filter(
+                SynthesisRoute.round_id == parent_round_id,
+                SynthesisRoute.molecule_id.in_(ranked_ids),
+            ).all()
+        } if ranked_ids else {}
+        critique_by_id = {
+            item.molecule_id: item
+            for item in db.query(Critique).filter(
+                Critique.round_id == parent_round_id,
+                Critique.molecule_id.in_(ranked_ids),
+            ).all()
+        } if ranked_ids else {}
         context["previous_top_molecules"] = [
-            {
-                "molecule_id": item.molecule_id,
-                "rank": item.rank,
-                "overall_score": item.overall_score,
-                "final_decision": item.final_decision,
-                "source_agent": molecule_by_id.get(item.molecule_id).source_agent
-                if molecule_by_id.get(item.molecule_id)
-                else None,
-            }
+            self._ranked_molecule_evidence(
+                item,
+                molecule_by_id.get(item.molecule_id),
+                properties_by_id.get(item.molecule_id),
+                docking_by_id.get(item.molecule_id),
+                admet_by_id.get(item.molecule_id),
+                synthesis_by_id.get(item.molecule_id),
+                critique_by_id.get(item.molecule_id),
+            )
             for item in rankings
         ]
-        context["previous_ranked_molecule_ids"] = [item.molecule_id for item in rankings]
+        context["previous_ranked_molecule_ids"] = ranked_ids
+
+        report = db.query(RoundReport).filter_by(round_id=parent_round_id).one_or_none()
+        if report is not None:
+            report_json = report.report_json or {}
+            context["previous_report_recommendations"] = {
+                "next_round_recommendations": report_json.get("next_round_recommendations", []),
+                "warnings": report_json.get("warnings", []),
+            }
+        advisor = db.query(AdvisorSuggestion).filter_by(
+            project_id=project.project_id,
+            round_id=parent_round_id,
+        ).order_by(AdvisorSuggestion.created_at.desc()).first()
+        if advisor is not None:
+            context["previous_advisor_suggestion"] = {
+                "summary": advisor.summary,
+                "suggestions": advisor.suggestions or [],
+                "next_round_constraints": advisor.next_round_constraints or [],
+                "suggested_generation_config": advisor.suggested_generation_config or {},
+            }
         return context
+
+    @staticmethod
+    def _ranked_molecule_evidence(
+        ranking: Ranking,
+        molecule: Molecule | None,
+        properties: MoleculeProperty | None,
+        docking: DockingResult | None,
+        admet: ADMETResult | None,
+        synthesis: SynthesisRoute | None,
+        critique: Critique | None,
+    ) -> dict[str, Any]:
+        return {
+            "molecule_id": ranking.molecule_id,
+            "rank": ranking.rank,
+            "overall_score": ranking.overall_score,
+            "final_decision": ranking.final_decision,
+            "score_breakdown": ranking.score_breakdown or {},
+            "smiles": molecule.smiles if molecule else None,
+            "status": molecule.status if molecule else None,
+            "source_agent": molecule.source_agent if molecule else None,
+            "generation_method": molecule.generation_method if molecule else None,
+            "properties": (
+                {
+                    "mw": properties.mw,
+                    "logp": properties.logp,
+                    "tpsa": properties.tpsa,
+                    "hbd": properties.hbd,
+                    "hba": properties.hba,
+                    "sa_score": properties.sa_score,
+                }
+                if properties else None
+            ),
+            "docking": (
+                {
+                    "vina_score": docking.vina_score,
+                    "cnn_score": docking.cnn_score,
+                    "key_hbond_count": docking.key_hbond_count,
+                    "clash_count": docking.clash_count,
+                }
+                if docking else None
+            ),
+            "admet": (
+                {
+                    "hERG_risk": admet.hERG_risk,
+                    "Ames_risk": admet.Ames_risk,
+                    "solubility": admet.solubility,
+                    "permeability": admet.permeability,
+                    "risk_score": admet.admet_risk_score,
+                }
+                if admet else None
+            ),
+            "synthesis": (
+                {
+                    "route_found": synthesis.route_found,
+                    "route_steps": synthesis.route_steps,
+                    "route_confidence": synthesis.route_confidence,
+                }
+                if synthesis else None
+            ),
+            "critique": (
+                {
+                    "risk_level": critique.risk_level,
+                    "decision": critique.refutation_decision,
+                    "reason": critique.reason,
+                    "campaign_patch_suggestions": critique.campaign_patch_suggestions_json or {},
+                }
+                if critique else None
+            ),
+        }
 
     def _build_strategy_prompt(
         self,

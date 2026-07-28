@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -7,7 +8,11 @@ from medagent.agents.round_strategy import RoundStrategyAgent
 from medagent.api.rounds_router import _prepare_seed_selection
 from medagent.db.models import (
     ADMETResult,
+    AgentRun,
+    AdvisorSuggestion,
     Base,
+    CampaignRun,
+    Critique,
     DockingResult,
     Molecule,
     MoleculeProperty,
@@ -19,6 +24,12 @@ from medagent.db.models import (
 )
 from medagent.pipeline.round_orchestrator import RoundOrchestrator
 from medagent.reporting.round_report import build_round_report
+from medagent.services.round_strategy_snapshot import (
+    ExecutionSnapshotError,
+    build_execution_snapshot,
+    persist_strategy_document,
+    validate_execution_snapshot,
+)
 from medagent.services.strategy_validator import StrategyValidator
 
 
@@ -47,6 +58,43 @@ def make_session() -> Session:
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     return Session(engine)
+
+
+def test_strategy_version_only_advances_when_the_canonical_document_changes():
+    round_obj = SimpleNamespace(user_conditions_json=None)
+    strategy = {"objective": "first", "campaign_config": {}}
+
+    first_version, first_hash = persist_strategy_document(
+        round_obj, strategy, source="llm", changed_at="2026-07-28T00:00:00+00:00"
+    )
+    same_version, same_hash = persist_strategy_document(
+        round_obj, strategy, source="confirmation", changed_at="2026-07-28T00:01:00+00:00"
+    )
+    changed_version, changed_hash = persist_strategy_document(
+        round_obj,
+        {**strategy, "objective": "user final"},
+        source="user_confirmation",
+        changed_at="2026-07-28T00:02:00+00:00",
+    )
+
+    assert (first_version, same_version, changed_version) == (1, 1, 2)
+    assert first_hash == same_hash
+    assert changed_hash != first_hash
+
+
+def test_execution_snapshot_rejects_strategy_tampering():
+    snapshot = build_execution_snapshot(
+        {"objective": "confirmed", "campaign_config": {}},
+        strategy_version=1,
+        confirmed_at="2026-07-28T00:00:00+00:00",
+        parent_round_id=None,
+        seed_smiles=[],
+        seed_molecule_ids=[],
+    )
+    snapshot["strategy"]["objective"] = "changed after confirmation"
+
+    with pytest.raises(ExecutionSnapshotError, match="hash mismatch"):
+        validate_execution_snapshot(snapshot)
 
 
 def test_round_strategy_uses_deterministic_fallback_when_llm_is_unavailable(monkeypatch):
@@ -83,6 +131,11 @@ def test_round_strategy_uses_deterministic_fallback_when_llm_is_unavailable(monk
     assert strategy["campaign_config"]["targetdiff"]["enabled"] is False
     assert strategy["seed_policy"]["molecule_ids"] == ["MOL-2", "MOL-1", "MOL-3"]
     assert strategy["requires_user_confirmation"] is True
+    assert strategy["planner_metadata"] == {
+        "mode": "deterministic_fallback",
+        "provider": None,
+        "error_type": "ValueError",
+    }
     assert any("deterministic fallback" in warning for warning in strategy["warnings"])
 
 
@@ -119,6 +172,125 @@ def test_round_strategy_schema_enumerates_only_persisted_project_binding_sites(m
         "SITE-1",
         "SITE-2",
     ]
+
+
+def test_next_round_context_contains_parent_scientific_evidence():
+    with make_session() as db:
+        project = Project(project_id="PROJ-CONTEXT", name="Context", objective="Improve potency")
+        parent = ProjectRound(
+            round_id="ROUND-CONTEXT",
+            project_id=project.project_id,
+            round_number=1,
+            status="completed",
+        )
+        molecule = Molecule(
+            molecule_id="MOL-CONTEXT",
+            project_id=project.project_id,
+            round_id=parent.round_id,
+            smiles="CCO",
+            status="candidate_assessed",
+            source_agent="crem",
+            generation_method="crem_fragment_mutation",
+        )
+        db.add_all([project, parent, molecule])
+        db.flush()
+        db.add_all(
+            [
+                CampaignRun(
+                    campaign_run_id="CAM-CONTEXT",
+                    project_id=project.project_id,
+                    round_id=parent.round_id,
+                    method="autogrow4",
+                    status="failed",
+                    metrics_json={"failure_reason": "mutation_exhausted"},
+                    warnings_json=["generation_incomplete"],
+                ),
+                MoleculeProperty(
+                    molecule_id=molecule.molecule_id,
+                    mw=46.07,
+                    logp=-0.001,
+                    tpsa=20.23,
+                    hbd=1,
+                    hba=1,
+                    sa_score=1.2,
+                ),
+                DockingResult(
+                    molecule_id=molecule.molecule_id,
+                    round_id=parent.round_id,
+                    vina_score=-8.1,
+                    cnn_score=0.71,
+                    key_hbond_count=2,
+                    clash_count=0,
+                ),
+                ADMETResult(
+                    molecule_id=molecule.molecule_id,
+                    round_id=parent.round_id,
+                    hERG_risk="low",
+                    Ames_risk="low",
+                    admet_risk_score=0.1,
+                ),
+                SynthesisRoute(
+                    molecule_id=molecule.molecule_id,
+                    round_id=parent.round_id,
+                    route_found=True,
+                    route_steps=2,
+                    route_confidence=0.8,
+                ),
+                Critique(
+                    critique_id="CRIT-CONTEXT",
+                    molecule_id=molecule.molecule_id,
+                    round_id=parent.round_id,
+                    con_score=10.0,
+                    risk_level="medium",
+                    reason="Check metabolic liability",
+                    refutation_decision="reserve",
+                    campaign_patch_suggestions_json={"reduce_logp": True},
+                ),
+                Ranking(
+                    project_id=project.project_id,
+                    molecule_id=molecule.molecule_id,
+                    round_id=parent.round_id,
+                    rank=1,
+                    overall_score=0.88,
+                    final_decision="advance",
+                    score_breakdown={"docking": 0.9},
+                ),
+                RoundReport(
+                    report_id="REPORT-CONTEXT",
+                    project_id=project.project_id,
+                    round_id=parent.round_id,
+                    status="completed",
+                    report_json={"next_round_recommendations": [{"action": "reduce_logp"}]},
+                ),
+                AdvisorSuggestion(
+                    suggestion_id="ADVISOR-CONTEXT",
+                    project_id=project.project_id,
+                    round_id=parent.round_id,
+                    summary="Keep the active scaffold",
+                    suggestions=[{"action": "retain_scaffold"}],
+                    next_round_constraints=[{"field": "logp", "max": 4.0}],
+                    suggested_generation_config={"crem": {"edit_depth": 1}},
+                ),
+            ]
+        )
+        db.flush()
+
+        context = RoundStrategyAgent(FailingLLMClient())._collect_context(
+            db, project, parent.round_id
+        )
+
+        top = context["previous_top_molecules"][0]
+        assert top["smiles"] == "CCO"
+        assert top["properties"]["mw"] == 46.07
+        assert top["docking"]["vina_score"] == -8.1
+        assert top["admet"]["hERG_risk"] == "low"
+        assert top["synthesis"]["route_found"] is True
+        assert top["critique"]["campaign_patch_suggestions"] == {"reduce_logp": True}
+        assert context["previous_campaigns"][0]["metrics"]["failure_reason"] == "mutation_exhausted"
+        assert context["previous_report_recommendations"]["next_round_recommendations"] == [
+            {"action": "reduce_logp"}
+        ]
+        assert context["previous_advisor_suggestion"]["summary"] == "Keep the active scaffold"
 
 
 def test_strategy_validator_disables_an_invented_binding_site_id():
@@ -171,6 +343,32 @@ def test_strategy_validator_clears_legacy_targetdiff_pocket_resource_id():
 
     assert validated["campaign_config"]["targetdiff"]["enabled"] is True
     assert validated["campaign_config"]["targetdiff"]["pocket_resource_id"] is None
+
+
+def test_strategy_validator_disables_campaign_with_zero_requested_molecules():
+    validated = StrategyValidator().validate_and_fix(
+        {
+            "campaign_config": {
+                "crem": {"enabled": True, "num_molecules": 0},
+                "targetdiff": {
+                    "enabled": True,
+                    "num_molecules": 10,
+                    "binding_site_id": "SITE-REAL",
+                },
+                "autogrow4": {"enabled": False, "num_molecules": 0},
+            }
+        },
+        tool_availability={"crem": True, "targetdiff": True},
+        data_context={
+            "active_binding_site_id": "SITE-REAL",
+            "available_binding_site_ids": ["SITE-REAL"],
+            "data_summary": {"seed_ligand_count": 1, "binding_site_count": 1},
+        },
+    )
+
+    assert validated["campaign_config"]["crem"]["num_molecules"] == 0
+    assert validated["campaign_config"]["crem"]["enabled"] is False
+    assert any("CReM 生成数量为 0" in warning for warning in validated["warnings"])
 
 
 def test_strategy_validator_clamps_values_and_keeps_ranked_explicit_seed_order():
@@ -512,6 +710,13 @@ def test_next_round_auto_strategy_stays_ready_for_user_confirmation(monkeypatch)
         )
 
         strategy = next_round.user_conditions_json["strategy_draft"]
+        audit = db.query(AgentRun).filter_by(
+            round_id=next_round.round_id,
+            agent_name="round_strategy_agent",
+        ).one()
         assert next_round.status == "ready"
         assert strategy["requires_user_confirmation"] is True
         assert strategy["seed_policy"]["molecule_ids"] == ["MOL-1"]
+        assert strategy["planner_metadata"]["mode"] == "deterministic_fallback"
+        assert audit.model_name == "deterministic_fallback"
+        assert audit.status == "completed_with_fallback"

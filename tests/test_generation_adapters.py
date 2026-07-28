@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -561,8 +562,9 @@ def test_targetdiff_runs_a_local_python_entrypoint_and_reads_sdf_output(tmp_path
     entrypoint.write_text("# entrypoint", encoding="utf-8")
 
     def fake_run(command, **_kwargs):
-        output.mkdir(exist_ok=True)
-        writer = Chem.SDWriter(str(output / "generated.sdf"))
+        result_path = Path(command[command.index("--result_path") + 1])
+        result_path.mkdir(parents=True, exist_ok=True)
+        writer = Chem.SDWriter(str(result_path / "generated.sdf"))
         writer.write(Chem.MolFromSmiles("CCO"))
         writer.close()
         assert command[:2] == ["python.exe", str(entrypoint)]
@@ -593,8 +595,14 @@ def test_targetdiff_wsl_command_maps_input_and_output_paths(tmp_path, monkeypatc
 
     def fake_run(command, **_kwargs):
         captured["command"] = command
-        output.mkdir(exist_ok=True)
-        writer = Chem.SDWriter(str(output / "generated.sdf"))
+        result_path_match = re.search(
+            r"--result_path\s+([^\s]+)", " ".join(command)
+        )
+        assert result_path_match is not None
+        result_path = result_path_match.group(1).strip("'\"")
+        result_path = Path(windows_path_from_wsl(result_path))
+        result_path.mkdir(parents=True, exist_ok=True)
+        writer = Chem.SDWriter(str(result_path / "generated.sdf"))
         writer.write(Chem.MolFromSmiles("CCO"))
         writer.close()
         return SimpleNamespace(returncode=0, stdout="sampled", stderr="")

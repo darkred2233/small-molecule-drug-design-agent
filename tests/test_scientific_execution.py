@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from medagent.services.scientific_execution import (
@@ -116,6 +117,21 @@ def test_scientific_result_rejects_external_validation_claims_for_surrogates():
     assert result.execution_mode == "surrogate"
     assert result.is_eligible_for_external_validation is False
     assert "surrogate_result_not_external_validation" in result.warnings
+
+
+def test_capability_snapshot_converts_paths_for_json_storage():
+    snapshot = _snapshot(
+        tools={"gnina": {"available": True, "path": Path("/opt/gnina")}},
+        target_resource={"prepared_receptor_path": Path("/tmp/receptor.pdbqt")},
+        runtime={"working_directory": Path("/tmp/workflow")},
+    )
+
+    payload = snapshot.as_dict()
+
+    assert payload["tools"]["gnina"]["path"] == str(Path("/opt/gnina"))
+    assert payload["target_resource"]["prepared_receptor_path"] == str(Path("/tmp/receptor.pdbqt"))
+    assert payload["runtime"]["working_directory"] == str(Path("/tmp/workflow"))
+    json.dumps(payload)
 
 
 def test_sha256_file_is_stable(tmp_path):
