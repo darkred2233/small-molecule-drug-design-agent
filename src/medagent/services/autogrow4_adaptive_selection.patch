@@ -1,0 +1,26 @@
+--- a/autogrow/docking/ranking/selecting/rank_selection.py
++++ b/autogrow/docking/ranking/selecting/rank_selection.py
+@@ -67,13 +67,14 @@ def run_rank_selector(
+     del sorted_list
+     del temp_list_info
+     if len(new_sorted_list) < number_to_chose:
+-
+-        raise Exception(
+-            "Asked for {} but only {} availabe to chose from \
+-            There are more ligands to chose to seed the list than ligands to select from. \
+-            Please lower the top_mols_to_seed_next_generation and/or \
+-            diversity_mols_to_seed_first_generation".format(
+-                number_to_chose, len(new_sorted_list)
+-            )
+-        )
++        if not new_sorted_list:
++            raise Exception("No unique scored ligands are available for next-generation seeding")
++        print(
++            "AutoGrow selection pool shrank from {} requested parents to {} available; "
++            "using all available parents for this generation.".format(
++                number_to_chose, len(new_sorted_list)
++            )
++        )
++        number_to_chose = len(new_sorted_list)
++
+     new_sorted_list = sorted(

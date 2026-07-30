@@ -290,7 +290,7 @@ def _strengths(candidate: dict[str, Any]) -> list[str]:
         strengths.append("当前最佳 pose 已按工具输出确认。")
     admet = candidate.get("admet") or {}
     herg = (admet.get("hERG") or {}).get("risk")
-    if herg and str(herg).lower() in {"low", "lower", "低"}:
+    if _is_low_risk(herg):
         strengths.append("hERG 预测风险较低。")
     synthesis = candidate.get("synthesis") or {}
     if synthesis.get("route_found") or synthesis.get("estimated_route_feasible"):
@@ -316,17 +316,23 @@ def _risks(candidate: dict[str, Any]) -> list[str]:
     admet = candidate.get("admet") or {}
     for key in ("hERG", "Ames"):
         risk = (admet.get(key) or {}).get("risk")
-        if risk and str(risk).lower() not in {"low", "lower", "低"}:
+        if risk and not _is_low_risk(risk):
             risks.append(f"{key} 预测风险为 {risk}。")
-    if admet.get("admet_risk_score") is not None and _as_float(admet.get("admet_risk_score")):
-        risks.append(f"ADMET 总风险分为 {_format_number(admet.get('admet_risk_score'), digits=2)}。")
+    admet_risk_score = _as_float(admet.get("admet_risk_score"))
+    if admet_risk_score is not None and admet_risk_score >= 0.33:
+        risks.append(f"ADMET 总风险分为 {_format_number(admet_risk_score, digits=2)}。")
     synthesis = candidate.get("synthesis") or {}
     if synthesis and not synthesis.get("route_found") and not synthesis.get("estimated_route_feasible"):
         risks.append("外部路线或合成可行性未给出明确可行结论。")
     refutation = candidate.get("refutation_chain") or {}
-    if refutation.get("risk_level"):
+    if refutation.get("risk_level") and not _is_low_risk(refutation.get("risk_level")):
         risks.append(f"自反驳模块风险等级为 {refutation.get('risk_level')}。")
     return risks
+
+
+def _is_low_risk(value: Any) -> bool:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {"low", "lower", "low_risk", "低", "低风险"}
 
 
 def _suggestions(candidate: dict[str, Any], risks: list[str]) -> list[str]:

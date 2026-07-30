@@ -35,6 +35,7 @@ AUTOGROW_PROFILES: dict[str, dict[str, int]] = {
         "processors": 4,
         "exhaustiveness": 1,
         "timeout": 120,
+        "gypsum_timeout": 20,
     },
     "normal": {
         "generations": 5,
@@ -42,6 +43,7 @@ AUTOGROW_PROFILES: dict[str, dict[str, int]] = {
         "processors": 8,
         "exhaustiveness": 2,
         "timeout": 300,
+        "gypsum_timeout": 30,
     },
     "heavy": {
         "generations": 10,
@@ -49,8 +51,14 @@ AUTOGROW_PROFILES: dict[str, dict[str, int]] = {
         "processors": 8,
         "exhaustiveness": 4,
         "timeout": 300,
+        "gypsum_timeout": 60,
     },
 }
+
+
+AUTOGROW4_RUNTIME_PATCH = Path(__file__).with_name(
+    "autogrow4_adaptive_selection.patch"
+)
 
 
 @dataclass(frozen=True)
@@ -515,11 +523,18 @@ def _prepare_wsl_source_cache(
     """Stage read-heavy AutoGrow sources on WSL's native filesystem."""
     if not source_dir.is_dir():
         raise RuntimeError(f"AutoGrow source directory is missing: {source_dir}")
+    if not AUTOGROW4_RUNTIME_PATCH.is_file():
+        raise RuntimeError(
+            f"AutoGrow runtime patch is missing: {AUTOGROW4_RUNTIME_PATCH}"
+        )
 
     source_wsl = windows_path_to_wsl(str(source_dir.resolve()))
-    fingerprint = _source_tree_fingerprint(source_dir)
+    patch_wsl = windows_path_to_wsl(str(AUTOGROW4_RUNTIME_PATCH.resolve()))
+    fingerprint = _source_tree_fingerprint(source_dir, AUTOGROW4_RUNTIME_PATCH)
     cache_dir = f"{cache_root.rstrip('/')}/{fingerprint}"
-    script = _wsl_source_cache_script(source_wsl, cache_dir, cache_root)
+    script = _wsl_source_cache_script(
+        source_wsl, cache_dir, cache_root, runtime_patch_wsl=patch_wsl
+    )
     # WSL.exe applies Windows command-line escaping before Bash sees an
     # argument. Encode the multi-line shell script so its quotes and dollar
     # signs cannot be altered in transit.
@@ -553,7 +568,7 @@ def _prepare_wsl_source_cache(
     return cache_dir
 
 
-def _source_tree_fingerprint(source_dir: Path) -> str:
+def _source_tree_fingerprint(source_dir: Path, runtime_patch: Path | None = None) -> str:
     """Return a source-tree identifier while avoiding large reaction-library reads."""
     digest = hashlib.sha256()
     for item in sorted(source_dir.rglob("*")):
@@ -569,18 +584,30 @@ def _source_tree_fingerprint(source_dir: Path) -> str:
         else:
             digest.update(str(stat.st_mtime_ns).encode())
         digest.update(b"\n")
+    if runtime_patch is not None:
+        digest.update(b"runtime_patch:")
+        digest.update(runtime_patch.read_bytes())
+        digest.update(b"\n")
     return digest.hexdigest()[:24]
 
 
-def _wsl_source_cache_script(source_wsl: str, cache_dir: str, cache_root: str) -> str:
+def _wsl_source_cache_script(
+    source_wsl: str,
+    cache_dir: str,
+    cache_root: str,
+    *,
+    runtime_patch_wsl: str,
+) -> str:
     """Build an atomic WSL-side cache operation for the local source tree."""
     source = shlex.quote(source_wsl)
     cache = shlex.quote(cache_dir)
     root = shlex.quote(cache_root)
+    patch = shlex.quote(runtime_patch_wsl)
     return f'''set -euo pipefail
 source_dir={source}
 cache_dir={cache}
 cache_root={root}
+runtime_patch={patch}
 if [ ! -f "$cache_dir/.ready" ]; then
   mkdir -p "$cache_root"
   lock_dir="$cache_dir.lock"
@@ -590,6 +617,8 @@ if [ ! -f "$cache_dir/.ready" ]; then
     trap cleanup EXIT
     if [ ! -f "$cache_dir/.ready" ]; then
       tar -C "$source_dir" --exclude=.git --exclude=__pycache__ -cf - . | tar -C "$tmp_dir" -xf -
+      sed -i 's/\\r$//' "$tmp_dir/autogrow/docking/ranking/selecting/rank_selection.py"
+      patch --batch --forward -p1 -d "$tmp_dir" < "$runtime_patch"
       touch "$tmp_dir/.ready"
       rm -rf "$cache_dir"
       mv "$tmp_dir" "$cache_dir"
@@ -656,6 +685,12 @@ def _autogrow4_config(
         16,
         docking_profile["processors"],
     )
+    gypsum_timeout_limit = _bounded_int(
+        request.constraints.get("gypsum_timeout_limit"),
+        10,
+        600,
+        docking_profile["gypsum_timeout"],
+    )
     return {
         "filename_of_receptor": receptor_file,
         "source_compound_file": seeds_file,
@@ -683,6 +718,7 @@ def _autogrow4_config(
         "number_of_processors": processor_count,
         "docking_exhaustiveness": docking_profile["exhaustiveness"],
         "docking_timeout_limit": docking_profile["timeout"],
+        "gypsum_timeout_limit": gypsum_timeout_limit,
         "dock_choice": "VinaGpuBatchDocking",
         "docking_executable": docking_executable,
         "scoring_choice": "VINA",

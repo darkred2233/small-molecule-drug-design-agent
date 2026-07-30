@@ -31,6 +31,7 @@ class TargetDiffRequest:
     output_dir: str
     num_samples: int = 20
     timeout_seconds: int = 2700
+    batch_size: int = 25
 
 
 @dataclass
@@ -170,6 +171,8 @@ def run_targetdiff_generation(
         str(output_dir),
         "--num_samples",
         str(max(1, request.num_samples)),
+        "--batch_size",
+        str(max(1, request.batch_size)),
     ]
     execution_mode = "local_python"
     process_cwd: str | None = source_dir
@@ -187,6 +190,8 @@ def run_targetdiff_generation(
                 windows_path_to_wsl(str(output_dir)),
                 "--num_samples",
                 str(max(1, request.num_samples)),
+                "--batch_size",
+                str(max(1, request.batch_size)),
             ],
             distribution=str(status.get("wsl_distribution") or "Ubuntu"),
             user=str(status.get("wsl_user") or "root"),
@@ -315,6 +320,8 @@ def _provenance(
         "command": command,
         "pocket_file": request.pocket_file,
         "configured_output_root": request.output_dir,
+        "num_samples": max(1, request.num_samples),
+        "batch_size": max(1, request.batch_size),
         "raw_output_dir": str(artifact_root),
         "input_artifacts": {
             "pocket_pdb": _artifact_record(Path(request.pocket_file).expanduser())

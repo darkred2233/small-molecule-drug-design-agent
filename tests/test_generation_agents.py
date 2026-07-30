@@ -47,6 +47,7 @@ def test_targetdiff_agent_uses_local_pocket_generation(monkeypatch, tmp_path):
     assert result.success is True
     assert [item.smiles for item in result.molecules] == ["CCO", "CCN"]
     assert captured["request"].pocket_file == str(pocket)
+    assert captured["request"].batch_size == 25
     assert result.molecules[0].provenance["agent"] == "targetdiff"
     assert result.molecules[0].metadata["generation_pose_is_docking_evidence"] is False
 

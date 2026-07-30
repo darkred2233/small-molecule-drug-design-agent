@@ -113,6 +113,7 @@ def test_autogrow_local_config_records_receptor_grid_and_vina(tmp_path):
     assert config["number_of_processors"] == 8
     assert config["docking_exhaustiveness"] == 2
     assert config["docking_timeout_limit"] == 300
+    assert config["gypsum_timeout_limit"] == 30
     assert (
         config["number_of_mutants_first_generation"]
         + config["number_of_crossovers_first_generation"]
@@ -150,6 +151,31 @@ def test_autogrow_small_source_pool_uses_mutation_only(tmp_path):
     assert config["number_of_crossovers"] == 0
     assert config["number_of_mutants"] == 2
     assert config["number_elitism_advance_from_previous_gen"] == 1
+
+
+def test_autogrow_heavy_profile_allows_longer_gypsum_preparation(tmp_path):
+    request = _autogrow_request(tmp_path)
+    request = AutoGrow4Request(
+        seed_smiles=request.seed_smiles,
+        receptor_file=request.receptor_file,
+        output_dir=request.output_dir,
+        num_generations=10,
+        population_size=100,
+        constraints={
+            "grid_center": [1, 2, 3],
+            "grid_size": [18, 18, 18],
+            "search_intensity": "heavy",
+        },
+    )
+
+    config = autogrow4_adapter._autogrow4_config(
+        request,
+        receptor_file=request.receptor_file,
+        seeds_file=str(tmp_path / "seeds.smi"),
+        output_dir=str(tmp_path / "output"),
+    )
+
+    assert config["gypsum_timeout_limit"] == 60
 
 
 def test_autogrow_survives_source_pool_shrinking_after_docking(tmp_path):
@@ -190,6 +216,27 @@ def test_autogrow_survives_source_pool_shrinking_after_docking(tmp_path):
         + config["number_elitism_advance_from_previous_gen"]
         == 5
     )
+
+
+def test_autogrow_wsl_cache_fingerprint_and_script_include_runtime_patch(tmp_path):
+    source = tmp_path / "AutoGrow4"
+    source.mkdir()
+    (source / "RunAutogrow.py").write_text("# entrypoint\n", encoding="utf-8")
+    runtime_patch = tmp_path / "adaptive.patch"
+    runtime_patch.write_text("runtime patch v1\n", encoding="utf-8")
+
+    first = autogrow4_adapter._source_tree_fingerprint(source, runtime_patch)
+    runtime_patch.write_text("runtime patch v2\n", encoding="utf-8")
+    second = autogrow4_adapter._source_tree_fingerprint(source, runtime_patch)
+    script = autogrow4_adapter._wsl_source_cache_script(
+        "/mnt/c/AutoGrow4",
+        "/opt/cache/example",
+        "/opt/cache",
+        runtime_patch_wsl="/mnt/c/adaptive.patch",
+    )
+
+    assert first != second
+    assert 'patch --batch --forward -p1 -d "$tmp_dir" < "$runtime_patch"' in script
 
 
 def test_autogrow_timeout_covers_all_gpu_waits_and_retries(tmp_path):
@@ -434,7 +481,10 @@ def test_autogrow_wsl_source_cache_is_versioned_and_excludes_git_metadata(tmp_pa
 
     before = autogrow4_adapter._source_tree_fingerprint(source)
     script = autogrow4_adapter._wsl_source_cache_script(
-        "/mnt/c/work/AutoGrow4", f"/opt/medagent/cache/{before}", "/opt/medagent/cache"
+        "/mnt/c/work/AutoGrow4",
+        f"/opt/medagent/cache/{before}",
+        "/opt/medagent/cache",
+        runtime_patch_wsl="/mnt/c/work/adaptive.patch",
     )
 
     (git / "config").write_text("changed metadata", encoding="utf-8")
@@ -570,6 +620,7 @@ def test_targetdiff_runs_a_local_python_entrypoint_and_reads_sdf_output(tmp_path
         assert command[:2] == ["python.exe", str(entrypoint)]
         assert command[2].replace("\\", "/").endswith("configs/sampling.yml")
         assert "--pdb_path" in command and "--result_path" in command
+        assert command[command.index("--batch_size") + 1] == "25"
         return SimpleNamespace(returncode=0, stdout="sampled", stderr="")
 
     monkeypatch.setattr(targetdiff_adapter.subprocess, "run", fake_run)
@@ -630,6 +681,7 @@ def test_targetdiff_wsl_command_maps_input_and_output_paths(tmp_path, monkeypatc
     assert "sample_for_pocket.py" in shell_command
     assert "configs/sampling.yml" in shell_command
     assert "--result_path" in shell_command
+    assert "--batch_size 25" in shell_command
     assert "PYTHONPATH=/mnt/c/project/TargetDiff" in shell_command
 
 
